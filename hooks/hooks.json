@@ -1,5 +1,5 @@
 {
-  "description": "cranker-llm's read guard: in the folders listed under read_guard.roots in the worker's config, a whole-file Read of a big text file is sent to the local worker first. Does nothing until folders are listed.",
+  "description": "cranker-llm's hooks. The read guard: in the folders listed under read_guard.roots in the worker's config, a whole-file Read of a big text file is sent to the local worker first (does nothing until folders are listed). The scale: a session that uses the worker and is below the local-to-Claude scale (scale.ratio, 5 by default; 0 turns it off) gets a note with its numbers and what real load to hand over, at most every 15 minutes. Neither blocks anything else.",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,6 +8,29 @@
           {
             "type": "command",
             "command": "PY=$(command -v py || command -v python3 || command -v python); \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/read_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Edit|Write|Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=$(command -v py || command -v python3 || command -v python); \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/local_share.py\" --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=$(command -v py || command -v python3 || command -v python); \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/local_share.py\" --hook",
             "timeout": 10
           }
         ]

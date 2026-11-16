@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.0.1
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.1.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -236,6 +236,43 @@ total                                          7.80            15.59            
 
 Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless `--all`.
 
+## The scale
+
+Left to itself, Claude hands the worker what is easy to hand over, not what is heavy. One session spent six hours
+giving it accents and single lines, and on 16-11-2026 the author's sessions had Claude write 10.2M new tokens
+against the worker's 4.5M. So the plugin keeps a scale: `ratio` local tokens for each token of Claude, 5 by default
+(a million local for 200K of Claude). It is a target, not a rule, and nothing is ever blocked.
+
+```
+py scripts/local_share.py [--day 2026-11-16]
+```
+
+```
+2026-11-16: Claude 10,184,572 new tokens, the local worker 4,482,374: 0.44 to 1 (the scale: 5 to 1, 50,922,860 local)
+
+session   project (where it started)                    Claude       local   ratio
+42d6ebdd  D:\Vsworkspace\somos                       2,416,567           0    0.00
+533ec8bd  D:\vs-cheviman\outrunners                  1,046,201           0    0.00
+```
+
+- **Claude's tokens** are what each turn adds, from Claude Code's own transcripts: input, cache writes and output,
+  one count per message, subagents included. Cache reads are left out, because they are the same context sent again
+  on every turn: that day they came to 800M against the 10M new.
+- **The worker's** are `in` + `out` from `usage.jsonl`. Every request logs the Claude Code session that made it, so
+  each session's share is exact.
+- **The hook** (`PostToolUse` on Read, Grep, Glob, Edit, Write and Agent, and `UserPromptSubmit`): when a session that
+  has used the worker is below the scale, it adds a note to Claude's context with the session's numbers and what
+  counts as real load. That means first drafts of the code Claude is about to write (for Claude to review), maps,
+  searches across many files, diff reviews, logs, and names and comments in batch. Accents and single lines don't
+  count. It waits until the session has spent 150K tokens of Claude, and then notes at most every 15 minutes.
+
+```json
+"scale": {"ratio": 5, "roots": ["D:/projects/personal"], "floor": 150000, "every_min": 15}
+```
+
+In the folders under `roots` the note comes even before the session has used the worker. `ratio` 0 turns the hook
+off, and `CRANKER_RATIO` overrides it.
+
 ## Things learned the hard way
 
 - **Qwen3's chat template raises on a system message after the first one**, and Claude Code sends them. Without a
@@ -263,6 +300,8 @@ Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless 
   leaving up to 2,048 tokens for the answer: past it, the server closes the thinking and the model answers. If an
   answer still comes back empty, the worker sends the cut thinking back and asks for the conclusion, and says
   `RECOVERED` so the answer gets checked. Maps and summaries run without `--think`.
+- **A rule to delegate is not enough; a number is.** With only the skill's guidance, Claude kept the heavy work and
+  handed over the light. The scale and its note in the session's own context (see above) put a number on it.
 - **ngram speculation** (`--spec-type ngram-mod`) costs nothing on free text and makes rewrites 5x faster.
 - **A worker's batch threads must not probe a file lock together**: they mistook each other's probe for a running
   agent.
@@ -296,16 +335,17 @@ useful thing you can send back.
 | `skills/cranker-llm/SKILL.md` | when and how Claude uses the worker, and how it checks what comes back |
 | `commands/` | `/worker-status`, `/worker-usage` |
 | `hooks/hooks.json`, `scripts/read_guard.py` | the read guard (off until `read_guard.roots` lists folders) |
+| `hooks/hooks.json`, `scripts/local_share.py` | the scale: the day's report, and the note to sessions below it |
 | `scripts/worker.py` | start, stop, status, config, ask, batch, agent, usage |
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
 
 Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
-`cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `extra` (more llama-server options),
-`system`, `sampling`, `max_tokens`. `worker.py config` prints the values in effect. These environment variables
-override them: `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`, `CRANKER_PORT`, `CRANKER_CTX`,
-`CRANKER_PARALLEL`, `CRANKER_SPEC`, `CRANKER_EXTRA`.
+`cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `scale`, `extra` (more llama-server
+options), `system`, `sampling`, `max_tokens`. `worker.py config` prints the values in effect. These environment
+variables override them: `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`, `CRANKER_PORT`, `CRANKER_CTX`,
+`CRANKER_PARALLEL`, `CRANKER_SPEC`, `CRANKER_EXTRA`, `CRANKER_RATIO`.
 
 ## Where it came from
 

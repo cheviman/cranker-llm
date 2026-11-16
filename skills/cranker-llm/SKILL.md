@@ -33,6 +33,13 @@ whole-file Read of a text file over `max_lines` (300) is refused with how to map
 `offset`/`limit` always goes through; when a file is really needed whole (to edit most of it), Read it with
 offset 1 and limit its line count. Folders outside those roots are never touched.
 
+**The scale** (a hook): the target is `ratio` local tokens for each token of Claude (`scale` in the config, 5 by
+default: a million local for 200K of Claude). Claude's tokens are the new ones of each turn (input, cache writes,
+output; not cache reads), and the worker's are its `in` + `out`. When a session that used the worker (or works under
+`scale.roots`) is below it, a note with the session's numbers comes into the context, at most every 15 minutes: hand
+over real load then, not more accents. `py scripts/local_share.py [--day YYYY-MM-DD]` (beside W) shows the day by
+session. It is a target to aim at, not a rule, and it blocks nothing.
+
 ## The three ways to use it
 
 **1. `ask`: a question about files, no tools.** The files go to the model, the answer to `-o`.
@@ -107,7 +114,11 @@ the pool overflows, the server does not refuse the new request: it fails **every
 | An agent over 2 folders, ~20 files | 20 turns, 11 min, exact; but alone on the server |
 
 Delegate: maps of long files before reading them, searches across many files, volume naming and commenting (with
-mechanical checks after), long logs ("what failed and why, with the lines"), first drafts.
+mechanical checks after), long logs ("what failed and why, with the lines"), first drafts. Also **first drafts of
+code** Claude is about to write (a function, a script, a test, a mechanical patch), from an exact spec (what goes in,
+what comes out, a neighbouring file as an example), for Claude to review, fix and test; and **a review of the diff**
+before Claude's own, marking what looks wrong with file:line. These move the scale most. Not load: accents, spelling,
+a single line, anything quicker to do than to hand over.
 Do not delegate: decisions, stateful debugging, anything that needs several things weighed at once, anything that
 goes to the repo without a mechanical check, text the user will read as is.
 

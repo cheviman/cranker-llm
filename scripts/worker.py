@@ -565,6 +565,9 @@ def log_usage(cmd, tokens_in, tokens_out, answer, seconds, **extra):
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")  # the calling Claude Code session (scripts/local_share.py)
+    if session:
+        rec["session"] = session
     try:
         LOGS.mkdir(parents=True, exist_ok=True)
         with _USAGE_WRITE, open(USAGE_LOG, "a", encoding="utf-8") as f:
