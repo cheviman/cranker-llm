@@ -1,0 +1,5 @@
+# models, binaries and logs live in CRANKER_HOME (~/.cranker-llm by default), never here
+*.gguf
+*.part
+__pycache__/
+bench/runs/

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cranker-llm",
+  "description": "A local LLM on your GPU as Claude Code's worker",
+  "owner": {
+    "name": "Sebastian Toyos",
+    "url": "https://github.com/cheviman"
+  },
+  "plugins": [
+    {
+      "name": "cranker-llm",
+      "source": "./",
+      "description": "A local LLM (llama.cpp on your GPU) as Claude Code's worker: reading, summarising, naming and searching in volume, with the tokens it keeps off Claude measured.",
+      "version": "0.1.0"
+    }
+  ]
+}

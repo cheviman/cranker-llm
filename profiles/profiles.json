@@ -1,0 +1,48 @@
+[
+  {
+    "name": "qwen3.8-27b-q4kxl",
+    "title": "Qwen3.8-27B UD-Q4_K_XL (unsloth): the default for a 24 GB GPU",
+    "min_vram_gb": 22,
+    "status": "measured",
+    "measured": "RTX 3090 capped at 260 W, 15-11-2026: 30.7 tok/s on one request, ~118 tok/s in all on batches of 8; a 666-line C file summarised in 47 s (25 of 25 functions, 22 accurate); the agent's who-calls-what exact in 2-4 turns; renamed a local in 120 lines of C right 6 of 6 times. 21 GB of the GPU with the desktop's.",
+    "model": {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "size": 17659407264,
+      "sha256": "2a5f3565f39cf885103da591182c1266da64745737b42b452fd3e675369f1211",
+      "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "qwen3.8-27b", "ctx": 65536, "parallel": 8, "cache_type": "q8_0", "spec": "ngram-mod"}
+  },
+  {
+    "name": "bonsai2-27b-q2_0",
+    "title": "Ternary Bonsai 2 27B Q2_0 (PrismML): Qwen3.8-27B in ternary weights, for 12 GB and up, or for speed",
+    "min_vram_gb": 12,
+    "status": "measured on a 24 GB GPU only",
+    "measured": "RTX 3090 capped at 260 W, 15-11-2026: 58.4 tok/s on one request (1.9x the Qwen above), about the same in batches; summaries, names and the agent as good as the Qwen above, but asked to rename a local in 120 lines of C it gave the code back unchanged 3 times of 6. 11.4 GB of the GPU with the desktop's, with 64K of context. Needs llama.cpp b11556 or newer (older builds load it and print garbage). PrismML's own fork runs a 5.9 GB PTQ1_0 pack at 81 tok/s on the same card: see the README.",
+    "model": {
+      "repo": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+      "file": "Ternary-Bonsai-2-27B-Q2_0.gguf",
+      "size": 7626008928,
+      "sha256": "4f99aed01b8a877e153f9aa6569a4440fe17c59701cc0953e36d7f460549e70e",
+      "license": "Apache-2.0 (Prism ML, built from Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "bonsai2-27b", "ctx": 65536, "parallel": 4, "cache_type": "q8_0", "spec": "ngram-mod"},
+    "use_for": "reading in volume (summaries, names, logs, search); not exact code edits"
+  },
+  {
+    "name": "qwen3.8-27b-iq3s",
+    "title": "Qwen3.8-27B UD-IQ3_S (unsloth): for a 16 GB GPU",
+    "min_vram_gb": 16,
+    "status": "untested",
+    "measured": "Not measured. 12.0 GB of weights, so 32K of context and 4 slots should fit in 16 GB; a 3-bit quant loses more than the Q4_K_XL. Run bench/bench.py on it and send the numbers.",
+    "model": {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-IQ3_S.gguf",
+      "size": 12040883104,
+      "sha256": "d847e2c1e4aa276e4b7b8e9ad7628050e61e165d49ab995407bc36677a6f3864",
+      "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "qwen3.8-27b", "ctx": 32768, "parallel": 4, "cache_type": "q8_0", "spec": "ngram-mod"}
+  }
+]

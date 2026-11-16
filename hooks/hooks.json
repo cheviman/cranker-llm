@@ -1,0 +1,17 @@
+{
+  "description": "cranker-llm's read guard: in the folders listed under read_guard.roots in the worker's config, a whole-file Read of a big text file is sent to the local worker first. Does nothing until folders are listed.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=$(command -v py || command -v python3 || command -v python); \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/read_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

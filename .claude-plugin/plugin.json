@@ -1,0 +1,13 @@
+{
+  "name": "cranker-llm",
+  "description": "A local LLM (llama.cpp on your GPU) as Claude Code's worker: it reads, summarises, names and searches in volume so those tokens stay off Claude, which orchestrates and checks. Measures the tokens it keeps off Claude.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Sebastian Toyos",
+    "url": "https://github.com/cheviman"
+  },
+  "homepage": "https://github.com/cheviman/cranker-llm",
+  "repository": "https://github.com/cheviman/cranker-llm",
+  "license": "BSD-3-Clause",
+  "keywords": ["llama.cpp", "local-llm", "qwen", "tokens", "worker", "offload"]
+}
