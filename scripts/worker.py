@@ -399,7 +399,8 @@ def needed_tokens(body):
         return None
 
 
-ANSWER_MARGIN = 4096  # what a running request may still add to the context, at most counted
+ANSWER_MARGIN = 4096  # what a running request may still add when the server does not say (n_remain -1); else all of
+# it: capped at 4096, a batch of four thinking tasks (7,000 tokens each) grew past a 64K pool and every request failed
 
 
 def used_tokens():
@@ -414,41 +415,115 @@ def used_tokens():
             nt = (nt[0] if nt else {}) if isinstance(nt, list) else (nt or {})
             remain = nt.get("n_remain", -1)
             total += ((s.get("n_prompt_tokens") or 0) + (nt.get("n_decoded") or 0)
-                      + (ANSWER_MARGIN if remain is None or remain < 0 else min(remain, ANSWER_MARGIN)))
+                      + (ANSWER_MARGIN if remain is None or remain < 0 else remain))
     except Exception:
         pass
     return total, busy
 
 
+ADMIT_LOCK = LOGS / "admit.lock"
+ADMIT_MARGIN = 1024  # context kept free beyond the running requests' answers: speculative drafts take a few tokens
+ADMIT_SEEN = 30      # s a request holds the admission until the server shows it running (/slots)
+_ADMIT = threading.Lock()
+# What a full pool fails the running requests with (HTTP 500), retried like "no room". With the pool full, the
+# server halves its batch down to a few tokens, and the ngram drafts then fall outside it: "speculative batch
+# index 8 is not inside the current sub-batch [0, 8)"
+POOL_FULL = ("context", "speculative batch index", "free space in the kv cache", "memory slot")
+
+
+class _Admission:
+    """One request at a time, among this process's threads and the other worker processes, from the room check
+    until the server runs it. /slots shows a request only once the server takes it, so a batch's threads that
+    all found the server idle in the same second went in together: 88K of answers on a 64K pool."""
+
+    def __enter__(self):
+        _ADMIT.acquire()
+        self.f = None
+        try:
+            LOGS.mkdir(parents=True, exist_ok=True)
+            self.f = open(ADMIT_LOCK, "a+")
+            while True:
+                try:
+                    _try_lock(self.f)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        except Exception:
+            if self.f:
+                self.f.close()
+            self.f = None  # the thread lock alone
+        return self
+
+    def __exit__(self, *exc):
+        if self.f:
+            _unlock(self.f)
+            self.f.close()
+        _ADMIT.release()
+
+
+def _running_tasks():
+    """The tasks the server runs and has counted (their prompt known), or None if /slots does not answer"""
+    try:
+        return {s.get("id_task") for s in _get("/slots") if s.get("is_processing") and s.get("n_prompt_tokens")}
+    except Exception:
+        return None
+
+
+def _post_seen(path, body):
+    """Sends the request and returns its future once the server runs it, it ended, or ADMIT_SEEN s passed"""
+    before = _running_tasks()
+    fut = concurrent.futures.Future()
+
+    def send():  # a daemon thread: Ctrl+C does not wait for the answer
+        try:
+            fut.set_result(_post(path, body))
+        except BaseException as e:
+            fut.set_exception(e)
+
+    threading.Thread(target=send, daemon=True).start()
+    t0 = time.time()
+    while not fut.done() and time.time() - t0 < ADMIT_SEEN:
+        now = _running_tasks()
+        if now is None or before is None or now - before:
+            break
+        time.sleep(0.2)
+    return fut
+
+
 def post_with_room(path, body):
     """The slots share one context pool (-kvu). The server does not turn a request away when the pool is full:
-    decoding fails and every running request fails with it ("Context size has been exceeded", HTTP 500). So a
-    request is sent only where the running ones leave room for it (counted with its answer at most), else it waits.
-    One over the whole context is an error at once: split it, use line ranges or lower --max-tokens."""
+    decoding fails and every running request fails with it (HTTP 500, POOL_FULL). So a request is sent only where
+    the running ones leave room for it (counted with its answer at most) and ADMIT_MARGIN more, one at a time
+    (_Admission), else it waits. One over the whole context is an error at once: split it, use line ranges or lower
+    --max-tokens."""
     ctx = CFG["ctx"]
     need = needed_tokens(body)
-    if need is not None and need > ctx:
+    if need is not None and need > ctx - ADMIT_MARGIN:
         raise WorkerError(f"{need} tokens with the answer, over the context ({ctx}) alone: "
                           f"split it, use line ranges or lower --max-tokens")
     t0 = time.time()
     noted = False
     while True:
-        used, busy = used_tokens()
-        if agent_running():
-            error = "an agent is running (it takes the context alone)"
-        elif busy == 0 or need is None or need + used <= ctx:
+        fut = None
+        with _Admission():
+            used, busy = used_tokens()
+            if agent_running():
+                error = "an agent is running (it takes the context alone)"
+            elif busy == 0 or need is None or need + used <= ctx - ADMIT_MARGIN:
+                fut = _post_seen(path, body)
+            else:
+                error = f"no room: {need} tokens needed, {used} held by {busy} running requests"
+        if fut is not None:
             try:
-                return _post(path, body)
+                return fut.result()
             except urllib.error.HTTPError as e:
                 try:
                     text = e.read().decode("utf-8", "replace")
                 except Exception:
                     text = str(e)
-                if "context" not in text.lower():
+                if not any(k in text.lower() for k in POOL_FULL):
                     raise WorkerError(f"HTTP {e.code}: {text[:500]}")
                 error = f"HTTP {e.code}: {text[:300]}"
-        else:
-            error = f"no room: {need} tokens needed, {used} held by {busy} running requests"
         if time.time() - t0 > CFG["context_wait"]:
             raise WorkerError(f"{error} -- still no room after {CFG['context_wait']} s")
         if not noted:

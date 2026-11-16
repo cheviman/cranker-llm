@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.0.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.0.1
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -249,6 +249,11 @@ Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless 
 - **All slots share one context pool (`-kvu`).** When it overflows, llama-server does not refuse the new request;
   it fails every running one. So `ask` and `batch` count a request with the server's tokenizer and wait for room,
   and an agent (32-40K a request, growing with every file it reads) runs alone.
+- **Count the requests one at a time.** `/slots` shows a request only once the server takes it, so a batch's
+  threads that found the server idle in the same second all went in: 88K of answers on a 64K pool. With the pool
+  full, llama-server halves its batch down to 8 tokens and the ngram drafts fall outside it ("speculative batch
+  index 8 is not inside the current sub-batch"). Now a request waits for the one before it to show in `/slots`
+  (a lock shared by all the worker's processes), and that error is retried like a full pool.
 - **When the GPU's memory overflows on Windows, the driver moves it to system RAM and everything crawls** (a few
   tok/s), with no error. A DFlash 2 drafter beside the 17.7 GB model and its 64K context did exactly that. The
   same drafter was right 0 % of the time on Bonsai, whose rotated weights change the hidden states it reads.
