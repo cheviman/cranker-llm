@@ -137,8 +137,10 @@ task that doesn't set its own, so the shared rules are written once and not in e
 ### The brief: how you work there
 
 The worker loads no `CLAUDE.md`. Your full one wouldn't help anyway: it's written for Claude and would fill the
-shared context. Instead, `.cranker/brief.md` in the project (found in the caller's folder or the nearest one above
-it) goes into the system prompt of every `ask`, `batch` and `agent`. Keep it to the rules the code must follow:
+shared context. Instead, `.cranker/brief.md` in the project (found in the caller's folder or above it, up to the
+repository's root and never past it; outside a repository, only in the caller's folder) goes into the system prompt
+of every `ask`, `batch` and `agent`. A brief is instructions to the model, like a CLAUDE.md: a repo you don't trust
+gets `--brief ""`. Keep it to the rules the code must follow:
 language, indentation, headers and markers, what never to do. `--brief FILE` uses another file, and `--brief ""`
 leaves it out. With a four-line brief, the same request for a C function went from spaces and no markers to tabs
 and `//ok, DD-MM-YYYY`, and passed a style check the first time.

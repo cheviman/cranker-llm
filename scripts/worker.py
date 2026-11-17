@@ -768,14 +768,23 @@ _BRIEF = {}
 
 def find_brief(explicit=None):
     """The brief that goes with every request: --brief FILE, else CRANKER_BRIEF, else .cranker/brief.md in the
-    caller's folder or the nearest one above it. '' / 'none' turns it off. Returns (path, text) or (None, '')."""
+    caller's folder or the nearest one above it up to the repository's root (outside a repository, the caller's
+    folder only). '' / 'none' turns it off. Returns (path, text) or (None, '')."""
     spec = explicit if explicit is not None else os.environ.get("CRANKER_BRIEF")
     if spec is not None:
         if spec.strip().lower() in ("", "none"):
             return None, ""
         path = Path(spec)
     else:
-        path = next((d / BRIEF_NAME for d in [Path.cwd(), *Path.cwd().parents] if (d / BRIEF_NAME).is_file()), None)
+        # up to the repository's root and no further: a brief in a folder above it (the user's home, a drive's root)
+        # is not that project's, and would steer every repo below it
+        here = Path.cwd()
+        dirs = [here]
+        for d in [here, *here.parents]:
+            if (d / ".git").exists():
+                dirs = [here, *here.parents][:[here, *here.parents].index(d) + 1]
+                break
+        path = next((d / BRIEF_NAME for d in dirs if (d / BRIEF_NAME).is_file()), None)
         if path is None:
             return None, ""
     key = str(path.resolve())

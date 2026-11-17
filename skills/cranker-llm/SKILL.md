@@ -86,8 +86,9 @@ Windows PowerShell 5.1 splits `-p "..."` with `\"` inside into several arguments
 The worker sees no CLAUDE.md, no environment and no compiler: only the files and the prompt. Two things make up for
 that, and both go with every task that writes something:
 
-- **The brief**: `.cranker/brief.md` in the project (the caller's folder or above it) goes into the system prompt
-  of every `ask`, `batch` and `agent`. The first time a project gets code, names or comments from the worker and has
+- **The brief**: `.cranker/brief.md` in the project (the caller's folder or above it, up to the repository's root;
+  outside a repo, only the caller's folder: then pass `--brief`) goes into the system prompt of every `ask`, `batch`
+  and `agent`. In a repo the user doesn't own, `--brief ""`. The first time a project gets code, names or comments from the worker and has
   no brief, Claude writes one from that project's CLAUDE.md: only the rules the code must follow (language,
   indentation, headers and markers, what is never done), 5 to 20 lines, not Claude's own workflow. It is a file in
   the user's repo: say so when it is created. `--brief FILE` uses another one, `--brief ""` none.
