@@ -1,15 +1,20 @@
 """cranker-llm: a llama.cpp server on this machine that Claude Code hands volume work to.
 
     worker.py start | stop | status | config
-    worker.py ask -p "instruction" [-f file[:a-b] ...] [-o out] [--think] [--print]
-    worker.py batch tasks.jsonl [--jobs N] [--force]
+    worker.py ask -p "instruction" [-f file[:a-b] ...] [-o out] [--think] [--print] [--check CMD] [--brief FILE]
+    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
+
+check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
+and the errors until it passes or check_retries run out. brief: .cranker/brief.md in the caller's folder or above it,
+how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md).
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
 summary is printed (--print also prints the answer). From Windows PowerShell 5.1 a prompt with double quotes in it is
 split into several arguments: write it to a file and pass --prompt-file.
-batch: one JSON object per line: {"id", "prompt", "files": [...], "out", "system"?, "think"?, "max_tokens"?}.
+batch: one JSON object per line: {"id", "prompt", "files": [...], "out", "system"?, "think"?, "max_tokens"?,
+"check"?, "retries"?}.
 Tasks whose "out" already exists are skipped unless --force, so a batch can resume.
 agent: Claude Code itself, headless, on the local model: Read, Grep and Glob, and with --write also Write and Edit
 inside that folder only.
@@ -66,6 +71,8 @@ DEFAULTS = {
     "max_tokens": 4096,
     "max_tokens_thinking": 10000,  # the thinking counts: 4096 went on it alone in a 260-line diff's review
     "context_wait": 1800,          # s a request waits for the shared context to have room
+    "check_retries": 2,            # a task with a check: how many times the worker fixes its own output
+    "check_timeout": 300,          # s one run of a check may take
 }
 ENV_OVERRIDES = {"CRANKER_SERVER": "llama_server", "CRANKER_MODEL": "model",
                  "CRANKER_TEMPLATE": "template", "CRANKER_PORT": "port", "CRANKER_CTX": "ctx",
@@ -621,6 +628,7 @@ def cmd_usage(args):
     table("project (the caller's folder)", project_of)
     table("day", lambda r: r["ts"][:10])
     cost_table(recs, project_of)
+    quality_table(args.since, args.all)
     guard_line(args.since)
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
@@ -633,6 +641,37 @@ PRICES = {"Opus 5.5": (4.00, 20.00), "Fable 5.2": (8.00, 40.00)}
 
 def project_of(r):
     return os.sep.join(Path(r.get("cwd", "?")).parts[-2:])
+
+
+def quality_table(since=None, include_tagged=False):
+    """The tasks that came with a check: how many were right the first time, how many the worker fixed itself and
+    how many were left for Claude to fix. The rework Claude does on outputs without a check is not seen here."""
+    if not QUALITY_LOG.exists():
+        return
+    recs = []
+    for line in QUALITY_LOG.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if (since and r["ts"][:10] < since) or (r.get("tag") and not include_tagged):
+            continue
+        recs.append(r)
+    if not recs:
+        return
+    rows = {}
+    for r in recs:
+        a = rows.setdefault(project_of(r), {"pass": 0, "fixed": 0, "fail": 0, "tries": 0})
+        a[r["result"]] += 1
+        a["tries"] += r["tries"]
+    print(f"\n{'checked tasks (the rework)':<34} {'tasks':>8} {'first time':>11} {'by worker':>10} "
+          f"{'for Claude':>11} {'fixes':>6}")
+    for k, a in sorted(rows.items(), key=lambda kv: -sum(kv[1][x] for x in ("pass", "fixed", "fail"))):
+        n = a["pass"] + a["fixed"] + a["fail"]
+        print(f"{str(k)[:34]:<34} {n:>8} {a['pass'] / n:>10.0%} {a['fixed'] / n:>10.0%} {a['fail'] / n:>11.0%} "
+              f"{a['tries']:>6}")
+    print("first time: passed its check with no fix. by worker: the worker fixed it from the check's errors. "
+          "for Claude: still\nfailing after its retries. fixes: the worker's extra requests.")
 
 
 def guard_line(since=None):
@@ -720,7 +759,153 @@ def _chat(body):
     }
 
 
-def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None):
+# ----- the project's brief: how the user works there (style, rules), so it is not repeated in every prompt
+
+BRIEF_NAME = Path(".cranker") / "brief.md"
+BRIEF_WARN = 8000  # chars: the brief goes into every request and the context is one pool for all the slots
+_BRIEF = {}
+
+
+def find_brief(explicit=None):
+    """The brief that goes with every request: --brief FILE, else CRANKER_BRIEF, else .cranker/brief.md in the
+    caller's folder or the nearest one above it. '' / 'none' turns it off. Returns (path, text) or (None, '')."""
+    spec = explicit if explicit is not None else os.environ.get("CRANKER_BRIEF")
+    if spec is not None:
+        if spec.strip().lower() in ("", "none"):
+            return None, ""
+        path = Path(spec)
+    else:
+        path = next((d / BRIEF_NAME for d in [Path.cwd(), *Path.cwd().parents] if (d / BRIEF_NAME).is_file()), None)
+        if path is None:
+            return None, ""
+    key = str(path.resolve())
+    if key not in _BRIEF:
+        text = path.read_text(encoding="utf-8").strip()
+        if len(text) > BRIEF_WARN:
+            print(f"the brief {path} is {len(text):,} chars: it goes into every request; keep it to the rules the "
+                  f"code must follow", file=sys.stderr)
+        _BRIEF[key] = text
+    return path, _BRIEF[key]
+
+
+def with_brief(system, brief):
+    if not brief:
+        return system
+    return (f"{system}\n\n=== HOW THIS PROJECT WORKS (follow it in everything you write) ===\n{brief}\n"
+            f"=== END ===")
+
+
+# ----- the check: a command that says whether an output is right; the worker fixes its own output until it passes
+
+CHECK_TAIL = 6000  # chars of the check's output that go back to the model
+FIX_PROMPT = ("Your output above was saved to {out} and checked with `{cmd}`. The check is right and your output is "
+              "wrong:\n\n```\n{log}\n```\n\n{again}Change your output so that it passes: work out from each error "
+              "what the check expects, and fix the cause, not just the line it names. Leave alone what the errors do "
+              "not touch. Output the WHOLE result again, in the same form the instructions asked for, with nothing "
+              "before or after it.")
+SAME_AGAIN = "Your last fix came back unchanged, so it failed the same way: this time change it. "
+QUALITY_LOG = LOGS / "quality.jsonl"
+
+
+def _decode(raw):
+    """A check's output: UTF-8, else the console's code page (Windows tools such as MSVC print in it), so the
+    model sees the real characters of the errors."""
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in (("oem", "mbcs") if WINDOWS else ()):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def run_check(cmd, out):
+    """Runs the check with {out} replaced by the output's path, in the caller's folder. (passed, its output)."""
+    line = cmd.replace("{out}", str(out))
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}  # a Python check prints in UTF-8
+    try:
+        r = subprocess.run(line, shell=True, capture_output=True, env=env, timeout=CFG["check_timeout"])
+    except subprocess.TimeoutExpired:
+        return False, f"the check took more than {CFG['check_timeout']} s"
+    text = (_decode(r.stdout) + _decode(r.stderr)).strip()
+    if len(text) > CHECK_TAIL:
+        text = "[...]\n" + text[-CHECK_TAIL:]
+    return r.returncode == 0, text or f"exit code {r.returncode}, no output"
+
+
+def log_quality(task_id, out, check, result, tries):
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cwd": os.getcwd(), "id": task_id, "out": str(out),
+           "check": check, "result": result, "tries": tries}
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        rec["session"] = session
+    if os.environ.get("CRANKER_USAGE_TAG"):
+        rec["tag"] = os.environ["CRANKER_USAGE_TAG"]
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with _USAGE_WRITE, open(QUALITY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def run_checked(t, cmd, keep_thinking, brief):
+    """One task (a batch line, or ask's arguments in the same shape): runs it, writes 'out', and with a 'check'
+    runs the check and hands the model its own output and the check's errors until it passes or the retries run
+    out. The result says how it ended: check = pass (first time) | fixed (by its retries) | fail (left for Claude,
+    with the check's last output in out.check.txt)."""
+    out = Path(t["out"])
+    args = dict(files=t.get("files", []), system=with_brief(t.get("system") or CFG["system"], brief),
+                think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
+                cmd=cmd, effort=t.get("effort"))
+    res = run_task(t["prompt"], **args)
+    write_out(out, res, keep_thinking)
+    check = t.get("check")
+    if not check:
+        return res
+    retries = t.get("retries", CFG["check_retries"])
+    note = out.with_name(out.name + ".check.txt")
+    tries = 0
+    totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
+    previous = None
+    while True:
+        passed, log = run_check(check, out)
+        if passed or tries >= retries:
+            break
+        tries += 1
+        same = res["content"].strip() == previous
+        previous = res["content"].strip()
+        fix = [{"role": "assistant", "content": res["content"]},
+               {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log,
+                                                             again=SAME_AGAIN if same else "")}]
+        step = dict(args)
+        if not step["think"] and (tries >= 2 or same):
+            # a plain fix that did not take: the next one thinks first (medium effort, so it does not spend
+            # the whole budget thinking)
+            step.update(think=True, effort=step["effort"] or "medium", max_tokens=None)
+        res = run_task(t["prompt"], **step, history=fix, attempt=tries)
+        for k in totals:
+            totals[k] += res[k]
+        write_out(out, res, keep_thinking)
+    res.update(totals)
+    res["check"] = ("pass" if tries == 0 else "fixed") if passed else "fail"
+    res["tries"] = tries
+    if passed:
+        note.unlink(missing_ok=True)
+    else:
+        note.write_text(f"$ {check}\n{log}\n", encoding="utf-8")
+    log_quality(t.get("id"), out, check, res["check"], tries)
+    return res
+
+
+def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None,
+             history=None, attempt=0):
+    """One request. history: more turns after the first (the model's last answer and what to fix in it)."""
     if max_tokens is None:
         max_tokens = CFG["max_tokens_thinking"] if think else CFG["max_tokens"]
     parts = [read_file_spec(f) for f in files]
@@ -732,6 +917,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     if think and effort:
         kwargs["reasoning_effort"] = effort
     messages = [{"role": "system", "content": system or CFG["system"]}, {"role": "user", "content": "\n".join(parts)}]
+    messages += history or []
     body = {"model": CFG["alias"], "messages": messages, "max_tokens": max_tokens, "chat_template_kwargs": kwargs,
             **sampling}
     if think:
@@ -743,8 +929,8 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         # from it without thinking; the summary says so, to be checked
         again = _chat({"model": CFG["alias"], "max_tokens": CFG["max_tokens"],
                        "chat_template_kwargs": {"enable_thinking": False},
-                       "messages": [messages[0], {"role": "user", "content": messages[1]["content"]
-                                                  + RECOVER.format(thinking=res["thinking"])}],
+                       "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
+                                                     + RECOVER.format(thinking=res["thinking"])}],
                        **CFG["sampling"]["plain"]})
         res.update(content=again["content"], finish=again["finish"], recovered=True,
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
@@ -752,7 +938,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                    seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"])
     answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
     log_usage(cmd, res["prompt_tokens"], res["completion_tokens"], answer, res["seconds"], files=len(files),
-              **({"recovered": True} if res.get("recovered") else {}))
+              **({"recovered": True} if res.get("recovered") else {}), **({"attempt": attempt} if attempt else {}))
     return res
 
 
@@ -763,6 +949,13 @@ def summary(res, out):
         s += ", RECOVERED: its thinking ran out, the answer was concluded from it (check it)"
     if res["finish"] != "stop":
         s += f", FINISH={res['finish']} (cut: raise --max-tokens)"
+    if res.get("check") == "pass":
+        s += ", check passed"
+    elif res.get("check") == "fixed":
+        s += f", check passed after {res['tries']} fix{'es' if res['tries'] > 1 else ''} by the worker"
+    elif res.get("check") == "fail":
+        s += (f", CHECK FAILED after {res['tries']} fix{'es' if res['tries'] != 1 else ''}"
+              + (f": {out}.check.txt" if out else ""))
     return (f"-> {out}: " if out else "") + s
 
 
@@ -793,41 +986,63 @@ def cmd_ask(args):
     if not prompt:
         print("no prompt (-p or --prompt-file)")
         return 1
+    if args.check and not args.out:
+        print("--check needs -o: the check reads the output from its file ({out})")
+        return 1
+    _, brief = find_brief(args.brief)
+    t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
+         "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
+         "out": args.out, "check": args.check}
+    if args.retries is not None:
+        t["retries"] = args.retries
     try:
-        res = run_task(prompt, args.file or [], args.system, args.think, args.max_tokens, args.temperature,
-                       effort=args.effort)
+        if args.out:
+            res = run_checked(t, "ask", args.keep_thinking, brief)
+        else:
+            res = run_task(prompt, t["files"], with_brief(args.system or CFG["system"], brief), args.think,
+                           args.max_tokens, args.temperature, effort=args.effort)
     except WorkerError as e:
         print(e)
         return 1
     except urllib.error.HTTPError as e:
         print(_http_error(e))
         return 1
-    if args.out:
-        write_out(args.out, res, args.keep_thinking)
     if args.print or not args.out:
         print(res["content"])
     print(summary(res, args.out), file=sys.stderr if not args.out else sys.stdout)
-    return 0 if res["finish"] == "stop" else 2
+    return 0 if res["finish"] == "stop" and res.get("check") != "fail" else 2
 
 
 def cmd_batch(args):
     if not healthy():
         return _not_running()
     tasks = [json.loads(l) for l in Path(args.tasks).read_text(encoding="utf-8").splitlines() if l.strip()]
+    # what every task shares goes once on the command line, not in every line: a task's own value wins
+    shared = {}
+    if args.system_file:
+        shared["system"] = Path(args.system_file).read_text(encoding="utf-8").strip()
+    if args.check:
+        shared["check"] = args.check
+    if args.retries is not None:
+        shared["retries"] = args.retries
+    tasks = [{**shared, **{k: v for k, v in t.items() if v is not None}} for t in tasks]
+    if args.prompt_prefix:
+        prefix = Path(args.prompt_prefix).read_text(encoding="utf-8").strip()
+        tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
+    brief_path, brief = find_brief(args.brief)
     todo = [t for t in tasks if args.force or not Path(t["out"]).exists()]
-    print(f"{len(tasks)} tasks, {len(tasks) - len(todo)} already done, {len(todo)} to run")
+    print(f"{len(tasks)} tasks, {len(tasks) - len(todo)} already done, {len(todo)} to run"
+          + (f"; brief {brief_path}" if brief else ""))
     t0 = time.time()
     failed = tokens = 0
+    checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
     def one(t):
         waited = cool_down()
         if waited >= 1:
             waits.append(waited)
-        res = run_task(t["prompt"], t.get("files", []), t.get("system"), t.get("think", False),
-                       t.get("max_tokens"), t.get("temperature"), cmd="batch", effort=t.get("effort"))
-        write_out(t["out"], res, args.keep_thinking)
-        return res
+        return run_checked(t, "batch", args.keep_thinking, brief)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs or CFG["parallel"]) as ex:
         futs = {ex.submit(one, t): t for t in todo}
@@ -837,8 +1052,12 @@ def cmd_batch(args):
                 res = f.result()
                 tokens += res["completion_tokens"] or 0
                 cut = res["finish"] != "stop"
-                failed += cut
-                print(f"{'CUT ' if cut else 'ok  '}{t.get('id', t['out'])}: {summary(res, None)}")
+                bad = res.get("check") == "fail"
+                failed += cut or bad
+                if res.get("check"):
+                    checks[res["check"]] += 1
+                tag = "BAD " if bad else "CUT " if cut else "ok  "
+                print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad else None)}")
             except urllib.error.HTTPError as e:
                 failed += 1
                 print(f"FAIL {t.get('id', t['out'])}: {_http_error(e)}")
@@ -847,6 +1066,9 @@ def cmd_batch(args):
                 print(f"FAIL {t.get('id', t['out'])}: {e}")
     print(f"done: {len(todo) - failed} ok, {failed} failed or cut, {tokens} tokens out in {time.time() - t0:.0f} s"
           + (f"; paused {len(waits)} times for GPU heat ({sum(waits):.0f} s)" if waits else ""))
+    if any(checks.values()):
+        print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
+              f"{checks['fail']} left for Claude (their errors in <out>.check.txt)")
     return 0 if failed == 0 else 2
 
 
@@ -936,12 +1158,14 @@ def cmd_agent(args):
     if not exe:
         print("claude not found on PATH")
         return 1
+    # it loads no CLAUDE.md (no setting sources): the project's brief is how it learns how the user works there
+    _, brief = find_brief(args.brief)
     # not --bare: it leaves only Read and Edit. No setting sources instead (no hooks, plugins or CLAUDE.md), no MCP
     # servers; the API key and base URL in agent_env keep every request on this machine.
     cmd = [exe, "-p", prompt, "--setting-sources", "", "--strict-mcp-config",
            "--model", CFG["alias"], "--output-format", "json",
            "--tools", ",".join(tools), "--allowedTools", " ".join(allowed),
-           "--append-system-prompt", AGENT_APPEND]
+           "--append-system-prompt", with_brief(AGENT_APPEND, brief)]
     for d in args.dir or []:
         cmd += ["--add-dir", d]
     t0 = time.time()
@@ -1002,12 +1226,21 @@ def main():
     p.add_argument("--temperature", type=float)
     p.add_argument("--print", action="store_true", help="also print the answer when writing -o")
     p.add_argument("--keep-thinking", action="store_true", help="save the thinking next to -o")
+    p.add_argument("--check", help="a command that passes (exit 0) when the output is right; {out} is its path")
+    p.add_argument("--retries", type=int, help="how many times the worker fixes its output for the check")
+    p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("batch")
     p.add_argument("tasks")
     p.add_argument("--jobs", type=int, help="default: the server's slots")
     p.add_argument("--force", action="store_true")
     p.add_argument("--keep-thinking", action="store_true")
+    p.add_argument("--check", help="the check for every task without its own; {out} is the task's output")
+    p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
+    p.add_argument("--system-file", help="the system prompt for every task without its own")
+    p.add_argument("--prompt-prefix", help="a file with what every task's prompt starts with (the shared rules)")
+    p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("agent", help="Claude Code on the local model, with tools")
+    p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p.add_argument("-p", "--prompt")
     p.add_argument("--prompt-file")
     p.add_argument("--dir", action="append", help="a folder it may read (a repo root brings its CLAUDE.md)")

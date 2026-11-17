@@ -11,7 +11,7 @@
       "name": "cranker-llm",
       "source": "./",
       "description": "A local LLM (llama.cpp on your GPU) as Claude Code's worker: reading, summarising, naming and searching in volume, with the tokens it keeps off Claude measured.",
-      "version": "1.1.0"
+      "version": "1.2.0"
     }
   ]
 }

@@ -60,7 +60,8 @@ than its default `xhigh`. Maps, summaries and searches: no `--think`. If it must
 --keep-thinking`, and expect 10-15 minutes.
 
 **2. `batch`: many tasks in parallel** (8 slots: ~118 tok/s in all on a 3090, against ~30 for one request). One JSON
-object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?}`. Tasks whose `out`
+object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?, "check"?,
+"retries"?}`. Tasks whose `out`
 exists are skipped, so a batch can be stopped and resumed; `--force` redoes them.
 ```
 py W batch tasks.jsonl
@@ -79,6 +80,30 @@ in its folder and Claude applies what it found.
 
 Prompts to the worker in English. A prompt with double quotes or a long one goes in a file (`--prompt-file`):
 Windows PowerShell 5.1 splits `-p "..."` with `\"` inside into several arguments.
+
+## The brief and the check: so Claude neither prepares nor redoes the work
+
+The worker sees no CLAUDE.md, no environment and no compiler: only the files and the prompt. Two things make up for
+that, and both go with every task that writes something:
+
+- **The brief**: `.cranker/brief.md` in the project (the caller's folder or above it) goes into the system prompt
+  of every `ask`, `batch` and `agent`. The first time a project gets code, names or comments from the worker and has
+  no brief, Claude writes one from that project's CLAUDE.md: only the rules the code must follow (language,
+  indentation, headers and markers, what is never done), 5 to 20 lines, not Claude's own workflow. It is a file in
+  the user's repo: say so when it is created. `--brief FILE` uses another one, `--brief ""` none.
+- **The check**: `--check "CMD {out}"` (or `"check"` in a batch line), a command that exits 0 when the output is
+  right: a compile, a test, a style script. The worker runs it and hands the model its errors until it passes
+  (`check_retries`, 2; from the second fix on it thinks first). What comes back to Claude is only what still fails:
+  `CHECK FAILED` and the errors in `<out>.check.txt`. **Don't run fix rounds by hand** (compile, read errors, write a
+  prompt for each one, send again): that's the check's job. A check runs in the caller's folder, several at once in
+  a batch, so it writes only files of its own (one object file per task, say).
+- **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`, and
+  `--check` for all of them; a line's own value wins. The line then holds only what is its own.
+
+The check proves what it checks, and nothing more. What passes still gets read in the diff like any draft, and an
+output without a check is checked by Claude as before. `usage` shows the rework by project: first time / by the
+worker / for Claude. When "for Claude" stays high, the prompt, the brief or the check is what needs work, not
+more rounds.
 
 ## The shared context
 

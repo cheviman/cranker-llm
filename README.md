@@ -115,6 +115,34 @@ loads none of your Claude Code settings (no hooks, plugins, CLAUDE.md or MCP ser
 py scripts/worker.py agent --dir src --dir include -o answer.md -p "Who writes to e->state? file:line for each."
 ```
 
+### The check: the worker does its own rework
+
+The model can't compile or run anything, so without a check every round of rework goes back through Claude:
+compile, read the errors, write a prompt for each one, send it again. In one port that took 704 tasks in 26 rounds.
+With a `check`, the worker runs the command itself, hands the model its own output with the errors, and repeats
+until it passes or runs out of `check_retries` (2 by default; from the second fix on, the model thinks first). The
+check is any command that exits 0 when the output is right, with `{out}` standing for the output's path. It runs in
+the caller's folder, several at once in a batch, so it must write only files of its own.
+
+```
+py scripts/worker.py ask --prompt-file spec.txt -o slug.py --check "py test_slug.py {out}"
+py scripts/worker.py batch fixes.jsonl --check "py build_chunk.py {out}" --prompt-prefix rules.txt
+```
+
+Each output ends one of three ways: `check passed`, `check passed after N fixes by the worker`, or `CHECK FAILED`
+with the last errors in `<out>.check.txt`, left for Claude. `usage` adds them up by project (first time / by the
+worker / for Claude). In a `batch`, `--check`, `--retries`, `--system-file` and `--prompt-prefix` apply to every
+task that doesn't set its own, so the shared rules are written once and not in every line.
+
+### The brief: how you work there
+
+The worker loads no `CLAUDE.md`. Your full one wouldn't help anyway: it's written for Claude and would fill the
+shared context. Instead, `.cranker/brief.md` in the project (found in the caller's folder or the nearest one above
+it) goes into the system prompt of every `ask`, `batch` and `agent`. Keep it to the rules the code must follow:
+language, indentation, headers and markers, what never to do. `--brief FILE` uses another file, and `--brief ""`
+leaves it out. With a four-line brief, the same request for a C function went from spaces and no markers to tabs
+and `//ok, DD-MM-YYYY`, and passed a style check the first time.
+
 ### What to hand it, and what not
 
 | Hand it | Measured (Qwen3.8-27B Q4_K_XL, RTX 3090) |
@@ -343,9 +371,10 @@ useful thing you can send back.
 
 Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
 `cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `scale`, `extra` (more llama-server
-options), `system`, `sampling`, `max_tokens`. `worker.py config` prints the values in effect. These environment
-variables override them: `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`, `CRANKER_PORT`, `CRANKER_CTX`,
-`CRANKER_PARALLEL`, `CRANKER_SPEC`, `CRANKER_EXTRA`, `CRANKER_RATIO`.
+options), `system`, `sampling`, `max_tokens`, `check_retries`, `check_timeout`. `worker.py config` prints the
+values in effect. These environment variables override them: `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`,
+`CRANKER_PORT`, `CRANKER_CTX`, `CRANKER_PARALLEL`, `CRANKER_SPEC`, `CRANKER_EXTRA`, `CRANKER_RATIO`. `CRANKER_BRIEF`
+names the brief (or `none`). A project's brief is `.cranker/brief.md`.
 
 ## Where it came from
 
