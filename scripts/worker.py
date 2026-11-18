@@ -10,6 +10,7 @@ check: a command that exits 0 when an output is right ({out} is its path); the w
 and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
 the room, once; cut again, the task needs splitting. brief: .cranker/brief.md in the caller's folder or above it,
 how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md).
+out: an answer that is one fenced code block and nothing else is written without its fence (-o, a batch's "out").
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
 summary is printed (--print also prints the answer). From Windows PowerShell 5.1 a prompt with double quotes in it is
@@ -1142,10 +1143,27 @@ def summary(res, out):
     return lead + (f"-> {out}: " if out else "") + s
 
 
+# Asked for a file, the model often wraps the whole of it in one fenced block (```c ... ```). Written as it came, the
+# fence lines went into janus.c, its check failed on line 1, and the fixes went to the fence, not to the code
+# (18-11-2026). So an answer that is one fenced block and nothing else is written without the fence; any other
+# (prose, a markdown file with several blocks, text around the block) as it came.
+FENCED = re.compile(r"```[^`\r\n]*\r?\n(.*?\r?\n)?```", re.S)
+FENCE_LINE = re.compile(r"^[ \t]*```", re.M)
+
+
+def unfence(text):
+    """The inside of an answer that is exactly one fenced code block (whitespace around it aside, with or without a
+    language tag, no other fence inside); any other answer unchanged."""
+    m = FENCED.fullmatch(text.strip())
+    if not m or FENCE_LINE.search(m.group(1) or ""):
+        return text
+    return m.group(1) or ""
+
+
 def write_out(out, res, keep_thinking):
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(res["content"], encoding="utf-8")
+    out.write_text(unfence(res["content"]), encoding="utf-8")
     if keep_thinking and res["thinking"]:
         out.with_name(out.name + ".thinking.md").write_text(res["thinking"], encoding="utf-8")
 
@@ -1588,7 +1606,7 @@ def cmd_agent(args):
             + (f", ERROR {error}: {' '.join(result.split())[:300]}" if error else ""))
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(result, encoding="utf-8")
+        Path(args.out).write_text(unfence(result), encoding="utf-8")
     if args.print or not args.out:
         print(result)
     if error:

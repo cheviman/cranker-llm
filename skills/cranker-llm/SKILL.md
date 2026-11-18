@@ -107,7 +107,11 @@ that, and both go with every task that writes something:
   `CHECK FAILED` and the errors in `<out>.check.txt`. A cut answer is asked for again with 1.5 times the room, once,
   and its line starts `cut by max_tokens N`. **Don't run fix rounds by hand** (compile, read errors, write a
   prompt for each one, send again): that's the check's job. A check runs in the caller's folder, several at once in
-  a batch, so it writes only files of its own (one object file per task, say).
+  a batch, so it writes only files of its own (one object file per task, say). A check that runs the draft (a test
+  script, a program) builds the folder it runs in again on every run, never reusing one a previous round's draft
+  could have changed: a draft test's cleanup once deleted the project's `main.c`, and every later round failed on the
+  missing file instead of on its own errors. An answer that is one fenced block and nothing else (`` ```c ... ``` ``)
+  is written without its fence, so a check doesn't need to strip it.
 - **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`, and
   `--check` for all of them; a line's own value wins. The line then holds only what is its own.
 

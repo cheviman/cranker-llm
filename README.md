@@ -123,7 +123,9 @@ compile, read the errors, write a prompt for each one, send it again. In one por
 With a `check`, the worker runs the command itself, hands the model its own output with the errors, and repeats
 until it passes or runs out of `check_retries` (2 by default; from the second fix on, the model thinks first). The
 check is any command that exits 0 when the output is right, with `{out}` standing for the output's path. It runs in
-the caller's folder, several at once in a batch, so it must write only files of its own.
+the caller's folder, several at once in a batch, so it must write only files of its own. An answer that is one
+fenced code block and nothing else (`` ```c ... ``` ``) is written to `-o` or `out` without its fence, so the check
+sees the code and not the fence; any other answer (prose, a markdown file with several blocks) is written as it came.
 
 ```
 py scripts/worker.py ask --prompt-file spec.txt -o slug.py --check "py test_slug.py {out}"
