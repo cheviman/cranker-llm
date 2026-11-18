@@ -7,7 +7,8 @@
     worker.py usage [--since YYYY-MM-DD] [--all]
 
 check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
-and the errors until it passes or check_retries run out. brief: .cranker/brief.md in the caller's folder or above it,
+and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
+the room, once; cut again, the task needs splitting. brief: .cranker/brief.md in the caller's folder or above it,
 how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md).
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
@@ -938,9 +939,9 @@ def run_check(cmd, out):
     return r.returncode == 0, text or f"exit code {r.returncode}, no output"
 
 
-def log_quality(task_id, out, check, result, tries):
+def log_quality(task_id, out, check, result, tries, **extra):
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cwd": os.getcwd(), "id": task_id, "out": str(out),
-           "check": check, "result": result, "tries": tries}
+           "check": check, "result": result, "tries": tries, **extra}
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if session:
         rec["session"] = session
@@ -954,11 +955,27 @@ def log_quality(task_id, out, check, result, tries):
         pass
 
 
+# A cut answer (finish 'length') is unfinished whatever its check says, and the check's errors on it are only about
+# the missing end. Sent back as a fix with the same limit, it is cut again: on 17-11-2026 a CMake file of two parts
+# came back "CHECK FAILED: the reply must hold the second file" four times, and nothing said it had been cut. So it
+# is asked for again as it was, with RAISE times the room, once; cut again, the task needs splitting.
+RAISE = 1.5
+
+
+def answer_room(prompt, step, history):
+    """The most max_tokens a request can have: what the context holds beside its prompt, with post_with_room's
+    accounting (a request over it alone is refused there). None if the server cannot count it."""
+    need = needed_tokens({"messages": build_messages(prompt, step["files"], step["system"], history)})
+    return None if need is None else CFG["ctx"] - ADMIT_MARGIN - need
+
+
 def run_checked(t, cmd, keep_thinking, brief):
     """One task (a batch line, or ask's arguments in the same shape): runs it, writes 'out', and with a 'check'
     runs the check and hands the model its own output and the check's errors until it passes or the retries run
     out. The result says how it ended: check = pass (first time) | fixed (by its retries) | fail (left for Claude,
-    with the check's last output in out.check.txt)."""
+    with the check's last output in out.check.txt). A cut answer counts as failing: its retry asks for it again as
+    it was, with more max_tokens (RAISE, as far as the context holds it), once; 'raised' says from what to what, and
+    'split' why it stops when even that is cut."""
     out = Path(t["out"])
     args = dict(files=t.get("files", []), system=with_brief(t.get("system") or CFG["system"], brief),
                 think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
@@ -970,60 +987,99 @@ def run_checked(t, cmd, keep_thinking, brief):
         return res
     retries = t.get("retries", CFG["check_retries"])
     note = out.with_name(out.name + ".check.txt")
-    tries = 0
+    tries = fixes = 0
     totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
     previous = None
+    step, history = dict(args), None  # how the last answer was asked for: a cut one is asked for again the same way
+    raised = split = None
     while True:
         passed, log = run_check(check, out)
-        if passed or tries >= retries:
+        cut = res["finish"] == "length"
+        if (passed and not cut) or tries >= retries:
             break
+        if cut:
+            if raised:
+                split = f"after raising it from {raised[0]} for a first cut"
+                break
+            room = answer_room(t["prompt"], step, history)
+            limit = int(res["max_tokens"] * RAISE) if room is None else min(int(res["max_tokens"] * RAISE), room)
+            if limit <= res["max_tokens"]:
+                split = f"and the context has no room to raise it beside the prompt ({room} tokens at most)"
+                break
+            raised = (res["max_tokens"], limit)
+            # the same request with more room; with thinking, its budget stays and the room goes to the answer
+            step = {**step, "max_tokens": limit, "think_tokens": res["think_tokens"] or None}
+        else:
+            fixes += 1
+            same = res["content"].strip() == previous
+            previous = res["content"].strip()
+            history = [{"role": "assistant", "content": res["content"]},
+                       {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log,
+                                                                     again=SAME_AGAIN if same else "")}]
+            if not step["think"] and (fixes >= 2 or same):
+                # a plain fix that did not take: the next one thinks first (medium effort, so it does not spend
+                # the whole budget thinking). The answer keeps the room it had and the thinking comes on top: with
+                # the thinking default instead (10,000, 7,952 of it thinking), a 12,000-token task had 2,048 left
+                # to write its whole file again in, and was cut at line 206 (17-11-2026)
+                budget = think_budget(CFG["max_tokens_thinking"])
+                limit = res["max_tokens"] + budget
+                room = answer_room(t["prompt"], step, history)
+                if room is not None and limit > room:
+                    limit, budget = room, max(256, room - res["max_tokens"])
+                step = {**step, "think": True, "effort": step["effort"] or "medium", "max_tokens": limit,
+                        "think_tokens": budget}
         tries += 1
-        same = res["content"].strip() == previous
-        previous = res["content"].strip()
-        fix = [{"role": "assistant", "content": res["content"]},
-               {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log,
-                                                             again=SAME_AGAIN if same else "")}]
-        step = dict(args)
-        if not step["think"] and (tries >= 2 or same):
-            # a plain fix that did not take: the next one thinks first (medium effort, so it does not spend
-            # the whole budget thinking)
-            step.update(think=True, effort=step["effort"] or "medium", max_tokens=None)
-        res = run_task(t["prompt"], **step, history=fix, attempt=tries)
+        res = run_task(t["prompt"], **step, history=history, attempt=tries)
         for k in totals:
             totals[k] += res[k]
         write_out(out, res, keep_thinking)
     res.update(totals)
-    res["check"] = ("pass" if tries == 0 else "fixed") if passed else "fail"
-    res["tries"] = tries
-    if passed:
+    cut = res["finish"] == "length"
+    res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut else "fail"
+    res.update(tries=tries, raised=raised, split=split)
+    if res["check"] != "fail":
         note.unlink(missing_ok=True)
     else:
-        note.write_text(f"$ {check}\n{log}\n", encoding="utf-8")
-    log_quality(t.get("id"), out, check, res["check"], tries)
+        head = (cut_line(res) if cut else
+                f"max_tokens was raised {raised[0]} -> {raised[1]} after a cut; the check still fails:" if raised
+                else "")
+        note.write_text((head + "\n" if head else "") + f"$ {check}\n{log}\n", encoding="utf-8")
+    log_quality(t.get("id"), out, check, res["check"], tries,
+                **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
+                **({"split": True} if split else {}))
     return res
 
 
-def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None,
-             history=None, attempt=0):
-    """One request. history: more turns after the first (the model's last answer and what to fix in it)."""
-    if max_tokens is None:
-        max_tokens = CFG["max_tokens_thinking"] if think else CFG["max_tokens"]
+def build_messages(prompt, files=(), system=None, history=None):
     parts = [read_file_spec(f) for f in files]
     parts.append(prompt)
+    return ([{"role": "system", "content": system or CFG["system"]}, {"role": "user", "content": "\n".join(parts)}]
+            + (history or []))
+
+
+def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None,
+             history=None, attempt=0, think_tokens=None):
+    """One request. history: more turns after the first (the model's last answer and what to fix in it).
+    think_tokens: its thinking budget, when not think_budget(max_tokens): the room a cut answer gains goes to the
+    answer, not to more thinking. The result carries the limits it ran with (max_tokens, think_tokens) and 'limit',
+    the max_tokens of the request its answer came from (the recovery's, once recovered)."""
+    if max_tokens is None:
+        max_tokens = CFG["max_tokens_thinking"] if think else CFG["max_tokens"]
     sampling = dict(CFG["sampling"]["thinking" if think else "plain"])
     if temperature is not None:
         sampling["temperature"] = temperature
     kwargs = {"enable_thinking": bool(think)}
     if think and effort:
         kwargs["reasoning_effort"] = effort
-    messages = [{"role": "system", "content": system or CFG["system"]}, {"role": "user", "content": "\n".join(parts)}]
-    messages += history or []
+    messages = build_messages(prompt, files, system, history)
     body = {"model": CFG["alias"], "messages": messages, "max_tokens": max_tokens, "chat_template_kwargs": kwargs,
             **sampling}
     if think:
-        body["reasoning_budget_tokens"] = think_budget(max_tokens)
+        think_tokens = think_tokens or think_budget(max_tokens)
+        body["reasoning_budget_tokens"] = think_tokens
         body["reasoning_budget_message"] = BUDGET_MESSAGE
     res = _chat(body)
+    res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens)
     if think and not res["content"].strip() and res["thinking"]:
         # still no answer (a server that ignores the budget): the thinking goes back as text and the model concludes
         # from it without thinking; the summary says so, to be checked
@@ -1032,13 +1088,14 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                        "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
                                                      + RECOVER.format(thinking=res["thinking"])}],
                        **CFG["sampling"]["plain"]})
-        res.update(content=again["content"], finish=again["finish"], recovered=True,
+        res.update(content=again["content"], finish=again["finish"], recovered=True, limit=CFG["max_tokens"],
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
                    seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"])
     answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
     log_usage(cmd, res["prompt_tokens"], res["completion_tokens"], answer, res["seconds"], files=len(files),
-              **({"recovered": True} if res.get("recovered") else {}), **({"attempt": attempt} if attempt else {}))
+              **({"recovered": True} if res.get("recovered") else {}), **({"attempt": attempt} if attempt else {}),
+              **({"cut": res["limit"]} if res["finish"] == "length" else {}))
     return res
 
 
@@ -1050,21 +1107,39 @@ RESEND = ("next: send it again with something changed, not a fix by hand (unless
           "failure is that task with those parameters, not what the worker can't do.")
 
 
+def cut_line(res):
+    """What a cut answer says first (the task's line, and its .check.txt), before any check: a check's errors on an
+    unfinished answer are about its missing end"""
+    s = f"cut by max_tokens {res['limit']}"
+    if res.get("think_tokens") and not res.get("recovered"):
+        s += f" ({res['think_tokens']} of it a thinking budget)"
+    if res.get("split"):
+        return (f"{s}, {res['split']}: the task needs splitting, its answer does not fit in one reply (fewer files "
+                "or functions per task, line ranges)")
+    return s + ": the answer is unfinished, raise --max-tokens" + (" or think less" if res.get("think_tokens") else "")
+
+
 def summary(res, out):
     s = (f"in {res['prompt_tokens']} tok ({res['prompt_tps'] or 0:.0f} tok/s), "
          f"out {res['completion_tokens']} tok ({res['gen_tps'] or 0:.1f} tok/s), {res['seconds']:.1f} s")
     if res.get("recovered"):
         s += ", RECOVERED: its thinking ran out, the answer was concluded from it (check it)"
-    if res["finish"] != "stop":
-        s += f", FINISH={res['finish']} (cut: raise --max-tokens)"
+    lead = ""
+    if res["finish"] == "length":
+        lead = cut_line(res) + " "
+    elif res["finish"] != "stop":
+        s += f", FINISH={res['finish']}"
+    raised = res.get("raised")
+    raised = f" (max_tokens raised {raised[0]} -> {raised[1]} after a cut)" if raised else ""
+    fixes = f"{res.get('tries')} fix{'' if res.get('tries') == 1 else 'es'}"
     if res.get("check") == "pass":
         s += ", check passed"
     elif res.get("check") == "fixed":
-        s += f", check passed after {res['tries']} fix{'es' if res['tries'] > 1 else ''} by the worker"
+        s += f", check passed after {fixes} by the worker{raised}"
     elif res.get("check") == "fail":
-        s += (f", CHECK FAILED after {res['tries']} fix{'es' if res['tries'] != 1 else ''}"
+        s += (f", {'left for Claude' if lead else 'CHECK FAILED'} after {fixes}{raised}"
               + (f": {out}.check.txt" if out else ""))
-    return (f"-> {out}: " if out else "") + s
+    return lead + (f"-> {out}: " if out else "") + s
 
 
 def write_out(out, res, keep_thinking):
@@ -1145,7 +1220,7 @@ def cmd_batch(args):
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else ""))
     t0 = time.time()
-    failed = tokens = not_run = 0
+    failed = tokens = not_run = raised = split = 0
     checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
@@ -1167,8 +1242,10 @@ def cmd_batch(args):
                 failed += cut or bad
                 if res.get("check"):
                     checks[res["check"]] += 1
-                tag = "BAD " if bad else "CUT " if cut else "ok  "
-                print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad else None)}")
+                raised += bool(res.get("raised"))
+                split += bool(res.get("split"))
+                tag = "CUT " if cut else "BAD " if bad else "ok  "
+                print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad or cut else None)}")
             except WorkerBusy as e:  # never sent: not a failure of the task, and nothing to change in it
                 not_run += 1
                 print(f"WAIT {t.get('id', t['out'])}: {e}")
@@ -1184,6 +1261,10 @@ def cmd_batch(args):
     if any(checks.values()):
         print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
               f"{checks['fail']} still failing (their errors in <out>.check.txt)")
+    if raised or split:
+        print(f"cuts: {raised} answers cut by max_tokens asked for again with more (x{RAISE:g}, as far as the "
+              "context holds it)" + (f"; {split} need splitting, cut even so or with no room to raise "
+                                     "(their CUT lines)" if split else ""))
     if failed:
         print(RESEND)
     if not_run:

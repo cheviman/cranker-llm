@@ -135,6 +135,13 @@ with the last errors in `<out>.check.txt`, left for Claude. `usage` adds them up
 worker / for Claude). In a `batch`, `--check`, `--retries`, `--system-file` and `--prompt-prefix` apply to every
 task that doesn't set its own, so the shared rules are written once and not in every line.
 
+An answer cut by `max_tokens` is unfinished whatever its check says, and the check's errors on it are only about
+the missing end. So a cut answer is asked for again as it was, with 1.5 times the limit (as far as the context
+holds it beside the prompt; with `--think` the thinking budget stays and the extra goes to the answer), once. The
+task's line and its `.check.txt` start with `cut by max_tokens N`, and say `max_tokens raised N -> M` when the
+retry took it. Cut again, or with no room to raise it, the task stops there: it `needs splitting`. When a plain fix
+moves to thinking, the answer keeps the room it had and the thinking budget comes on top.
+
 ### The brief: how you work there
 
 The worker loads no `CLAUDE.md`. Your full one wouldn't help anyway: it's written for Claude and would fill the
@@ -361,6 +368,12 @@ off, and `CRANKER_RATIO` overrides it.
   as failed (`WAIT` in a batch, counted apart): nothing is wrong with it, and the same command again picks it up.
 - **A check that only parses proves that it parses.** The relay's first draft passed "it is valid Python" and
   failed on every request; sent back with the failure and a test that runs it, the next draft passed.
+- **A cut answer looked like a wrong one.** A batch task (`max_tokens` 12,000, `--retries 3`) wrote a CMake file
+  in two parts; the check said the second was missing, four times, and nothing said the answer had been cut. Its
+  first answers weren't (3,241 and 4,085 tokens): the fixes that think went to the thinking default, 10,000 with
+  7,952 of it to think, and had 2,048 left to write the whole file again in, cut at line 206. Now a fix that thinks
+  keeps the answer's room, a cut answer is asked for again with more, and its line says so first
+  (`tests/test_cut.py`).
 - **A rule to delegate is not enough; a number is.** With only the skill's guidance, Claude kept the heavy work and
   handed over the light. The scale and its note in the session's own context (see above) put a number on it.
 - **ngram speculation** (`--spec-type ngram-mod`) costs nothing on free text and makes rewrites 5x faster.

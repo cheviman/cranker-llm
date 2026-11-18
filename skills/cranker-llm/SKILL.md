@@ -104,7 +104,8 @@ that, and both go with every task that writes something:
 - **The check**: `--check "CMD {out}"` (or `"check"` in a batch line), a command that exits 0 when the output is
   right: a compile, a test, a style script. The worker runs it and hands the model its errors until it passes
   (`check_retries`, 2; from the second fix on it thinks first). What comes back to Claude is only what still fails:
-  `CHECK FAILED` and the errors in `<out>.check.txt`. **Don't run fix rounds by hand** (compile, read errors, write a
+  `CHECK FAILED` and the errors in `<out>.check.txt`. A cut answer is asked for again with 1.5 times the room, once,
+  and its line starts `cut by max_tokens N`. **Don't run fix rounds by hand** (compile, read errors, write a
   prompt for each one, send again): that's the check's job. A check runs in the caller's folder, several at once in
   a batch, so it writes only files of its own (one object file per task, say).
 - **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`, and
@@ -209,7 +210,9 @@ counts by project. Tests and benchmarks go with `CRANKER_USAGE_TAG=bench` so the
 ## If something fails
 
 - `server not running`: `py W start`. If it does not start: `logs/server.stdout.log` in the config's home.
-- `FINISH=length`: raise `--max-tokens`, or ask it to think less.
+- `cut by max_tokens N`: raise `--max-tokens`, or ask it to think less. With a check, the worker already asked for
+  it again with 1.5 times the room; `needs splitting` means even that was cut: fewer files or functions per task,
+  or line ranges, not a bigger limit.
 - `agent stopped: N turns in a row ended at the output cap`: what it had to write does not fit in a turn. One file
   per run, or have the code written by `ask`/`batch` with `--check`.
 - "Context size has been exceeded": see "The shared context". `curl -s http://127.0.0.1:8090/slots` shows the slots.
