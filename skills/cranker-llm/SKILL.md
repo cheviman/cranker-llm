@@ -78,6 +78,15 @@ py W agent --dir src --write /tmp/job1 -p "... write the results to results.md"
 outside `--write` is denied by Claude Code's permission rules. **Never give `--write` a repository**: the agent writes
 in its folder and Claude applies what it found.
 
+The agent is for **finding and putting together**, not for writing code. A turn has 8,000 tokens, its thinking
+included (capped at 4,096), so a file it writes must fit in the rest (~300 lines). It can write (measured: a
+100-line test and its 100-line export script from two 700-line sources, 23 turns, 34 minutes alone on the server),
+but code to write, tests included, goes first through `ask` or `batch` with `--check`, which compile or run it
+and leave the server to the other sessions. When a turn is cut twice in a row before it
+acts, the worker stops the agent at once and says so (`agent stopped: ...`): split the task, don't run it again as is.
+Run one agent at a time and read its result line before starting the next one: never chain several long agents in
+one background command and leave them unattended.
+
 Prompts to the worker in English. A prompt with double quotes or a long one goes in a file (`--prompt-file`):
 Windows PowerShell 5.1 splits `-p "..."` with `\"` inside into several arguments.
 
@@ -113,7 +122,14 @@ The context (64K by default) is **one pool for all the slots** (`-kvu`), not 8K 
 the pool overflows, the server does not refuse the new request: it fails **every** running request (HTTP 500,
 "Context size has been exceeded"). So:
 - **An agent runs alone**: it starts with the server idle, asks and batches wait while it runs, and two agents take
-  turns (a lock). For a search in a few files, Claude's own grep or an `ask` with the files is faster.
+  turns (a lock). For a search in a few files, Claude's own grep or an `ask` with the files is faster. An agent
+  takes the worker from **every session on the machine**, for up to its `--timeout`: keep it short, and don't
+  start one while other sessions' batches are running (`status` shows the requests and who has the worker).
+- **A task that waits says who it waits for**: `waiting, up to 30 min: an agent of session 601d636d
+  (vs-cheviman\saturn-fullset; 12 min in, 33 min left at most; "Write a test for...") has the worker`. When the
+  wait (`context_wait`, 30 min) runs out it ends as `not run` (`WAIT` in a batch), which is not a failure of the
+  task: tell the user which session has the worker, and run the same command again when it is free (a batch skips
+  what is done). Don't rewrite the task or do it by hand because of it.
 - **`ask` and `batch` send a request only when it fits** (counted with the server's tokenizer, answer included,
   against what the running requests hold); otherwise they wait. One that does not fit even alone fails at once:
   split it, use line ranges or lower `--max-tokens`.
@@ -127,6 +143,28 @@ the pool overflows, the server does not refuse the new request: it fails **every
 - Small things Claude does itself: a file under ~300 lines, a grep, a short diff cost less to read than to send.
 - **What the worker answers is a draft, not a finding**: every file:line and every fact used is checked in the code
   before telling the user or touching the repo.
+
+## When a task fails or comes back wrong
+
+Claude's reflex is to fix the output itself, or to do the task itself. That is the work the worker was for, and it
+is how a session ends with Claude doing everything and the scale at zero. In this order:
+
+1. **Send it again with something changed**, not the same thing and not a fix by hand: `--think` (or `--effort`),
+   more `--max-tokens` for a cut answer, a narrower task (line ranges, one function, one file), a `--check` that
+   proves it (the test or the compile, not only "it parses"), or the rule or example the prompt missed. The draft
+   and its error go back as files of the new task. A failed output ends with a `next:` line saying this.
+2. **Fix by hand only a slip of a line or two**: what is quicker to fix than to describe.
+3. **When the limit is the worker's own** (a cap, a timeout, a missing option, an error of the server), tell the
+   user in the report: what failed, with its numbers, and what in cranker-llm would fix it. Don't work around it in
+   silence, and don't wait an hour for it: a run that makes no progress is stopped and looked at.
+4. **One failure is that task with those parameters.** Don't conclude, tell the user or write to memory that "the
+   worker can't do X" from one run: say what was tried, with what, and what was not tried.
+
+**Consumed is not effective.** Everything the worker reads and writes is consumed and counts as that. A run that
+read and gave nothing back (an agent stopped or in an error, an empty answer) is not effective: it is not kept off
+Claude, not saved, and the scale is measured without it. `usage` and `local_share.py` show both numbers. And **a
+report of the worker's work is this session's own** (`usage --session`, its row in `local_share.py`), with both
+numbers: never another session's or project's added in, never consumption passed off as work done.
 
 ## What to delegate (measured with Qwen3.8-27B Q4_K_XL on an RTX 3090)
 
@@ -172,6 +210,8 @@ counts by project. Tests and benchmarks go with `CRANKER_USAGE_TAG=bench` so the
 
 - `server not running`: `py W start`. If it does not start: `logs/server.stdout.log` in the config's home.
 - `FINISH=length`: raise `--max-tokens`, or ask it to think less.
+- `agent stopped: N turns in a row ended at the output cap`: what it had to write does not fit in a turn. One file
+  per run, or have the code written by `ask`/`batch` with `--check`.
 - "Context size has been exceeded": see "The shared context". `curl -s http://127.0.0.1:8090/slots` shows the slots.
 - The agent's first request fails with HTTP 500 "System message must be at the beginning": the chat template was not
   patched. `start` patches it when `template` is `auto`; with another model whose template raises differently, see

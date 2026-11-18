@@ -24,7 +24,10 @@ environment variables in ENV_OVERRIDES. Standard library only.
 """
 
 import argparse
+import atexit
 import concurrent.futures
+import http.client
+import http.server
 import json
 import os
 import re
@@ -37,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 WINDOWS = os.name == "nt"
 HOME = Path(os.environ.get("CRANKER_HOME") or Path.home() / ".cranker-llm")
@@ -47,6 +51,7 @@ PID_FILE = LOGS / "server.pid"
 SERVER_LOG = LOGS / "server.log"
 USAGE_LOG = LOGS / "usage.jsonl"
 AGENT_LOCK = LOGS / "agent.lock"
+AGENT_INFO = LOGS / "agent.json"  # who holds AGENT_LOCK (agent_note)
 
 DEFAULTS = {
     "llama_server": "",        # path to llama-server; "" = HOME/bin, then PATH
@@ -73,6 +78,7 @@ DEFAULTS = {
     "context_wait": 1800,          # s a request waits for the shared context to have room
     "check_retries": 2,            # a task with a check: how many times the worker fixes its own output
     "check_timeout": 300,          # s one run of a check may take
+    "agent_think_budget": 4096,    # tokens an agent's turn may think before it must act (of its 8,000 per turn)
 }
 ENV_OVERRIDES = {"CRANKER_SERVER": "llama_server", "CRANKER_MODEL": "model",
                  "CRANKER_TEMPLATE": "template", "CRANKER_PORT": "port", "CRANKER_CTX": "ctx",
@@ -335,6 +341,12 @@ def cmd_status(args):
         print(f"not running ({URL}). {_vram_line()}")
         return 1
     print(f"running at {URL}; {_props_line()}; {_vram_line()}")
+    used, busy = used_tokens()
+    if busy:
+        print(f"busy: {busy} requests running, {used} tokens of the context held (an agent started now waits for "
+              "them, and then makes every other task wait for it)")
+    if agent_running():
+        print(f"taken: {agent_holder()} has the worker; asks and batches wait for it")
     return 0
 
 
@@ -393,8 +405,56 @@ def agent_running():
         return False
 
 
+def agent_note(state, timeout, task):
+    """The agent leaves its name where the tasks that wait for it can read it (agent_holder): they waited half an
+    hour and failed without a word on whose agent had the worker. The lock itself cannot hold it: on Windows a
+    locked byte is not readable."""
+    note = {"session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "pid": os.getpid(),
+            "since": time.time(), "timeout": timeout, "state": state, "task": " ".join(task.split())[:70]}
+    try:
+        AGENT_INFO.write_text(json.dumps(note), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def agent_holder():
+    """Whose agent has the worker, for a message: 'an agent of session 601d636d (vs-cheviman\\saturn-fullset; 12
+    min in, 33 min left at most; "Write a test for...")'. Only means something while agent_running(). 'an agent'
+    alone when there is no note, or it is too old to be this agent's (one that was killed leaves its note)."""
+    try:
+        a = json.loads(AGENT_INFO.read_text(encoding="utf-8"))
+        age = time.time() - a["since"]
+        if age > 2 * a["timeout"] + 60:
+            return "an agent"
+        sid = a.get("session")
+        if sid and sid == os.environ.get("CLAUDE_CODE_SESSION_ID"):
+            who = "this session's own agent"
+        elif sid:
+            who = f"an agent of session {sid[:8]}"
+        else:
+            who = f"an agent started outside Claude Code, pid {a.get('pid')}"
+        about = [project_of(a)]
+        if a.get("state") == "running":
+            about.append(f"{_span(age)} in, {_span(max(0, a['timeout'] - age))} left at most")
+        else:
+            about.append("waiting for the server to be idle")
+        if a.get("task"):
+            about.append(f"\"{a['task']}...\"")
+        return f"{who} ({'; '.join(about)})"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "an agent"
+
+
+def _span(seconds):
+    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
+
+
 class WorkerError(Exception):
     pass
+
+
+class WorkerBusy(WorkerError):
+    """The request was never sent: the worker was taken for the whole wait. Nothing is wrong with the task."""
 
 
 def needed_tokens(body):
@@ -514,8 +574,9 @@ def post_with_room(path, body):
         fut = None
         with _Admission():
             used, busy = used_tokens()
-            if agent_running():
-                error = "an agent is running (it takes the context alone)"
+            agent = agent_running()
+            if agent:
+                error = f"{agent_holder()} has the worker (an agent takes the context alone)"
             elif busy == 0 or need is None or need + used <= ctx - ADMIT_MARGIN:
                 fut = _post_seen(path, body)
             else:
@@ -532,9 +593,13 @@ def post_with_room(path, body):
                     raise WorkerError(f"HTTP {e.code}: {text[:500]}")
                 error = f"HTTP {e.code}: {text[:300]}"
         if time.time() - t0 > CFG["context_wait"]:
-            raise WorkerError(f"{error} -- still no room after {CFG['context_wait']} s")
+            if fut is not None:
+                raise WorkerError(f"{error} -- still no room after {CFG['context_wait']} s")
+            raise WorkerBusy(f"not run: {error}, still after {_span(CFG['context_wait'])} of waiting. Nothing is "
+                             "wrong with the task: run it again when "
+                             + ("that agent ends, or ask its session" if agent else "the worker has room"))
         if not noted:
-            print(f"context full ({error}): waiting for room", file=sys.stderr)
+            print(f"waiting, up to {_span(CFG['context_wait'])}: {error}", file=sys.stderr)
             noted = True
         time.sleep(15)
 
@@ -590,6 +655,10 @@ def cmd_usage(args):
     if not USAGE_LOG.exists():
         print(f"nothing logged yet ({USAGE_LOG})")
         return 0
+    session = args.session
+    if session == "":
+        print("--session: not called from a Claude Code session (CLAUDE_CODE_SESSION_ID is not set): give its id")
+        return 1
     recs = []
     for line in USAGE_LOG.read_text(encoding="utf-8").splitlines():
         try:
@@ -600,39 +669,59 @@ def cmd_usage(args):
             continue
         if r.get("tag") and not args.all:
             continue
+        if session and not str(r.get("session", "")).startswith(session):
+            continue
         recs.append(r)
+    only = f" by session {session[:8]}" if session else ""
     if not recs:
-        print("nothing logged" + (f" since {args.since}" if args.since else "")
+        print(f"nothing logged{only}" + (f" since {args.since}" if args.since else "")
               + ("" if args.all else " (--all adds the benchmarks)"))
         return 0
 
     def table(title, key):
         rows = {}
         for r in recs:
-            a = rows.setdefault(key(r), [0, 0, 0, 0, 0.0])
+            a = rows.setdefault(key(r), [0, 0, 0, 0, 0.0, 0])
             a[0] += 1
             a[1] += r["in"]
             a[2] += r["out"]
             a[3] += r["answer"]
             a[4] += r["s"]
+            a[5] += 0 if run_failed(r) else r["in"] - r["answer"]
         print(f"\n{title:<34} {'requests':>8} {'in':>11} {'out':>9} {'answer':>9} {'kept off Claude':>16} {'hours':>6}")
-        for k, (n, i, o, ans, s) in sorted(rows.items(), key=lambda kv: -kv[1][1]):
-            print(f"{str(k)[:34]:<34} {n:>8} {i:>11,} {o:>9,} {ans:>9,} {i - ans:>16,} {s / 3600:>6.1f}")
+        for k, (n, i, o, ans, s, kept) in sorted(rows.items(), key=lambda kv: -kv[1][1]):
+            print(f"{str(k)[:34]:<34} {n:>8} {i:>11,} {o:>9,} {ans:>9,} {kept:>16,} {s / 3600:>6.1f}")
         if len(rows) > 1:
-            n, i, o, ans, s = (sum(v[j] for v in rows.values()) for j in range(5))
-            print(f"{'total':<34} {n:>8} {i:>11,} {o:>9,} {ans:>9,} {i - ans:>16,} {s / 3600:>6.1f}")
+            n, i, o, ans, s, kept = (sum(v[j] for v in rows.values()) for j in range(6))
+            print(f"{'total':<34} {n:>8} {i:>11,} {o:>9,} {ans:>9,} {kept:>16,} {s / 3600:>6.1f}")
 
-    print(f"{USAGE_LOG}: {len(recs)} requests from {recs[0]['ts']} to {recs[-1]['ts']}"
+    print(f"{USAGE_LOG}: {len(recs)} requests{only} from {recs[0]['ts']} to {recs[-1]['ts']}"
           + ("" if args.all else " (benchmarks left out: --all)"))
     table("command", lambda r: r["cmd"] + (f" [{r['tag']}]" if r.get("tag") else ""))
     table("project (the caller's folder)", project_of)
     table("day", lambda r: r["ts"][:10])
-    cost_table(recs, project_of)
-    quality_table(args.since, args.all)
-    guard_line(args.since)
+    cost_table([r for r in recs if not run_failed(r)], project_of)
+    quality_table(args.since, args.all, session)
+    if not session:
+        guard_line(args.since)
+    lost = [r for r in recs if run_failed(r)]
+    if lost:
+        spent = sum(r["in"] + r["out"] for r in recs)
+        gone = sum(r["in"] + r["out"] for r in lost)
+        print(f"\nconsumed {spent:,} tokens (in + out), effective {spent - gone:,}: {len(lost)} runs read and "
+              f"gave nothing back (an agent stopped or in an error, an empty answer), {gone:,} tokens and "
+              f"{sum(r['s'] for r in lost) / 3600:.1f} hours. They count as consumed ('in', 'out', 'hours') and "
+              "not as kept off Claude or saved")
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
     return 0
+
+
+def run_failed(r):
+    """A run that read and gave nothing back: an agent the worker stopped or that ended in an error, an empty
+    answer. Its tokens were consumed, and count as that, but they were not effective: nothing was kept off Claude,
+    and scripts/local_share.py measures the scale on the effective ones."""
+    return bool(r.get("stopped") or r.get("error") or not r.get("answer"))
 
 
 # USD per million tokens (input, output): Anthropic's API list prices on 2026-11-03. Cache reads are $0.20 on both.
@@ -643,7 +732,7 @@ def project_of(r):
     return os.sep.join(Path(r.get("cwd", "?")).parts[-2:])
 
 
-def quality_table(since=None, include_tagged=False):
+def quality_table(since=None, include_tagged=False, session=None):
     """The tasks that came with a check: how many were right the first time, how many the worker fixed itself and
     how many were left for Claude to fix. The rework Claude does on outputs without a check is not seen here."""
     if not QUALITY_LOG.exists():
@@ -655,6 +744,8 @@ def quality_table(since=None, include_tagged=False):
         except ValueError:
             continue
         if (since and r["ts"][:10] < since) or (r.get("tag") and not include_tagged):
+            continue
+        if session and not str(r.get("session", "")).startswith(session):
             continue
         recs.append(r)
     if not recs:
@@ -951,6 +1042,14 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     return res
 
 
+# What a failed task's output ends with. Claude's reflex with a wrong output is to fix it itself, which is the work
+# the worker was for, and then to write off the worker for that kind of task: the line says what to do instead.
+RESEND = ("next: send it again with something changed, not a fix by hand (unless it is a slip of a line or two): "
+          "--think, more --max-tokens, a narrower task (line ranges, one function), a --check, or the rule or example "
+          "the prompt missed. If the limit is the worker's own, tell the user what in cranker-llm would fix it. One "
+          "failure is that task with those parameters, not what the worker can't do.")
+
+
 def summary(res, out):
     s = (f"in {res['prompt_tokens']} tok ({res['prompt_tps'] or 0:.0f} tok/s), "
          f"out {res['completion_tokens']} tok ({res['gen_tps'] or 0:.1f} tok/s), {res['seconds']:.1f} s")
@@ -1019,7 +1118,10 @@ def cmd_ask(args):
     if args.print or not args.out:
         print(res["content"])
     print(summary(res, args.out), file=sys.stderr if not args.out else sys.stdout)
-    return 0 if res["finish"] == "stop" and res.get("check") != "fail" else 2
+    if res["finish"] == "stop" and res.get("check") != "fail":
+        return 0
+    print(RESEND, file=sys.stderr if not args.out else sys.stdout)
+    return 2
 
 
 def cmd_batch(args):
@@ -1043,7 +1145,7 @@ def cmd_batch(args):
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else ""))
     t0 = time.time()
-    failed = tokens = 0
+    failed = tokens = not_run = 0
     checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
@@ -1067,27 +1169,36 @@ def cmd_batch(args):
                     checks[res["check"]] += 1
                 tag = "BAD " if bad else "CUT " if cut else "ok  "
                 print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad else None)}")
+            except WorkerBusy as e:  # never sent: not a failure of the task, and nothing to change in it
+                not_run += 1
+                print(f"WAIT {t.get('id', t['out'])}: {e}")
             except urllib.error.HTTPError as e:
                 failed += 1
                 print(f"FAIL {t.get('id', t['out'])}: {_http_error(e)}")
             except Exception as e:
                 failed += 1
                 print(f"FAIL {t.get('id', t['out'])}: {e}")
-    print(f"done: {len(todo) - failed} ok, {failed} failed or cut, {tokens} tokens out in {time.time() - t0:.0f} s"
+    print(f"done: {len(todo) - failed - not_run} ok, {failed} failed or cut, "
+          + (f"{not_run} not run, " if not_run else "") + f"{tokens} tokens out in {time.time() - t0:.0f} s"
           + (f"; paused {len(waits)} times for GPU heat ({sum(waits):.0f} s)" if waits else ""))
     if any(checks.values()):
         print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
-              f"{checks['fail']} left for Claude (their errors in <out>.check.txt)")
-    return 0 if failed == 0 else 2
+              f"{checks['fail']} still failing (their errors in <out>.check.txt)")
+    if failed:
+        print(RESEND)
+    if not_run:
+        print(f"{not_run} tasks were not run: the worker was taken for the whole wait (see their WAIT lines for "
+              "who had it). They did not fail: run the same batch again, the finished tasks are skipped")
+    return 0 if failed == 0 and not_run == 0 else 2
 
 
 # ------------------------------------------------------------------------------------------------------- agent
 
-def agent_env():
+def agent_env(url):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_OAUTH", "AWS_BEARER"))}
     alias = CFG["alias"]
     env.update({
-        "ANTHROPIC_BASE_URL": URL,  # everything goes to the local server, nothing to Anthropic
+        "ANTHROPIC_BASE_URL": url,  # the relay to the local server (AgentRelay): nothing goes to Anthropic
         "ANTHROPIC_API_KEY": "local",
         "ANTHROPIC_MODEL": alias,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": alias,
@@ -1098,9 +1209,172 @@ def agent_env():
         # and ends in an API error past the context; it compacts with room left for the compaction's own request
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(CFG["ctx"]),
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(CFG["ctx"] - 10000),
-        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+        # a turn's output, its thinking included: the relay caps the thinking at agent_think_budget
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(AGENT_MAX_OUTPUT),
     })
     return env
+
+
+AGENT_MAX_OUTPUT = 8000
+AGENT_STALL = 2  # turns in a row cut at AGENT_MAX_OUTPUT: the agent is stopped instead of thinking again from scratch
+
+
+def kill_tree(p):
+    """Ends a process and the ones it started (Claude Code runs rg and shells). Elsewhere than Windows it must have
+    been started in a session of its own (start_new_session), so that its group is only its own tree."""
+    if WINDOWS:
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+        return
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        p.kill()
+
+
+class AgentRelay:
+    """Between the agent's Claude Code and llama-server. Claude Code asks for adaptive thinking, which llama-server
+    reads as no limit: before writing a file the model thought past its 8,000-token turn, was cut, lost that
+    thinking and thought again from scratch, turn after turn (three agents, 25 to 45 minutes each, nothing
+    written). Claude Code has no setting for it, so the relay gives every request a thinking budget, which the
+    server honours, drops the thinking of earlier turns from the context, and counts the turns cut in a row."""
+    TURN = 1024  # a request with fewer max_tokens is not a turn of the agent (a title, a probe): its cut is no stall
+
+    def __init__(self, upstream, budget, stall_limit=AGENT_STALL):
+        parts = urlsplit(upstream)
+        self._host, self._port = parts.hostname, parts.port or 80
+        self.budget = budget
+        self.stall_limit = stall_limit
+        self.cuts = 0          # turns in a row that ended at max_tokens
+        self.stalled = False   # stall_limit of them: the caller stops the agent
+        self.requests = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.url = None
+        self._lock = threading.Lock()
+        self._server = None
+
+    def _rewrite(self, body):
+        """(the request's body with the budget and without old thinking, its max_tokens); (body, 0) if not JSON"""
+        try:
+            obj = json.loads(body)
+            if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list):
+                return body, 0
+        except ValueError:
+            return body, 0
+        max_tokens = obj.get("max_tokens") or AGENT_MAX_OUTPUT
+        obj["thinking"] = {"type": "enabled", "budget_tokens": min(self.budget, think_budget(max_tokens))}
+        turns = [m for m in obj["messages"] if isinstance(m, dict) and m.get("role") == "assistant"]
+        for m in turns[:-1]:  # the last turn keeps its thinking: the model is still in it
+            if isinstance(m.get("content"), list):
+                kept = [b for b in m["content"]
+                        if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))]
+                if kept:
+                    m["content"] = kept
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8"), max_tokens
+
+    def _count(self, max_tokens, stop_reason, tok_in, tok_out):
+        with self._lock:
+            self.requests += 1
+            self.tokens_in += tok_in
+            self.tokens_out += tok_out
+            if max_tokens < self.TURN:
+                return
+            if stop_reason == "max_tokens":
+                self.cuts += 1
+                self.stalled = self.stalled or self.cuts >= self.stall_limit
+            else:
+                self.cuts = 0
+
+    def start(self):
+        relay = self
+
+        def usage_in(u):
+            return sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                               "cache_creation_input_tokens"))
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # nothing printed: the caller reads the agent's JSON
+                pass
+
+            def _handle(self):
+                length = self.headers.get("Content-Length")
+                body = self.rfile.read(int(length)) if length else None
+                messages = self.command == "POST" and self.path.split("?")[0] == "/v1/messages"
+                max_tokens = 0
+                if messages and body:
+                    body, max_tokens = relay._rewrite(body)
+                skip = ("host", "content-length", "connection", "accept-encoding", "transfer-encoding")
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
+                if body is not None:
+                    headers["Content-Length"] = str(len(body))
+                conn = http.client.HTTPConnection(relay._host, relay._port, timeout=None)  # a turn takes minutes
+                try:
+                    conn.request(self.command, self.path, body=body, headers=headers)
+                    resp = conn.getresponse()
+                except (OSError, http.client.HTTPException) as e:
+                    err = json.dumps({"type": "error", "error": {"type": "api_error",
+                                                                 "message": f"cranker relay: {e}"}}).encode("utf-8")
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in ("content-length", "transfer-encoding", "connection"):
+                        self.send_header(k, v)
+                self.send_header("Connection", "close")  # HTTP/1.0, ended by the close: a stream goes line by line
+                self.end_headers()
+                stream = "text/event-stream" in (resp.getheader("Content-Type") or "")
+                stop_reason, tok_in, tok_out, whole = None, 0, 0, b""
+                try:
+                    while True:
+                        line = resp.readline()
+                        if not line:
+                            break
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                        if not stream:
+                            whole += line
+                        elif messages and line.startswith(b"data:"):
+                            try:
+                                ev = json.loads(line[5:])
+                            except ValueError:
+                                continue
+                            if ev.get("type") == "message_start":
+                                tok_in = usage_in((ev.get("message") or {}).get("usage") or {})
+                            elif ev.get("type") == "message_delta":
+                                stop_reason = (ev.get("delta") or {}).get("stop_reason") or stop_reason
+                                tok_out = (ev.get("usage") or {}).get("output_tokens") or tok_out
+                except (OSError, http.client.HTTPException):
+                    pass  # the client or the server went away: what was copied is what there is
+                finally:
+                    conn.close()
+                if not messages:
+                    return
+                if not stream:
+                    try:
+                        obj = json.loads(whole)
+                        stop_reason = obj.get("stop_reason")
+                        tok_in, tok_out = usage_in(obj.get("usage") or {}), (obj.get("usage") or {}).get(
+                            "output_tokens") or 0
+                    except (ValueError, AttributeError):
+                        pass
+                relay._count(max_tokens, stop_reason, tok_in, tok_out)
+
+            do_GET = do_POST = do_HEAD = do_PUT = do_DELETE = _handle
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._server.handle_error = lambda *a: None  # a client that hangs up mid-answer is not worth a traceback
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
 
 
 AGENT_APPEND = ("You are a worker another agent handed a task to. Be brief and concrete; cite files with line "
@@ -1125,7 +1399,8 @@ def agent_turn(wait):
                 f.close()
                 return None
             if not noted:
-                print("another agent is running (two do not fit in the context): waiting for it", file=sys.stderr)
+                print(f"waiting, up to {_span(wait)}: {agent_holder()} has the worker (two agents do not fit in "
+                      "the context)", file=sys.stderr)
                 noted = True
             time.sleep(5)
 
@@ -1133,10 +1408,17 @@ def agent_turn(wait):
 def cmd_agent(args):
     if not healthy():
         return _not_running()
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
+    if not prompt:
+        print("no prompt (-p or --prompt-file)")
+        return 1
     turn = agent_turn(args.timeout)  # held until this process ends
     if turn is None:
-        print(f"another agent still running after {args.timeout} s")
+        print(f"not run: {agent_holder()} still has the worker after {_span(args.timeout)} of waiting. Nothing is "
+              "wrong with the task: run it again when that agent ends, or ask its session")
         return 2
+    agent_note("waiting", args.timeout, prompt)
+    atexit.register(lambda: AGENT_INFO.unlink(missing_ok=True))  # ours: nobody else writes it while the lock is held
     # the agent takes the context alone: its requests grow with every file it reads, so it starts with the server
     # idle, and asks and batches wait while it runs (post_with_room, agent_running)
     t0 = time.time()
@@ -1146,16 +1428,13 @@ def cmd_agent(args):
         if busy == 0:
             break
         if time.time() - t0 > args.timeout:
-            print(f"the server still busy after {args.timeout} s ({used} tokens held by {busy} requests)")
+            print(f"not run: the server still busy after {_span(args.timeout)} of waiting ({used} tokens held by "
+                  f"{busy} requests of other tasks). Nothing is wrong with the task: run it again when they end")
             return 2
         if not noted:
             print(f"{used} tokens held by {busy} requests: the agent waits for the server to be idle", file=sys.stderr)
             noted = True
         time.sleep(15)
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
-    if not prompt:
-        print("no prompt (-p or --prompt-file)")
-        return 1
     tools = ["Read", "Grep", "Glob"]
     allowed = ["Read", "Grep", "Glob"]
     cwd = Path(args.write).resolve() if args.write else (LOGS / "agent")
@@ -1177,34 +1456,64 @@ def cmd_agent(args):
            "--append-system-prompt", with_brief(AGENT_APPEND, brief)]
     for d in args.dir or []:
         cmd += ["--add-dir", d]
+    relay = AgentRelay(URL, CFG["agent_think_budget"], stall_limit=AGENT_STALL)
+    relay.start()
+    agent_note("running", args.timeout, prompt)
     t0 = time.time()
+    stopped = None
     try:
-        r = subprocess.run(cmd, cwd=cwd, env=agent_env(), capture_output=True, text=True, encoding="utf-8",
-                           timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        print(f"agent timed out after {args.timeout} s")
+        p = subprocess.Popen(cmd, cwd=cwd, env=agent_env(relay.url), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", start_new_session=not WINDOWS)  # see kill_tree
+        while True:
+            try:
+                stdout, stderr = p.communicate(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                if relay.stalled:
+                    stopped = (f"stopped: {relay.cuts} turns in a row ended at the output cap ({AGENT_MAX_OUTPUT} "
+                               f"tokens, thinking included) before it acted. What it has to write does not fit in "
+                               f"one turn: one file per run, or write it with ask/batch and --check")
+                elif time.time() - t0 > args.timeout:
+                    stopped = f"timed out after {args.timeout} s"
+                if stopped:
+                    kill_tree(p)
+                    stdout, stderr = p.communicate()
+                    break
+    finally:
+        relay.stop()
+    if stopped:
+        log_usage("agent", relay.tokens_in, relay.tokens_out, 0, time.time() - t0, turns=relay.requests,
+                  stopped="stall" if relay.stalled else "timeout")
+        print(RESEND)
+        print(f"agent {stopped} ({relay.requests} requests, {time.time() - t0:.0f} s, in {relay.tokens_in} tok, "
+              f"out {relay.tokens_out} tok)")
         return 2
     try:
-        d = json.loads(r.stdout)
+        d = json.loads(stdout)
     except Exception:
-        print(f"agent failed (exit {r.returncode}): {(r.stderr or r.stdout)[:800]}")
+        print(f"agent failed (exit {p.returncode}): {(stderr or stdout)[:800]}")
         return 1
     result = d.get("result") or ""
     u = d.get("usage", {})
     tokens_in = ((u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
                  + (u.get("cache_creation_input_tokens") or 0))
+    error = (d.get("terminal_reason") or "error") if d.get("is_error") else None
     log_usage("agent", tokens_in, u.get("output_tokens"), count_tokens(result), time.time() - t0,
-              turns=d.get("num_turns"))
+              turns=d.get("num_turns"), **({"error": error} if error else {}))
+    # with an error the result is the error's text: it goes on the last line, where a caller that reads only the
+    # tail of the output still sees why
     line = (f"turns {d.get('num_turns')}, {time.time() - t0:.0f} s, in {tokens_in} tok, "
             f"out {u.get('output_tokens')} tok, denials {len(d.get('permission_denials') or [])}"
-            + (f", ERROR {d.get('terminal_reason')}" if d.get("is_error") else ""))
+            + (f", ERROR {error}: {' '.join(result.split())[:300]}" if error else ""))
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(result, encoding="utf-8")
     if args.print or not args.out:
         print(result)
+    if error:
+        print(RESEND)
     print((f"-> {args.out}: " if args.out else "") + line)
-    return 1 if d.get("is_error") else 0
+    return 1 if error else 0
 
 
 # -------------------------------------------------------------------------------------------------------- main
@@ -1260,6 +1569,8 @@ def main():
     p = sub.add_parser("usage", help="tokens through the local model, by command, project and day")
     p.add_argument("--since", help="YYYY-MM-DD")
     p.add_argument("--all", action="store_true", help="also the runs tagged with CRANKER_USAGE_TAG")
+    p.add_argument("--session", nargs="?", const=os.environ.get("CLAUDE_CODE_SESSION_ID") or "",
+                   help="only one Claude Code session's requests: the calling one, or the id given (its start)")
     args = ap.parse_args()
     return {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "config": cmd_config, "ask": cmd_ask,
             "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)

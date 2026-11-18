@@ -108,8 +108,9 @@ against ~30 for one request). Tasks whose output exists are skipped, so a batch 
 ```
 
 **`agent`**: Claude Code itself, headless, running on the local model, with Read, Grep and Glob, and Write and Edit
-inside its own folder only. For "find everything that touches X across these folders and put it together". It
-loads none of your Claude Code settings (no hooks, plugins, CLAUDE.md or MCP servers).
+inside its own folder only. For "find everything that touches X across these folders and put it together", not
+for writing code: a turn has 8,000 tokens with its thinking (capped at 4,096), and code is better written by `ask`
+or `batch` with a check. It loads none of your Claude Code settings (no hooks, plugins, CLAUDE.md or MCP servers).
 
 ```
 py scripts/worker.py agent --dir src --dir include -o answer.md -p "Who writes to e->state? file:line for each."
@@ -263,6 +264,13 @@ total                                          7.80            15.59            
   read early in a long session is paid for more than once.
 - **hours** adds up each request's time; requests run in parallel, so the wall clock was shorter.
 - On a subscription, the same tokens come off its usage limits instead of a bill.
+- **Consumed is not effective.** A run that read and gave nothing back (an agent the worker stopped or that ended
+  in an error, an empty answer) is in `in`, `out` and `hours`, because it was consumed, and not in "kept off
+  Claude" or the savings. `usage` says how much of each there was. One day's two failed agents had read 505K tokens
+  and were reported as 505K saved.
+- **`usage --session`** shows only the calling Claude Code session's requests (or `--session ID`). Asked how much
+  the worker had done in a session, Claude answered with every project's total; `/worker-usage` now leads with the
+  session's own.
 
 Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless `--all`.
 
@@ -289,7 +297,8 @@ session   project (where it started)                    Claude       local   rat
   one count per message, subagents included. Cache reads are left out, because they are the same context sent again
   on every turn: that day they came to 800M against the 10M new.
 - **The worker's** are `in` + `out` from `usage.jsonl`. Every request logs the Claude Code session that made it, so
-  each session's share is exact.
+  each session's share is exact. That is what it consumed; the scale is measured on the effective part, without
+  the runs that read and gave nothing back, and `local_share.py` shows both. Tokens that only burnt don't move it.
 - **The hook** (`PostToolUse` on Read, Grep, Glob, Edit, Write and Agent, and `UserPromptSubmit`): when a session that
   has used the worker is below the scale, it adds a note to Claude's context with the session's numbers and what
   counts as real load. That means first drafts of the code Claude is about to write (for Claude to review), maps,
@@ -330,6 +339,28 @@ off, and `CRANKER_RATIO` overrides it.
   leaving up to 2,048 tokens for the answer: past it, the server closes the thinking and the model answers. If an
   answer still comes back empty, the worker sends the cut thinking back and asks for the conclusion, and says
   `RECOVERED` so the answer gets checked. Maps and summaries run without `--think`.
+- **Claude Code asks for adaptive thinking, and llama-server reads that as no limit.** Three agents asked to write
+  a test against its reference spent 25 to 45 minutes each and wrote nothing: before writing, Qwen thought past
+  the agent's 8,000-token turn, Claude Code asked it to resume, the cut thinking was dropped and the model thought
+  again from scratch, four or five times, until an API error, the timeout or a context overflow. Claude Code has no
+  setting that changes it (`MAX_THINKING_TOKENS`, the effort level), while `"thinking": {"type": "enabled",
+  "budget_tokens": N}` is honoured. So the agent talks to a relay inside `worker.py` that gives every request that
+  budget (`agent_think_budget`, 4,096), drops the thinking of earlier turns from the context, and stops the agent
+  when two turns in a row are cut before it acts. With it, one of those three tasks ran to the end: 23 turns, 34
+  minutes, no turn cut, its three files written.
+- **Claude fixes a wrong output itself rather than send it again, and then writes the worker off.** After those
+  three agents, the session noted "the worker's agents are no good for writing tests" in its memory. The cause was
+  one setting. Now a failed `ask`, `batch` or `agent` ends with a `next:` line: send it again with something
+  changed (`--think`, more `--max-tokens`, a narrower task, a `--check`), say so when the limit is the worker's
+  own, and don't take one failure for what the worker can't do. The skill and the scale's note say the same.
+- **An agent takes the worker from every session, and nothing said whose it was.** While one ran for 34 minutes,
+  another session's batches waited their 30 and ended as failed, with "an agent is running". Now the agent leaves
+  a note (its session, its folder, when it started, its time limit, how its prompt begins), and a task that waits
+  says it: `an agent of session 601d636d (vs-cheviman\saturn-fullset; 12 min in, 33 min left at most; "Write a
+  test for...") has the worker`. `status` says it too. A task that waited the whole time ends as `not run`, not
+  as failed (`WAIT` in a batch, counted apart): nothing is wrong with it, and the same command again picks it up.
+- **A check that only parses proves that it parses.** The relay's first draft passed "it is valid Python" and
+  failed on every request; sent back with the failure and a test that runs it, the next draft passed.
 - **A rule to delegate is not enough; a number is.** With only the skill's guidance, Claude kept the heavy work and
   handed over the light. The scale and its note in the session's own context (see above) put a number on it.
 - **ngram speculation** (`--spec-type ngram-mod`) costs nothing on free text and makes rewrites 5x faster.

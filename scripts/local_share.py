@@ -4,8 +4,10 @@ of Claude (5 by default: a million local for 200K of Claude). A target, not a ru
 Claude's tokens are what each turn adds, from Claude Code's transcripts (CLAUDE_CONFIG_DIR or ~/.claude, projects/):
 input + cache writes + output, one count per message id, subagents included. Cache reads are left out: they are the
 same context sent again on every turn, and they run to dozens of times the rest. The worker's are in + out from
-usage.jsonl (its thinking too), benchmarks left out. Each request carries the calling session's id
-(CLAUDE_CODE_SESSION_ID), so a session's own share is exact.
+usage.jsonl (its thinking too), benchmarks left out. That is what it consumed; the effective part leaves out the runs
+that read and gave nothing back (an agent stopped or in an error, an empty answer), and the scale is measured on it:
+both are shown. Each request carries the calling session's id (CLAUDE_CODE_SESSION_ID), so a session's own share is
+exact.
 
     local_share.py [--day YYYY-MM-DD]   the day: in all, and by session
     local_share.py --hook               the hook (hooks/hooks.json: PostToolUse and UserPromptSubmit)
@@ -111,6 +113,18 @@ def local_rows(day=None):
     return rows
 
 
+def spent(r):
+    """What a request consumed: everything the model read and wrote, whether or not anything came back"""
+    return r["in"] + r["out"]
+
+
+def work(r):
+    """A request's effective tokens: its consumption, or 0 for a run that read and gave nothing back (an agent the
+    worker stopped or that ended in an error, an empty answer). The scale is measured on these: it is about work
+    done, and tokens that only burnt must not move it."""
+    return 0 if r.get("stopped") or r.get("error") or not r.get("answer") else spent(r)
+
+
 def ratio_text(local, claude):
     return f"{local / claude:.2f} to 1" if claude else "no Claude tokens yet"
 
@@ -120,39 +134,56 @@ def report(day, s):
     files = [f for f in PROJECTS.rglob("*.jsonl") if f.stat().st_mtime >= start] if PROJECTS.exists() else []
     claude = claude_tokens(files, day)
     rows = local_rows(day)
-    by_session = {}
+    by_session = {}  # session: [consumed, effective]
     for r in rows:
         if r.get("session"):
-            by_session[r["session"]] = by_session.get(r["session"], 0) + r["in"] + r["out"]
+            a = by_session.setdefault(r["session"], [0, 0])
+            a[0] += spent(r)
+            a[1] += work(r)
     c_total = sum(v[0] for v in claude.values())
-    l_total = sum(r["in"] + r["out"] for r in rows)
-    print(f"{day}: Claude {c_total:,} new tokens, the local worker {l_total:,}: {ratio_text(l_total, c_total)} "
-          f"(the scale: {s['ratio']:g} to 1, {int(c_total * s['ratio']):,} local)")
+    l_spent = sum(spent(r) for r in rows)
+    l_total = sum(work(r) for r in rows)
+    print(f"{day}: Claude {c_total:,} new tokens; the local worker consumed {l_spent:,}, {l_total:,} of them "
+          f"effective: {ratio_text(l_total, c_total)} (the scale: {s['ratio']:g} to 1, "
+          f"{int(c_total * s['ratio']):,} local)")
     shown = [(sid, c, cwd) for sid, (c, cwd) in claude.items() if c >= 20_000 or by_session.get(sid)]
     if shown:
-        print(f"\n{'session':<9} {'project (where it started)':<40} {'Claude':>11} {'local':>11} {'ratio':>7}")
+        print(f"\n{'session':<9} {'project (where it started)':<40} {'Claude':>11} {'consumed':>11} "
+              f"{'effective':>11} {'ratio':>7}")
         for sid, c, cwd in sorted(shown, key=lambda t: -t[1]):
-            loc = by_session.get(sid, 0)
-            print(f"{sid[:8]:<9} {cwd[-40:]:<40} {c:>11,} {loc:>11,} {loc / c if c else 0:>7.2f}")
+            used, eff = by_session.get(sid, (0, 0))
+            print(f"{sid[:8]:<9} {cwd[-40:]:<40} {c:>11,} {used:>11,} {eff:>11,} {eff / c if c else 0:>7.2f}")
     untagged = [r for r in rows if not r.get("session")]
     if untagged:
         print(f"\n{len(untagged)} of the worker's requests that day carry no session (not from Claude Code, or from "
-              f"before cranker-llm 1.1.0): {sum(r['in'] + r['out'] for r in untagged):,} tokens, in the day's total only")
+              f"before cranker-llm 1.1.0): {sum(spent(r) for r in untagged):,} tokens, in the day's total only")
     print("\nClaude: input + cache writes + output (cache reads left out: the same context again on every turn). "
-          "The worker: in + out.")
+          "The worker: consumed is in + out of every request; effective leaves out the runs that read and gave "
+          "nothing back (an agent stopped or in an error, an empty answer), and the ratio is on it. A session's row "
+          "is that session's alone: its numbers are not added to another's.")
 
 
-def note(claude, local, ratio):
+def note(claude, local, ratio, used=None):
+    """local: the session's effective tokens; used: all it consumed, said when some of it gave nothing back"""
+    wasted = ""
+    if used and used > local:
+        wasted = (f" The worker consumed {used:,} in all: {used - local:,} went on runs that read and gave nothing "
+                  "back; they are consumption, not work, and the scale is on the effective ones.")
     return (
-        f"cranker-llm scale: this session has spent {claude:,} tokens of Claude and {local:,} of the local worker "
-        f"({ratio_text(local, claude)}). The scale set for it is {ratio:g} local tokens for each one of Claude: give "
+        f"cranker-llm scale: this session has spent {claude:,} tokens of Claude and {local:,} effective tokens of the "
+        f"local worker ({ratio_text(local, claude)}).{wasted} The scale set for it is {ratio:g} local tokens for each "
+        "one of Claude: give "
         "the worker real load, in the background, and keep it busy while you do the rest (skill cranker-llm; "
         f"python {WORKER} status). Real load: the first draft of code you are about to write (a function, a script, "
         "a test, a mechanical patch), from an exact spec, for you to review and fix; a map before reading any long "
         "file; searches across many files (agent); reviewing your diff before you do; long logs and outputs; names "
         "and comments in batch; first drafts of notes and READMEs. Not load: accents, spelling, one-line rewrites, "
-        "anything quicker to do than to hand over. What it answers is a draft: check it before it is used. Not a "
-        "hard rule: the scale is what to aim at."
+        "anything quicker to do than to hand over. What it answers is a draft: check it before it is used. When a "
+        "task comes back wrong or fails, send it again with something changed (--think, more --max-tokens, a "
+        "narrower task, a --check) instead of fixing it yourself, and tell the user when the limit is the worker's "
+        "own; one failure is not what the worker can't do. When "
+        "you report the worker's work, give this session's own numbers (worker.py usage --session), never another "
+        "session's or project's added in. Not a hard rule: the scale is what to aim at."
     )
 
 
@@ -176,13 +207,14 @@ def hook():
     st["checked"] = now
     files = [Path(tp)] + sorted(Path(tp).with_suffix("").glob("subagents/*.jsonl"))
     claude = claude_tokens(files).get(sid, [0, ""])[0]
-    local = sum(r["in"] + r["out"] for r in local_rows() if r.get("session") == sid)
+    mine = [r for r in local_rows() if r.get("session") == sid]
+    used, local = sum(spent(r) for r in mine), sum(work(r) for r in mine)
     cwd = norm(data.get("cwd") or ".")
     listed = any(cwd == norm(r) or cwd.startswith(norm(r) + os.sep) for r in s["roots"])
-    if (listed or local) and claude >= int(s["floor"]) and local < s["ratio"] * claude:
+    if (listed or used) and claude >= int(s["floor"]) and local < s["ratio"] * claude:
         st["noted"] = now
         print(json.dumps({"hookSpecificOutput": {"hookEventName": data.get("hook_event_name", "PostToolUse"),
-                                                 "additionalContext": note(claude, local, s["ratio"])}}))
+                                                 "additionalContext": note(claude, local, s["ratio"], used)}}))
     state = {k: v for k, v in state.items() if now - v.get("checked", 0) < 7 * 86400}
     state[sid] = st
     STATE.parent.mkdir(parents=True, exist_ok=True)
