@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -59,13 +60,18 @@ def final_url(url):
     return url
 
 
+RETRY_WAIT = 3  # s before a piece's next attempt, times the attempt
+
+
 def _piece(url, path, start, end):
+    pos = start  # where this piece goes on from, after a connection that was cut or raised
     for attempt in range(8):
         try:
-            req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={start}-{end}"})
+            req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={pos}-{end}"})
             with urllib.request.urlopen(req, timeout=120) as r, open(path, "r+b") as f:
-                f.seek(start)
-                pos = start
+                if r.status != 206:  # the whole file from its start: written at pos it would be the wrong bytes
+                    raise RuntimeError(f"the server ignored the range (HTTP {r.status})")
+                f.seek(pos)
                 while True:
                     b = r.read(1 << 20)
                     if not b:
@@ -73,10 +79,9 @@ def _piece(url, path, start, end):
                     f.write(b)
                     pos += len(b)
             if pos == end + 1:
-                return end - start + 1
-            start = pos  # resume this piece where it stopped
+                return
         except Exception:
-            time.sleep(3 * (attempt + 1))
+            time.sleep(RETRY_WAIT * (attempt + 1))
     raise RuntimeError(f"piece {start}-{end} failed")
 
 
@@ -90,24 +95,64 @@ def sha256_of(path):
 
 def download(url, out, size, sha256, parts=32, jobs=8):
     """In ranges over several connections (Hugging Face throttles some files per connection: 0.4 MB/s on one,
-    24 MB/s on eight), then the SHA-256; the file gets its name only when the checksum matches."""
+    24 MB/s on eight), then the SHA-256; the file gets its name only when the checksum matches. A download that
+    was cut goes on from the pieces it has (NAME.part.json lists them): 17 GB cut at 90 % started from zero."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     url = final_url(url)
     part = out.with_name(out.name + ".part")
-    with open(part, "wb") as f:
-        f.truncate(size)
+    state = out.with_name(out.name + ".part.json")
     step = -(-size // parts)
     ranges = [(s, min(s + step, size) - 1) for s in range(0, size, step)]
+    this = {"size": size, "sha256": sha256, "step": step}
+    have = set()
+    try:  # the pieces a run before this one finished, when it was after the same file
+        was = json.loads(state.read_text(encoding="utf-8"))
+        if {k: was.get(k) for k in this} == this and part.stat().st_size == size:
+            have = {i for i in was["done"] if 0 <= i < len(ranges)}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if have:
+        print(f"  going on from a download that was cut: {len(have)} of {len(ranges)} pieces are here")
+    else:
+        with open(part, "wb") as f:
+            f.truncate(size)
+    lock = threading.Lock()
+
+    def one(i):
+        _piece(url, part, *ranges[i])
+        with lock:
+            have.add(i)
+            state.write_text(json.dumps({**this, "done": sorted(have)}), encoding="utf-8")
+
+    todo = [i for i in range(len(ranges)) if i not in have]
     t0 = time.time()
-    with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
-        done = sum(ex.map(lambda r: _piece(url, part, *r), ranges))
+    ex = concurrent.futures.ThreadPoolExecutor(jobs)
+    try:
+        pending = {ex.submit(one, i) for i in todo}
+        while pending:  # a wait with a timeout: on Windows one without it does not see Ctrl+C until a piece ends
+            done, pending = concurrent.futures.wait(pending, timeout=0.5,
+                                                    return_when=concurrent.futures.FIRST_EXCEPTION)
+            for f in done:
+                f.result()
+    except KeyboardInterrupt:
+        # the pool's threads are not daemons: left to themselves they would download every piece still waiting
+        ex.shutdown(wait=False, cancel_futures=True)
+        print(f"\ninterrupted with {len(have)} of {len(ranges)} pieces: the same command goes on from them",
+              flush=True)
+        os._exit(130)
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)  # after a piece that failed: the ones running finish and count
+    got_bytes = sum(ranges[i][1] - ranges[i][0] + 1 for i in todo)
     dt = max(time.time() - t0, 0.1)
-    print(f"  {done:,} bytes in {dt:.0f} s ({done / dt / 1e6:.1f} MB/s); checking the SHA-256")
+    print(f"  {got_bytes:,} bytes in {dt:.0f} s ({got_bytes / dt / 1e6:.1f} MB/s); checking the SHA-256")
     got = sha256_of(part)
     if got != sha256:
-        raise RuntimeError(f"checksum mismatch for {out.name}: {got}, expected {sha256} (left at {part})")
+        state.unlink(missing_ok=True)  # no piece of it can be trusted: the next run starts over
+        raise RuntimeError(f"checksum mismatch for {out.name}: {got}, expected {sha256} (left at {part}; the next "
+                           "run downloads it again)")
     part.replace(out)
+    state.unlink(missing_ok=True)
     out.with_name(out.name + ".sha256").write_text(f"{sha256}  {out.name}\n", encoding="utf-8")
 
 
@@ -258,7 +303,7 @@ def main():
         return 0
 
     cfg_file = HOME / "config.json"
-    cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+    cfg = json.loads(cfg_file.read_text(encoding="utf-8-sig")) if cfg_file.exists() else {}
     cfg.update(prof["config"])
     cfg.update({"model": str(model_path), "llama_server": str(server), "template": "auto", "profile": prof["name"]})
     HOME.mkdir(parents=True, exist_ok=True)

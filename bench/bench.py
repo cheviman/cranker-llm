@@ -6,6 +6,8 @@
   rename  rename the local 'state' (not the field ->state) in sample.c, --runs times: how many come out exactly right
   agent   the agent: which functions call elevator_step, at which lines
   batch   16 explanations at once (--jobs = the server's slots): tokens out per second in all
+  lines   map scripts/worker.py (some 1,800 lines, ~35K tokens with the answer) with the line of each function,
+          without and with --number: how many lines come out exact (two long requests: a few minutes)
 Answers and the report go to bench/runs/<TAG>/. The runs are tagged "bench" in usage.jsonl, so `worker.py usage`
 leaves them out. Send the report with your GPU and profile: the profiles' "measured" lines come from it.
 """
@@ -24,7 +26,8 @@ WORKER = [sys.executable, str(BENCH.parent / "scripts" / "worker.py")]
 SAMPLE = BENCH / "sample.c"
 FUNCTIONS = ["queue_empty", "queue_push", "queue_pop", "elevator_init", "elevator_call", "next_state",
              "elevator_step", "elevator_run", "elevator_fault"]
-STEPS = ["map", "rename", "agent", "batch"]
+STEPS = ["map", "rename", "agent", "batch", "lines"]
+LONG = BENCH.parent / "scripts" / "worker.py"  # the long file of the lines step
 OUT_TPS = re.compile(r"out (\d+) tok \(([\d.]+) tok/s\)")
 
 
@@ -106,12 +109,39 @@ def step_batch(out, rep):
     rep(f"batch: {last}" + (f" -> {int(m.group(1)) / max(int(m.group(2)), 1):.0f} tok/s in all" if m else ""))
 
 
+def score_lines(text, want):
+    """(functions named with a line, lines exact) in a map of `name` (line N) lines"""
+    said = {m.group(1): int(m.group(2)) for m in re.finditer(r"`?(\w+)`?\s*\(lines? (\d+)", text)}
+    return sum(f in said for f in want), sum(said.get(f) == n for f, n in want.items())
+
+
+def step_lines(out, rep):
+    """What --number is for: asked for each function's line, a model counts the lines by eye, and over a long file
+    it drifts; with the number in front of each line it has it to copy."""
+    source = LONG.read_text(encoding="utf-8").splitlines()
+    want = {m.group(1): i for i, l in enumerate(source, 1) if (m := re.match(r"def (\w+)\(", l))}
+    got = []
+    for name, flags in (("plain", []), ("numbered", ["--number"])):
+        o = out / f"lines_{name}.md"
+        rc, line = worker("ask", "-f", str(LONG), "-o", str(o), "--max-tokens", "6000", *flags, "-p",
+                          "For each top-level function in this file (not the methods), in order, write one line: "
+                          "`name` (line N): what it does, in a few words. N is the line its `def` is on. Nothing "
+                          "else.")
+        named, exact = score_lines(o.read_text(encoding="utf-8") if o.exists() else "", want)
+        got.append(f"{name} {exact} exact of {named} named")
+        rep(f"  lines {name}: {line.splitlines()[-1] if line else ''}")
+    rep(f"lines: {len(want)} functions in {len(source)} lines; " + "; ".join(got))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tag", nargs="?", default=time.strftime("%Y%m%d-%H%M%S"))
     ap.add_argument("--only", default=",".join(STEPS))
     ap.add_argument("--runs", type=int, default=3)
     a = ap.parse_args()
+    unknown = [s for s in a.only.split(",") if s not in STEPS]
+    if unknown:
+        ap.error(f"--only: no step {', '.join(unknown)} (the steps: {', '.join(STEPS)})")
     rc, status = worker("status")
     if rc != 0:
         print(status)

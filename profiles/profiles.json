@@ -44,5 +44,20 @@
       "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
     },
     "config": {"alias": "qwen3.8-27b", "ctx": 32768, "parallel": 4, "cache_type": "q8_0", "spec": "ngram-mod"}
+  },
+  {
+    "name": "daisyrose-27b-q4km",
+    "title": "DaisyRose-27B Q4_K_M (bartowski): RadixArk's fine-tune of Qwen3.8-27B, to compare against the default on a 24 GB GPU",
+    "min_vram_gb": 22,
+    "status": "untested",
+    "measured": "Not measured. Qwen3.8-27B trained further by reinforcement learning on long agent tasks (RadixArk, 18-11-2026); its model card says it keeps the base's chat template, so the same settings as the default should fit, and the template patch is the first thing to check. RadixArk's own numbers, on its own harnesses, put it 2 to 4 points over Qwen3.8-27B on coding benchmarks and 12.0 against 5.6 on Terminal Bench 4.1. To become the default it has to match it on bench/bench.py: the rename right 6 of 6 times, the map of sample.c, the agent's turns, the same tok/s, and no more thinking tokens on the same task. The quantizer differs from the default's (bartowski's Q4_K_M against unsloth's UD-Q4_K_XL), so a small difference either way may be the quant and not the model.",
+    "model": {
+      "repo": "bartowski/RadixArk_DaisyRose-27B-GGUF",
+      "file": "RadixArk_DaisyRose-27B-Q4_K_M.gguf",
+      "size": 17325372224,
+      "sha256": "10fcf6b8c84c0e62cf282a6293e03de8880c71799e77948450a4419c8024e521",
+      "license": "Apache-2.0 (RadixArk, built from Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "daisyrose-27b", "ctx": 65536, "parallel": 8, "cache_type": "q8_0", "spec": "ngram-mod"}
   }
 ]
