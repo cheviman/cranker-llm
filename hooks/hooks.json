@@ -1,6 +1,18 @@
 {
-  "description": "cranker-llm's hooks. The read guard: in the folders listed under read_guard.roots in the worker's config, a whole-file Read of a big text file is sent to the local worker first (does nothing until folders are listed). The scale: a session that uses the worker and is below the local-to-Claude scale (scale.ratio, 5 by default; 0 turns it off) gets a note with its numbers and what real load to hand over, at most every 15 minutes. Neither blocks anything else.",
+  "description": "cranker-llm's hooks. The read guard: in the folders listed under read_guard.roots in the worker's config, a whole-file Read of a big text file is sent to the local worker first (does nothing until folders are listed). The scale (scale.ratio local tokens for each token of Claude, 5 by default; 0 turns it off): a session that uses the worker, or works under scale.roots, is told the rule when it starts and after a compaction, is reminded at every prompt while Claude does more than the worker's effective work (scale.least, 1 to 1), and below the scale gets a note with its numbers at most every 15 minutes. Effective is work that was right by the first or second try. Neither blocks anything else.",
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PY=$(command -v py || command -v python3 || command -v python); \"$PY\" \"${CLAUDE_PLUGIN_ROOT}/scripts/local_share.py\" --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Read",
