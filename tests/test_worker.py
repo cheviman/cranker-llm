@@ -106,10 +106,20 @@ class Home:
         path.write_text(text, encoding="utf-8-sig" if bom else "utf-8")
         return path
 
-    def requests(self):
-        if not self.record.exists():
+    def requests(self, record=None):
+        record = record or self.record
+        if not record.exists():
             return []
-        return [json.loads(l) for l in self.record.read_text(encoding="utf-8").splitlines()]
+        return [json.loads(l) for l in record.read_text(encoding="utf-8").splitlines()]
+
+    def elsewhere(self, key="its-key"):
+        """A second stand-in, as a hosted server: a port of its own, a key, and OpenAI's fields only. Its base URL;
+        what it was sent is in self.away."""
+        port = free_port()
+        self.away = self.dir / "elsewhere.jsonl"
+        self.start(FAKE, "--port", port, "--key", key, "--record", self.away)
+        self.wait(lambda: get(port, "/health"), "the server elsewhere did not come up")
+        return f"http://127.0.0.1:{port}/v1"
 
     def log(self, name):
         path = self.dir / "logs" / name
@@ -478,6 +488,121 @@ class ConfigAndHooks(unittest.TestCase):
         note = json.loads(out)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("200,500 tokens of Claude and 1,000 effective tokens of the local worker", note)
         self.assertEqual(h.run(SCRIPTS / "local_share.py", "--hook", stdin=event)[1], "")  # not again for 15 minutes
+
+
+class Remote(unittest.TestCase):
+    """--remote: a run sent to a server elsewhere. No local server runs in these tests."""
+    KEY = {"CRANKER_REMOTE_KEY": "its-key"}
+
+    def home(self, **remote):
+        h = Home(self, serve=False)
+        h.save(remote={"url": h.elsewhere(), "model": "qwen-there", "roots": [str(h.work)], **remote})
+        return h
+
+    def test_nothing_leaves_until_the_user_lists_the_folder(self):
+        h = self.home(roots=[])
+        for args, env, error in (
+                (("-p", "x"), self.KEY, "is not under remote.roots"),  # the caller's folder: none is listed
+        ):
+            rc, out, _ = h.worker("ask", "--remote", *args, **env)
+            self.assertEqual(rc, 1, out)
+            self.assertIn(error, out)
+        h.save(remote={**h.config["remote"], "roots": [str(h.work)]})
+        outside = h.dir / "not-listed.c"
+        outside.write_text("int x;\n", encoding="utf-8")
+        for args, env, error in (
+                (("-f", f"{outside}:1-1", "-p", "x"), self.KEY, "not-listed.c is not under remote.roots"),
+                (("-p", "x"), {}, "environment variable CRANKER_REMOTE_KEY, and it is not set"),
+        ):
+            rc, out, _ = h.worker("ask", "--remote", *args, **env)
+            self.assertEqual(rc, 1, out)
+            self.assertIn(error, out)
+        h.save(remote={**h.config["remote"], "url": "http://models.example.com/v1"})
+        self.assertIn("is not https", h.worker("ask", "--remote", "-p", "x", **self.KEY)[1])
+        h.save(remote={})
+        self.assertIn("no server to send to", h.worker("ask", "--remote", "-p", "x", **self.KEY)[1])
+        self.assertEqual(h.requests(h.away), [])
+
+    def test_ask_goes_there_in_openais_own_fields_and_usage_tells_it_apart(self):
+        h = self.home(plain={"reasoning_effort": "none"}, price=[1, 2])
+        src = h.file("src.c", "one\ntwo\n")
+        rc, out, err = h.worker("ask", "--remote", "-f", src, "--number", "-o", "a.md", "-p", "[[say:from afar]]",
+                                **self.KEY)
+        self.assertEqual((rc, err), (0, ""), out)  # the stand-in answers 400 to any field that is not OpenAI's
+        self.assertEqual((h.work / "a.md").read_text(encoding="utf-8"), "from afar")
+        h.worker("ask", "--remote", "--think", "--effort", "medium", "-p", "x", **self.KEY)
+        plain, thinking = h.requests(h.away)
+        self.assertEqual((plain["path"], plain["auth"], plain["model"]),
+                         ("/v1/chat/completions", "Bearer its-key", "qwen-there"))
+        self.assertEqual((plain["reasoning_effort"], thinking["reasoning_effort"]), ("none", "medium"))
+        self.assertIn("1\tone\n2\ttwo", user_text(plain))
+        used = h.log("usage.jsonl")
+        self.assertEqual([(u["remote"], u["model"]) for u in used], [("127.0.0.1", "qwen-there")] * 2)
+        rc, out, _ = h.worker("usage", **self.KEY)
+        self.assertIn("ask (remote)", out)
+        spent = sum(u["in"] for u in used) * 1 / 1e6 + sum(u["out"] for u in used) * 2 / 1e6
+        self.assertIn(f"remote: 2 of these requests went to a server elsewhere (127.0.0.1)", out)
+        self.assertIn(f"${spent:,.2f} at the price in the config ($1 in / $2 out per million)", out)
+        self.assertIn("remote (--remote): qwen-there at 127.0.0.1; key in CRANKER_REMOTE_KEY (set); files may leave "
+                      f"from: {h.work}", h.worker("status", **self.KEY)[1])
+        for text in (out, (h.dir / "logs" / "usage.jsonl").read_text(encoding="utf-8"), h.worker("config")[1]):
+            self.assertNotIn("its-key", text)  # the key is in no output, no log and no config
+
+    def test_a_limit_is_waited_for_and_a_bad_key_is_said(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "-o", "a.md", "-p", "[[busy:2]] [[say:at last]]", **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("127.0.0.1 limits the requests (HTTP 429: ", err)
+        self.assertIn("slow down", err)  # what the server said, at once
+        t0 = time.time()  # a quota that is used up is said at once, not waited for
+        rc, out, _ = h.worker("ask", "--remote", "-p", "[[fail:429:free_limit_reached for today]]", **self.KEY)
+        self.assertEqual(rc, 1)
+        self.assertIn("free_limit_reached for today", out)
+        self.assertIn("waiting does not help", out)
+        self.assertLess(time.time() - t0, 5)
+        requests_so_far = len(h.requests(h.away))
+        self.assertEqual((h.work / "a.md").read_text(encoding="utf-8"), "at last")
+        self.assertEqual(requests_so_far, 4)  # three for the busy one, one for the quota
+        rc, out, _ = h.worker("ask", "--remote", "-p", "x", CRANKER_REMOTE_KEY="another")
+        self.assertEqual(rc, 1)
+        self.assertIn("127.0.0.1 refused the key in CRANKER_REMOTE_KEY (HTTP 401", out)
+        self.assertNotIn("another", out)
+        h.save(remote={**h.config["remote"], "wait": 0})
+        rc, out, _ = h.worker("ask", "--remote", "-p", "[[busy:9]] again", **self.KEY)
+        self.assertEqual(rc, 2)  # not run: nothing wrong with the task
+        self.assertIn("not run: 127.0.0.1 kept limiting the request", out)
+
+    def test_local_and_remote_run_at_the_same_time(self):
+        h = Home(self, context_wait=0)  # a local server too
+        h.save(remote={"url": h.elsewhere(), "model": "qwen-there", "roots": [str(h.work)]})
+        local = h.start(WORKER, "ask", "-o", "local.md", "-p", "[[sleep:4]] [[say:from here]]")
+        h.wait(lambda: any(s["is_processing"] for s in get(h.port, "/slots")), "the local request never ran")
+        t0 = time.time()
+        rc, out, _ = h.worker("ask", "--remote", "-o", "remote.md", "-p", "[[say:from afar]]", **self.KEY)
+        self.assertEqual(rc, 0, out)
+        self.assertLess(time.time() - t0, 3, "the remote run waited for the local one")
+        self.assertIsNone(local.poll(), "the local run should still be going")
+        # an agent takes the local worker from every local task; a remote run is not the local worker's
+        holder = h.start("-c", "import sys, time; sys.path.insert(0, sys.argv[1]); import worker\n"
+                         "lock = worker.agent_turn(1)\nprint('held', flush=True)\ntime.sleep(60)", SCRIPTS)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertEqual(h.worker("ask", "--remote", "-p", "x", **self.KEY)[0], 0)
+        self.assertEqual(h.worker("ask", "-p", "x")[0], 2)  # the local one is not run: the agent has the worker
+        self.assertEqual(local.wait(timeout=30), 0)
+        self.assertEqual(((h.work / "local.md").read_text(encoding="utf-8"),
+                          (h.work / "remote.md").read_text(encoding="utf-8")), ("from here", "from afar"))
+        self.assertEqual([bool(u.get("remote")) for u in h.log("usage.jsonl")], [True, True, False])
+
+    def test_a_batch_goes_there_too(self):
+        h = self.home()
+        tasks = h.file("tasks.jsonl", "".join(json.dumps(
+            {"id": str(i), "prompt": f"[[say:answer {i}]]", "out": f"{i}.md"}) + "\n" for i in range(3)))
+        rc, out, _ = h.worker("batch", tasks, "--remote", **self.KEY)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("done: 3 ok", out)
+        self.assertEqual({(h.work / f"{i}.md").read_text(encoding="utf-8") for i in range(3)},
+                         {f"answer {i}" for i in range(3)})
+        self.assertEqual(len(h.requests(h.away)), 3)
 
 
 class Scale(unittest.TestCase):

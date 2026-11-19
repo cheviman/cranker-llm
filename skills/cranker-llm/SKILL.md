@@ -91,6 +91,12 @@ own `files`: write beside the source and move it over once it is checked.
 py W batch tasks.jsonl
 ```
 
+**`--remote`** (`ask` and `batch`) sends that run to the server under `remote` in the config instead of the local
+one, so the files leave the machine. **Only when the user asks for it**, never because the local server is down,
+busy or slow: say so and let them decide. The worker itself refuses it outside the folders the user listed in
+`remote.roots`, and reads the key from an environment variable the user sets; never ask for the key or write it
+anywhere. `status` shows whether a remote server is configured.
+
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own
 folder). For searching many files and putting an answer together. It loads none of the user's settings (no hooks,
 plugins, CLAUDE.md or MCP servers).

@@ -167,6 +167,35 @@ and `//ok, DD-MM-YYYY`, and passed a style check the first time.
 Keep for Claude: decisions, stateful debugging, anything that weighs several things at once, anything that goes
 into the repo without a mechanical check, and text a person will read as is.
 
+## A server elsewhere (`--remote`)
+
+The worker is local, and by default nothing leaves the machine. `ask --remote` and `batch --remote` send one run to
+another server instead: any OpenAI-compatible endpoint, such as a hosted model, or your own GPU reached from a
+machine that has none. It is never a default and never a fallback. It takes the flag, and it is refused unless the
+caller's folder and every file of the run are under one of `remote.roots`, which is empty until you list folders:
+
+```json
+"remote": {"url": "https://api.example.com/v1", "model": "qwen3.8-27b", "roots": ["D:/projects/public"],
+           "plain": {"reasoning_effort": "none"}, "price": [0.32, 2.40]}
+```
+
+- **The key** is read from the environment variable `CRANKER_REMOTE_KEY` (`key_env` names another, `""` means no
+  key). It is never in the config, and it is in no log and no output. `http` is refused except to this machine.
+- **The request** carries OpenAI's own fields only (`model`, `messages`, `max_tokens`, `temperature`, `top_p`),
+  because a hosted server refuses the ones llama.cpp adds. How a model is told not to think, or how much, differs by
+  server: `plain` is added to a request that should not think, `think` to one that does (by default
+  `{"reasoning_effort": ...}`), `extra` to all. There is no thinking budget there: `--max-tokens` is the only cap.
+- **Its limits** take the place of the shared context: a batch sends `parallel` requests at once (2), and a
+  request the server limits (HTTP 429) waits as long as its `Retry-After` says, up to `wait` seconds (300), and
+  then ends as `not run`.
+- **`usage` tells them apart**: `ask (remote)`, with what they cost at `price` (USD per million, in and out).
+  They count for the scale like the local ones. `status` shows the server, the folders and whether the key is set.
+- **Not the agent**: `agent` is local only.
+
+Read the server's terms before you list a folder. A free plan is often paid for with what you send: one such
+gateway stores a free plan's requests and licenses them to third parties, with no way to turn that off. Public code
+is one thing to send there; a client's is another.
+
 ## Which model
 
 | Profile | GPU | Status | Use it for |
@@ -448,7 +477,8 @@ answers is scripted in the prompt (`[[say:...]]`, `[[cut]]`, `[[sleep:3]]`, `[[f
 real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
 of its own, so the real worker, its logs and a server that is running are never touched: `ask`, `batch`, the check
 and its fixes, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
-agent's relay, and the setup's download against a server that drops the connection. A couple of minutes on any machine. What they cannot tell is what the model answers: that is
+agent's relay, `--remote` against a second stand-in that asks for a key and refuses llama.cpp's fields, and the
+setup's download against a server that drops the connection. A couple of minutes on any machine. What they cannot tell is what the model answers: that is
 `bench/bench.py`, on the GPU.
 
 ## Files and settings
