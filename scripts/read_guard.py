@@ -28,7 +28,8 @@ def norm(p):
 
 
 def main():
-    cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8")) if (HOME / "config.json").exists() else {}
+    # utf-8-sig: with a BOM in the config (Windows PowerShell 5.1 writes one) the guard went quiet without a word
+    cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8-sig")) if (HOME / "config.json").exists() else {}
     guard = cfg.get("read_guard") or {}
     roots = [norm(r) for r in guard.get("roots", [])]
     max_lines = int(guard.get("max_lines", 300))
@@ -41,7 +42,8 @@ def main():
     if ti.get("offset") is not None or ti.get("limit") is not None or not ti.get("file_path"):
         return
     path = norm(ti["file_path"])
-    if not any(path == r or path.startswith(r + os.sep) for r in roots):
+    # rstrip: a drive's root already ends in the separator ("d:\\"), and with one more nothing was under it
+    if not any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
         return
     if Path(path).suffix.lower() in BINARY or not os.path.isfile(path):
         return
@@ -63,7 +65,7 @@ def main():
     reason = (
         f"{ti['file_path']} has {lines} lines: in these folders a file over {max_lines} lines is not read whole "
         f"(cranker-llm's read guard). {start}Map it with the local worker first, e.g. {py} \"{WORKER}\" ask -f "
-        f"\"{ti['file_path']}\" -o <scratch>/map.md -p \"For each function, in order, one line: `name` (line N): "
+        f"\"{ti['file_path']}\" --number -o <scratch>/map.md -p \"For each function, in order, one line: `name` (line N): "
         f"what it does, concretely. Nothing else.\" -- then Read only the range you need (offset and limit). If the "
         f"whole file is really needed (editing most of it), Read it with offset 1 and limit {lines}."
     )

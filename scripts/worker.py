@@ -1,8 +1,10 @@
 """cranker-llm: a llama.cpp server on this machine that Claude Code hands volume work to.
 
     worker.py start | stop | status | config
-    worker.py ask -p "instruction" [-f file[:a-b] ...] [-o out] [--think] [--print] [--check CMD] [--brief FILE]
-    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F]
+    worker.py ask -p "instruction" [-f file[:a-b] ...] [--number] [-o out] [--think] [--print] [--check CMD]
+                  [--brief FILE] [--remote]
+    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F] [--number]
+                  [--remote]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
 
@@ -14,12 +16,22 @@ out: an answer that is one fenced code block and nothing else is written without
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
 summary is printed (--print also prints the answer). From Windows PowerShell 5.1 a prompt with double quotes in it is
-split into several arguments: write it to a file and pass --prompt-file.
+split into several arguments: write it to a file and pass --prompt-file. --number gives the model every line with
+its number in the file, for answers that cite lines (a map, a review); not for a rewrite.
 batch: one JSON object per line: {"id", "prompt", "files": [...], "out", "system"?, "think"?, "max_tokens"?,
-"check"?, "retries"?}.
-Tasks whose "out" already exists are skipped unless --force, so a batch can resume.
+"check"?, "retries"?, "number"?}.
+Tasks whose "out" already exists are skipped unless --force, so a batch can resume. One that left its output cut or
+failing its check (out.failed.json beside it) runs again once its line has changed. An "out" is never one of the
+task's own files.
+
+Exit codes of ask, batch and agent: 0 done and right; 2 an output that is not right (cut, its check still failing,
+an agent stopped) or a task that was not run because the worker was taken (the last lines say which, and what to do);
+1 an error (a wrong argument or task file, the server not running or gone).
 agent: Claude Code itself, headless, on the local model: Read, Grep and Glob, and with --write also Write and Edit
 inside that folder only.
+--remote (ask, batch): the run goes to the server under "remote" in the config, any OpenAI-compatible endpoint,
+instead of the local one. The files leave the machine: only from the folders under remote.roots, with the key from
+an environment variable (CRANKER_REMOTE_KEY), and only when the user asks for it.
 
 Settings: CRANKER_HOME/config.json (~/.cranker-llm by default; scripts/setup.py writes it), and the
 environment variables in ENV_OVERRIDES. Standard library only.
@@ -28,6 +40,7 @@ environment variables in ENV_OVERRIDES. Standard library only.
 import argparse
 import atexit
 import concurrent.futures
+import hashlib
 import http.client
 import http.server
 import json
@@ -49,7 +62,8 @@ HOME = Path(os.environ.get("CRANKER_HOME") or Path.home() / ".cranker-llm")
 CONFIG_FILE = HOME / "config.json"
 LOGS = HOME / "logs"
 TEMPLATES = HOME / "templates"
-PID_FILE = LOGS / "server.pid"
+PID_FILE = LOGS / "server.pid"   # "pid start-time" of the server this worker started (_read_pid)
+START_LOCK = LOGS / "start.lock"
 SERVER_LOG = LOGS / "server.log"
 USAGE_LOG = LOGS / "usage.jsonl"
 AGENT_LOCK = LOGS / "agent.lock"
@@ -90,7 +104,13 @@ ENV_OVERRIDES = {"CRANKER_SERVER": "llama_server", "CRANKER_MODEL": "model",
 def load_config():
     cfg = dict(DEFAULTS)
     if CONFIG_FILE.exists():
-        cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        try:  # utf-8-sig: Windows PowerShell 5.1 writes a BOM, and json refuses it
+            own = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+            if not isinstance(own, dict):
+                raise ValueError("not an object")
+        except ValueError as e:
+            sys.exit(f"{CONFIG_FILE} is not valid JSON ({e}): fix it, or delete it and run scripts/setup.py")
+        cfg.update(own)
     for env, key in ENV_OVERRIDES.items():
         v = os.environ.get(env)
         if v is None or v == "":
@@ -215,32 +235,89 @@ def cool_down(max_wait=90):
     return time.time() - t0
 
 
+def _started(pid):
+    """When the process with this pid started, as a value that only has to compare equal, or None when there is no
+    such process (or no way to tell here). The pid file keeps it next to the pid: a pid alone is not a process. Once
+    the server is gone (a crash, a reboot) the system hands its pid to another one, and `stop` kills what it names."""
+    if WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32")
+        times = [wintypes.FILETIME() for _ in range(4)]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k.GetProcessTimes.argtypes = (wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4)
+        k.CloseHandle.argtypes = (wintypes.HANDLE,)
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+                return None
+            if not k.GetProcessTimes(h, *(ctypes.byref(t) for t in times)):
+                return None
+            return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        finally:
+            k.CloseHandle(h)
+    try:  # Linux: the 22nd field of /proc/PID/stat, in clock ticks since the boot
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # macOS, the BSDs
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        return " ".join(r.stdout.split()) or None
+    except Exception:
+        return None
+
+
+def _read_pid():
+    """(pid, ours) from the pid file. ours: True while that pid is still the server this worker started, False when
+    it is gone or is another process now, None when the file has no start time to tell by (an older worker wrote
+    it). (None, False) without a pid file."""
+    try:
+        pid, _, started = PID_FILE.read_text().strip().partition(" ")
+        pid = int(pid)
+    except (OSError, ValueError):
+        return None, False
+    if not started:
+        return pid, None
+    return pid, str(_started(pid)) == started
+
+
 def _launch():
     LOGS.mkdir(parents=True, exist_ok=True)
-    out = open(LOGS / "server.stdout.log", "w", encoding="utf-8")
-    kw = dict(stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, close_fds=True)
-    if WINDOWS:
-        flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
-        try:  # outlive the caller's job object (Claude Code's shell) when it allows it
-            p = subprocess.Popen(server_cmd(), creationflags=flags | 0x01000000, **kw)  # BREAKAWAY_FROM_JOB
-        except OSError:
-            p = subprocess.Popen(server_cmd(), creationflags=flags, **kw)
-    else:
-        p = subprocess.Popen(server_cmd(), start_new_session=True, **kw)
-    PID_FILE.write_text(str(p.pid))
+    with open(LOGS / "server.stdout.log", "w", encoding="utf-8") as out:
+        kw = dict(stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, close_fds=True)
+        if WINDOWS:
+            flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+            try:  # outlive the caller's job object (Claude Code's shell) when it allows it
+                p = subprocess.Popen(server_cmd(), creationflags=flags | 0x01000000, **kw)  # BREAKAWAY_FROM_JOB
+            except OSError:
+                p = subprocess.Popen(server_cmd(), creationflags=flags, **kw)
+        else:
+            p = subprocess.Popen(server_cmd(), start_new_session=True, **kw)
+    started = _started(p.pid)
+    PID_FILE.write_text(f"{p.pid} {started}" if started is not None else str(p.pid))
     return p
 
 
-def _wait_ready(p, timeout):
+def _wait_ready(timeout, p=None):
+    """p: the server just launched. None: one found already starting, the pid file's."""
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if p.poll() is not None:
+        if p is not None and p.poll() is not None:
             print(f"llama-server exited with {p.returncode}; see {LOGS / 'server.stdout.log'}")
+            return False
+        if p is None and not _read_pid()[1]:
+            print(f"the server that was starting is gone; see {LOGS / 'server.stdout.log'}")
             return False
         if healthy():
             return True
         time.sleep(1)
-    print(f"not ready after {timeout} s; see {LOGS / 'server.stdout.log'}")
+    print(f"not ready after {timeout} s; see {LOGS / 'server.stdout.log'}"
+          + ("" if p is not None else ". If it hangs there, `stop` ends it and `start` launches a new one"))
     return False
 
 
@@ -284,9 +361,45 @@ def cmd_start(args):
         print(f"llama-server missing: '{server_binary()}'. Run scripts/setup.py, or set \"llama_server\" in "
               f"{CONFIG_FILE}")
         return 1
+    # one start at a time, across sessions: two that both found nothing running each launched a server, and the
+    # second one's pid file left the first server with nobody to stop it
     t0 = time.time()
-    p = _launch()
-    if not _wait_ready(p, args.timeout):
+    LOGS.mkdir(parents=True, exist_ok=True)
+    lock = open(START_LOCK, "a+")
+    noted = False
+    try:
+        while True:
+            try:
+                _try_lock(lock)
+                break
+            except OSError:
+                if time.time() - t0 > args.timeout:
+                    print(f"another start still has not finished after {args.timeout} s; see "
+                          f"{LOGS / 'server.stdout.log'}")
+                    return 1
+                if not noted:
+                    print("another session is starting the server: waiting for it", file=sys.stderr)
+                    noted = True
+                time.sleep(1)
+        try:
+            return _start(args, t0)
+        finally:
+            _unlock(lock)
+    finally:
+        lock.close()
+
+
+def _start(args, t0):
+    if healthy():  # the start this one waited for
+        print(f"already running at {URL}")
+        return 0
+    pid, ours = _read_pid()
+    p = None
+    if ours:  # its own start was cut short while the model loaded: a second server would load the model again
+        print(f"a server is already starting (pid {pid}): waiting for it", file=sys.stderr)
+    else:
+        p = _launch()
+    if not _wait_ready(args.timeout, p):
         return 1
     if CFG["template"] == "auto" and template_file() is None:
         patched = fix_template()
@@ -295,32 +408,36 @@ def cmd_start(args):
                   f"patched copy {patched}; restarting with it")
             _stop()
             time.sleep(2)
-            p = _launch()
-            if not _wait_ready(p, args.timeout):
+            if not _wait_ready(args.timeout, _launch()):
                 return 1
-    print(f"ready at {URL} in {time.time() - t0:.0f} s (pid {p.pid}); {_props_line()}")
+    print(f"ready at {URL} in {time.time() - t0:.0f} s (pid {_read_pid()[0]}); {_props_line()}")
     return 0
 
 
 def _stop():
-    pid = PID_FILE.read_text().strip() if PID_FILE.exists() else None
-    msg = "not running"
-    if pid:
-        if WINDOWS:
-            r = subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True, text=True)
-            msg = (r.stdout or r.stderr).strip() or "stopped"
-        else:
-            try:
-                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-                msg = "stopped"
-            except ProcessLookupError:
-                msg = "was not running"
+    pid, ours = _read_pid()
     PID_FILE.unlink(missing_ok=True)
-    return msg
+    if pid is None:
+        return "not running"
+    if ours is False:  # never kill by a pid alone: it is another process's by now
+        return f"was not running (the server this worker started, pid {pid}, is gone)"
+    if WINDOWS:
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
+        return (r.stdout or r.stderr).strip() or "stopped"
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return "stopped"
+    except ProcessLookupError:
+        return "was not running"
 
 
 def cmd_stop(args):
+    ours = _read_pid()[1]
     print(_stop())
+    if ours is False and healthy():
+        print(f"a server still answers at {URL}: this worker did not start it (no pid file for it), so it is not "
+              "this worker's to stop")
+        return 1
     return 0
 
 
@@ -338,7 +455,19 @@ def _vram_line():
     return f"VRAM {v[0].replace(', ', ' of ')} MiB" if v else ""
 
 
+def _remote_line():
+    """The server elsewhere, when one is configured: where, which model, from which folders, and whether its key is
+    set (never the key)"""
+    r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    if not r["url"]:
+        return
+    key = "no key" if not r["key_env"] else f"key in {r['key_env']} ({'set' if os.environ.get(r['key_env']) else 'not set'})"
+    roots = ", ".join(map(str, r["roots"])) or "no folder listed yet: nothing can be sent"
+    print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}")
+
+
 def cmd_status(args):
+    _remote_line()
     if not healthy():
         print(f"not running ({URL}). {_vram_line()}")
         return 1
@@ -594,6 +723,9 @@ def post_with_room(path, body):
                 if not any(k in text.lower() for k in POOL_FULL):
                     raise WorkerError(f"HTTP {e.code}: {text[:500]}")
                 error = f"HTTP {e.code}: {text[:300]}"
+            except (OSError, http.client.HTTPException) as e:  # the connection, not an answer: the server went away
+                raise WorkerError(f"the server did not answer ({type(e).__name__}: {e}). `status` says whether it "
+                                  f"still runs; its log is {SERVER_LOG}")
         if time.time() - t0 > CFG["context_wait"]:
             if fut is not None:
                 raise WorkerError(f"{error} -- still no room after {CFG['context_wait']} s")
@@ -633,9 +765,12 @@ def count_tokens(text):
 def log_usage(cmd, tokens_in, tokens_out, answer, seconds, **extra):
     """One line per request in usage.jsonl: 'in' is what the model read, 'out' what it wrote (its thinking too),
     'answer' what comes back to the caller. CRANKER_USAGE_TAG marks runs that are not work (benchmarks)."""
-    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(), "model": server_model(),
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(),
+           "model": REMOTE["model"] if REMOTE else server_model(),
            "in": tokens_in or 0, "out": tokens_out or 0, "answer": answer if answer is not None else tokens_out or 0,
            "s": round(seconds, 1), **extra}
+    if REMOTE:
+        rec["remote"] = REMOTE["host"]  # not this machine's model: usage tells them apart, with what it cost
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
@@ -661,12 +796,15 @@ def cmd_usage(args):
     if session == "":
         print("--session: not called from a Claude Code session (CLAUDE_CODE_SESSION_ID is not set): give its id")
         return 1
-    recs = []
+    every = []
     for line in USAGE_LOG.read_text(encoding="utf-8").splitlines():
         try:
-            r = json.loads(line)
+            every.append(json.loads(line))
         except ValueError:
             continue
+    mark_tries(every)  # over the whole log: a task sent again today is one more try of yesterday's
+    recs = []
+    for r in every:
         if args.since and r["ts"][:10] < args.since:
             continue
         if r.get("tag") and not args.all:
@@ -699,7 +837,8 @@ def cmd_usage(args):
 
     print(f"{USAGE_LOG}: {len(recs)} requests{only} from {recs[0]['ts']} to {recs[-1]['ts']}"
           + ("" if args.all else " (benchmarks left out: --all)"))
-    table("command", lambda r: r["cmd"] + (f" [{r['tag']}]" if r.get("tag") else ""))
+    table("command", lambda r: r["cmd"] + (" (remote)" if r.get("remote") else "")
+          + (f" [{r['tag']}]" if r.get("tag") else ""))
     table("project (the caller's folder)", project_of)
     table("day", lambda r: r["ts"][:10])
     cost_table([r for r in recs if not run_failed(r)], project_of)
@@ -710,20 +849,94 @@ def cmd_usage(args):
     if lost:
         spent = sum(r["in"] + r["out"] for r in recs)
         gone = sum(r["in"] + r["out"] for r in lost)
-        print(f"\nconsumed {spent:,} tokens (in + out), effective {spent - gone:,}: {len(lost)} runs read and "
-              f"gave nothing back (an agent stopped or in an error, an empty answer), {gone:,} tokens and "
-              f"{sum(r['s'] for r in lost) / 3600:.1f} hours. They count as consumed ('in', 'out', 'hours') and "
-              "not as kept off Claude or saved")
+        why = {}
+        for r in lost:
+            why[not_effective(r)] = why.get(not_effective(r), 0) + 1
+        print(f"\nconsumed {spent:,} tokens (in + out), effective {spent - gone:,}: {len(lost)} runs were not "
+              f"effective ({', '.join(f'{n} {w}' for w, n in why.items())}), {gone:,} tokens and "
+              f"{sum(r['s'] for r in lost) / 3600:.1f} hours. They were spent all the same, and count as consumed "
+              "('in', 'out', 'hours'); they do not count as kept off Claude or saved")
+    pieces = pieces_line(recs)
+    if pieces:
+        print("\n" + pieces)
+    away = [r for r in recs if r.get("remote")]
+    if away:
+        price = (CFG.get("remote") or {}).get("price") or [0, 0]
+        cost = sum(r["in"] for r in away) * price[0] / 1e6 + sum(r["out"] for r in away) * price[1] / 1e6
+        print(f"\nremote: {len(away)} of these requests went to a server elsewhere "
+              f"({', '.join(sorted({str(r['remote']) for r in away}))}), {sum(r['in'] for r in away):,} tokens in and "
+              f"{sum(r['out'] for r in away):,} out: ${cost:,.2f} at the price in the config (${price[0]:g} in / "
+              f"${price[1]:g} out per million). What they read left this machine")
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
     return 0
 
 
+def work_id(out, files):
+    """The piece of work a request is: its output and the files it is about, without their line ranges, so that the
+    same file sent again in a narrower range, or with another prompt, is the same work done again"""
+    paths = sorted(os.path.normcase(os.path.abspath(m.group(1) if (m := FILE_RANGE.match(f)) else f))
+                   for f in files or [])
+    return hashlib.sha256(json.dumps([os.path.normcase(os.path.abspath(out)), paths]).encode("utf-8")).hexdigest()[:12]
+
+
+def tries_asked():
+    """By which try a piece of work has to be right to be effective (scale.tries in the config: the second)"""
+    return int((CFG.get("scale") or {}).get("tries", 2))
+
+
+def _wrong(r):
+    if r.get("stopped") or r.get("error") or not r.get("answer"):
+        return "gave nothing back"  # an agent the worker stopped or that ended in an error, an empty answer
+    if r.get("cut"):
+        return "were cut"
+    if r.get("check") == "fail":
+        return "failed their check"
+    return None
+
+
+def mark_tries(rows):
+    """Two yardsticks, kept apart. Consumption: every run's tokens are spent and counted, and a task run four times
+    is four runs. Quality: a piece of work (work_id: an output and its files) is effective when its output was right
+    by the first or second try (tries_asked); one that took more, or was left wrong, is not, whatever it consumed.
+    Marks each run with its piece's tries and with why it is not effective (None when it is)."""
+    most = tries_asked()
+    pieces = {}
+    for r in rows:
+        if r.get("work"):
+            pieces.setdefault(r["work"], []).append(r)
+    for runs in pieces.values():
+        why = _wrong(runs[-1]) or (f"were of work that took more than {most} tries" if len(runs) > most else None)
+        for r in runs:
+            r["_tries"], r["_why"] = len(runs), why
+
+
+def not_effective(r):
+    """Why a run is not effective work, or None when it is. A run with no piece of work to its name (an answer that
+    was only printed) is judged by itself."""
+    return r.get("_why") if "_tries" in r else _wrong(r)
+
+
 def run_failed(r):
-    """A run that read and gave nothing back: an agent the worker stopped or that ended in an error, an empty
-    answer. Its tokens were consumed, and count as that, but they were not effective: nothing was kept off Claude,
-    and scripts/local_share.py measures the scale on the effective ones."""
-    return bool(r.get("stopped") or r.get("error") or not r.get("answer"))
+    return not_effective(r) is not None
+
+
+def pieces_line(recs):
+    """The quality yardstick in a line: the pieces of work by the try they were right at"""
+    most = tries_asked()
+    pieces = {}
+    for r in recs:
+        if r.get("work"):
+            pieces[r["work"]] = r  # its last run among these
+    if not pieces:
+        return None
+    first = sum(1 for r in pieces.values() if not r["_why"] and r["_tries"] == 1)
+    by = sum(1 for r in pieces.values() if not r["_why"] and r["_tries"] > 1)
+    more = sum(1 for r in pieces.values() if r["_why"] and r["_tries"] > most and not _wrong(r))
+    wrong = len(pieces) - first - by - more
+    return (f"quality, by piece of work (an output and the files it is about): {len(pieces)} pieces, {first} right at "
+            f"the first try, {by} by try {most}, {more} took more tries, {wrong} left wrong (cut, failing their "
+            f"check, nothing back). Effective is the first two: right by try {most}")
 
 
 # USD per million tokens (input, output): Anthropic's API list prices on 2026-11-03. Cache reads are $0.20 on both.
@@ -772,8 +985,14 @@ def guard_line(since=None):
     log = LOGS / "read_guard.jsonl"
     if not log.exists():
         return
-    hits = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
-    hits = [h for h in hits if not since or h["ts"][:10] >= since]
+    hits = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        try:
+            h = json.loads(line)
+            if not since or h["ts"][:10] >= since:
+                hits.append(h)
+        except (ValueError, KeyError, TypeError):  # a line cut short by a hook that was killed
+            continue
     if hits:
         print(f"\nread guard: {len(hits)} whole-file reads of big files sent to the worker instead "
               f"({sum(h['lines'] for h in hits):,} lines in all, {len({h['path'] for h in hits})} files)")
@@ -807,15 +1026,23 @@ def cost_table(recs, key):
 FILE_RANGE = re.compile(r"^(.*):(\d+)-(\d+)$")
 
 
-def read_file_spec(spec):
+NUMBERED = "every line starts with its number in the file and a tab, which are not part of the file"
+
+
+def read_file_spec(spec, number=False):
+    """number: every line with its number in the file in front of it. A model asked for 'name (line N)' counts the
+    lines by eye and gets them wrong over a few hundred; with the number there it copies it. Not for a rewrite: the
+    numbers would come back in the code."""
     m = FILE_RANGE.match(spec)
     path, a, b = (m.group(1), int(m.group(2)), int(m.group(3))) if m else (spec, None, None)
-    text = Path(path).read_text(encoding="utf-8", errors="replace")
-    if a is not None:
-        text = "\n".join(text.splitlines()[a - 1:b])
-        label = f"{path} (lines {a}-{b})"
-    else:
-        label = path
+    text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    label = path if a is None else f"{path} (lines {a}-{b})"
+    if a is not None or number:
+        lines = text.splitlines()[(a or 1) - 1:b]
+        if number:
+            lines = [f"{n}\t{line}" for n, line in enumerate(lines, a or 1)]
+            label += f" ({NUMBERED})"
+        text = "\n".join(lines)
     return f"=== FILE: {label} ===\n{text}\n=== END FILE ===\n"
 
 
@@ -834,7 +1061,130 @@ def think_budget(max_tokens):
     return max(256, max_tokens - min(ANSWER_ROOM, max_tokens // 3))
 
 
+# ----- a server elsewhere (--remote): any OpenAI-compatible endpoint, for a run the caller asks to send there
+
+REMOTE = None  # set by use_remote: this run's requests go to the "remote" server of the config, not the local one
+REMOTE_DEFAULTS = {
+    "url": "",                        # its base URL, up to /v1
+    "model": "",                      # the model's name there
+    "key_env": "CRANKER_REMOTE_KEY",  # the environment variable its key is read from ("" = no key); never the config
+    "roots": [],                      # the folders files may leave this machine from: none until they are listed
+    "parallel": 2,                    # a batch's requests at once (hosted plans limit them)
+    "wait": 300,                      # s a request waits while the server limits it (HTTP 429) before it is not run
+    "extra": {},                      # fields for every request
+    "plain": {},                      # fields for a request that should not think, e.g. {"reasoning_effort": "none"}
+    "think": None,                    # fields for one that thinks; None: {"reasoning_effort": the effort}
+    "price": [0, 0],                  # USD per million tokens, in and out, for usage
+}
+EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
+# in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
+QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
+REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
+               "this machine, so only from the folders under remote.roots, and only when the user asks for it")
+
+
+def _where(p):
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(p))))
+
+
+def use_remote(files):
+    """--remote: the run goes to the server under "remote" in the config instead of the local one. The worker's
+    promise is that nothing leaves the machine, so this is never a default: it takes the flag, and the caller's
+    folder and every file of the run have to be under one of remote.roots, which is empty until the user lists
+    folders. The key comes from an environment variable, so it is in no file and no log."""
+    global REMOTE
+    r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    how = f"{CONFIG_FILE}: \"remote\": {{\"url\": \"https://.../v1\", \"model\": \"...\", \"roots\": [\"...\"]}}"
+    if not r["url"] or not r["model"]:
+        raise WorkerError(f"--remote: no server to send to. Set it in {how}")
+    parts = urlsplit(r["url"])
+    if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise WorkerError(f"--remote: {r['url']} is not https: the files and the key would cross the network in the "
+                          "clear")
+    roots = [_where(p) for p in r["roots"]]
+    for p in [os.getcwd(), *((m.group(1) if (m := FILE_RANGE.match(f)) else f) for f in files)]:
+        if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
+            raise WorkerError(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
+                              f"folders the user listed there ({how})")
+    r["key"] = os.environ.get(r["key_env"]) if r["key_env"] else None
+    if r["key_env"] and not r["key"]:
+        raise WorkerError(f"--remote: the server's key is read from the environment variable {r['key_env']}, and "
+                          "it is not set (the key is never written in the config)")
+    r["host"] = parts.hostname
+    REMOTE = r
+
+
+def _chat_remote(body):
+    """The same request, in OpenAI's own fields only: a hosted server refuses the ones llama.cpp adds. There is no
+    shared context to count there, only its limits: a 429 is waited for (Retry-After) up to remote.wait."""
+    r = REMOTE
+    asked = body.get("chat_template_kwargs") or {}
+    out = {"model": r["model"], "messages": body["messages"], "max_tokens": body["max_tokens"],
+           **{k: body[k] for k in ("temperature", "top_p") if k in body}, **r["extra"]}
+    if asked.get("enable_thinking"):
+        effort = EFFORT_ELSEWHERE[asked.get("reasoning_effort") or "xhigh"]
+        out.update(r["think"] if r["think"] is not None else {"reasoning_effort": effort})
+    else:
+        out.update(r["plain"])
+    req = urllib.request.Request(r["url"].rstrip("/") + "/chat/completions", data=json.dumps(out).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "User-Agent": "cranker-llm",
+                                          **({"Authorization": "Bearer " + r["key"]} if r["key"] else {})})
+    t0 = time.time()
+    noted = False
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                text = " ".join(e.read().decode("utf-8", "replace").split())[:400]
+            except Exception:
+                text = str(e)
+            if e.code in (401, 403):
+                raise WorkerError(f"{r['host']} refused the key in {r['key_env'] or 'no key'} (HTTP {e.code}: {text})")
+            try:
+                after = float(e.headers.get("Retry-After") or 10)
+            except ValueError:
+                after = 10.0
+            spent = any(w in text.lower() for w in QUOTA_WORDS)  # a quota that is used up is not waited for
+            if e.code not in (429, 502, 503, 504) or after > 120 or spent:
+                raise WorkerError(f"HTTP {e.code} from {r['host']}: {text}"
+                                  + (". That is a quota or the account, not a busy moment: waiting does not help"
+                                     if spent else ""))
+            if time.time() - t0 + after > r["wait"]:
+                raise WorkerBusy(f"not run: {r['host']} kept limiting the request for {_span(r['wait'])} (HTTP "
+                                 f"{e.code}: {text[:200]}). Nothing is wrong with the task: run it again later, or "
+                                 "with fewer --jobs")
+            if not noted:  # with what the server says: its reason is what tells a busy moment from a plan's limit
+                print(f"waiting, up to {_span(r['wait'])}: {r['host']} limits the requests (HTTP {e.code}: "
+                      f"{text[:200]})", file=sys.stderr)
+                noted = True
+            time.sleep(after)
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            raise WorkerError(f"{r['host']} did not answer ({type(e).__name__}: {e})")
+    choice = (d.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    usage = d.get("usage") or {}
+    content = msg.get("content") if isinstance(msg.get("content"), str) else ""
+    thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    thinking = thinking if isinstance(thinking, str) else ""
+    written = usage.get("completion_tokens") or 0
+    thought = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    seconds = time.time() - t0
+    return {
+        "content": content, "thinking": thinking, "finish": choice.get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens") or 0, "completion_tokens": written, "seconds": seconds,
+        "prompt_tps": None, "gen_tps": written / seconds if seconds else None,
+        # the answer without its thinking, as the server counts it, or else by its length: there is no /tokenize
+        "answer_tokens": (max(0, written - thought) if thought is not None
+                          else written if not thinking else len(content) // 4),
+    }
+
+
 def _chat(body):
+    if REMOTE:
+        return _chat_remote(body)
     t0 = time.time()
     r = post_with_room("/v1/chat/completions", body)
     choice = r["choices"][0]
@@ -882,7 +1232,11 @@ def find_brief(explicit=None):
             return None, ""
     key = str(path.resolve())
     if key not in _BRIEF:
-        text = path.read_text(encoding="utf-8").strip()
+        try:
+            text = path.read_text(encoding="utf-8-sig").strip()
+        except OSError as e:  # one that was asked for and is not there is an error, not a run without the rules
+            raise WorkerError(f"the brief {path} cannot be read ({e.strerror}): fix --brief or CRANKER_BRIEF, or "
+                              "pass --brief \"\" for none")
         if len(text) > BRIEF_WARN:
             print(f"the brief {path} is {len(text):,} chars: it goes into every request; keep it to the rules the "
                   f"code must follow", file=sys.stderr)
@@ -966,7 +1320,10 @@ RAISE = 1.5
 def answer_room(prompt, step, history):
     """The most max_tokens a request can have: what the context holds beside its prompt, with post_with_room's
     accounting (a request over it alone is refused there). None if the server cannot count it."""
-    need = needed_tokens({"messages": build_messages(prompt, step["files"], step["system"], history)})
+    if REMOTE:  # a server elsewhere: its context is not this machine's to count
+        return None
+    need = needed_tokens({"messages": build_messages(prompt, step["files"], step["system"], history,
+                                                     step["number"])})
     return None if need is None else CFG["ctx"] - ADMIT_MARGIN - need
 
 
@@ -980,11 +1337,19 @@ def run_checked(t, cmd, keep_thinking, brief):
     out = Path(t["out"])
     args = dict(files=t.get("files", []), system=with_brief(t.get("system") or CFG["system"], brief),
                 think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
-                cmd=cmd, effort=t.get("effort"))
+                cmd=cmd, effort=t.get("effort"), number=bool(t.get("number")), log=False)
+    work = work_id(out, t.get("files"))
+
+    def logged(res, **how):
+        """The request's line in usage.jsonl, written once its check has run: it says which piece of work it was
+        and how its output came out, which is what the quality yardstick is counted from (mark_tries)"""
+        log_usage(**res.pop("usage"), dest=str(out.resolve()), work=work, **how)  # "out" is the tokens written
+
     res = run_task(t["prompt"], **args)
     write_out(out, res, keep_thinking)
     check = t.get("check")
     if not check:
+        logged(res)
         return res
     retries = t.get("retries", CFG["check_retries"])
     note = out.with_name(out.name + ".check.txt")
@@ -996,6 +1361,7 @@ def run_checked(t, cmd, keep_thinking, brief):
     while True:
         passed, log = run_check(check, out)
         cut = res["finish"] == "length"
+        logged(res, check="pass" if passed else "fail")  # the check's own word: a cut answer's line says "cut" too
         if (passed and not cut) or tries >= retries:
             break
         if cut:
@@ -1051,16 +1417,17 @@ def run_checked(t, cmd, keep_thinking, brief):
     return res
 
 
-def build_messages(prompt, files=(), system=None, history=None):
-    parts = [read_file_spec(f) for f in files]
+def build_messages(prompt, files=(), system=None, history=None, number=False):
+    parts = [read_file_spec(f, number) for f in files]
     parts.append(prompt)
     return ([{"role": "system", "content": system or CFG["system"]}, {"role": "user", "content": "\n".join(parts)}]
             + (history or []))
 
 
 def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None,
-             history=None, attempt=0, think_tokens=None):
-    """One request. history: more turns after the first (the model's last answer and what to fix in it).
+             history=None, attempt=0, number=False, log=True, think_tokens=None):
+    """One request. history: more turns after the first (the model's last answer and what to fix in it). log=False:
+    its line for usage.jsonl comes back in res["usage"] for the caller to write (run_checked, after the check).
     think_tokens: its thinking budget, when not think_budget(max_tokens): the room a cut answer gains goes to the
     answer, not to more thinking. The result carries the limits it ran with (max_tokens, think_tokens) and 'limit',
     the max_tokens of the request its answer came from (the recovery's, once recovered)."""
@@ -1072,7 +1439,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     kwargs = {"enable_thinking": bool(think)}
     if think and effort:
         kwargs["reasoning_effort"] = effort
-    messages = build_messages(prompt, files, system, history)
+    messages = build_messages(prompt, files, system, history, number)
     body = {"model": CFG["alias"], "messages": messages, "max_tokens": max_tokens, "chat_template_kwargs": kwargs,
             **sampling}
     if think:
@@ -1092,11 +1459,21 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         res.update(content=again["content"], finish=again["finish"], recovered=True, limit=CFG["max_tokens"],
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
-                   seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"])
-    answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
-    log_usage(cmd, res["prompt_tokens"], res["completion_tokens"], answer, res["seconds"], files=len(files),
-              **({"recovered": True} if res.get("recovered") else {}), **({"attempt": attempt} if attempt else {}),
-              **({"cut": res["limit"]} if res["finish"] == "length" else {}))
+                   seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"],
+                   **({"answer_tokens": again["answer_tokens"]} if "answer_tokens" in again else {}))
+    if "answer_tokens" in res:  # a server elsewhere: counted by _chat_remote
+        answer = res.pop("answer_tokens")
+    else:
+        answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
+    # "cut": the limit an answer cut by max_tokens ran into; True for any other finish that is not a whole answer
+    res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
+                        seconds=res["seconds"], files=len(files),
+                        **({"recovered": True} if res.get("recovered") else {}),
+                        **({"attempt": attempt} if attempt else {}),
+                        **({"cut": res["limit"]} if res["finish"] == "length" else
+                           {"cut": True} if res["finish"] != "stop" else {}))
+    if log:
+        log_usage(**res.pop("usage"))
     return res
 
 
@@ -1160,9 +1537,33 @@ def unfence(text):
     return m.group(1) or ""
 
 
+TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number")
+
+
+def task_sig(t):
+    """What a task asks for, as a short hash: a batch runs a failed task again only once this has changed"""
+    asked = json.dumps({k: t.get(k) for k in TASK_KEYS}, sort_keys=True)
+    return hashlib.sha256(asked.encode("utf-8")).hexdigest()[:16]
+
+
+def failed_mark(out):
+    """Next to an output a batch left cut or failing its check: {"why": "cut" | "check", "task": task_sig}.
+    Without it a failed output counted as done, and the batch skipped the task even after its line was changed."""
+    return Path(out).with_name(Path(out).name + ".failed.json")
+
+
+def failed_before(out):
+    try:
+        mark = json.loads(failed_mark(out).read_text(encoding="utf-8"))
+        return mark if isinstance(mark, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def write_out(out, res, keep_thinking):
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    failed_mark(out).unlink(missing_ok=True)  # a new output: the batch marks it again if this one fails too
     out.write_text(unfence(res["content"]), encoding="utf-8")
     if keep_thinking and res["thinking"]:
         out.with_name(out.name + ".thinking.md").write_text(res["thinking"], encoding="utf-8")
@@ -1180,20 +1581,64 @@ def _not_running():
     return 1
 
 
+def _same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def check_out(out, files, what="-o"):
+    """An output over one of the task's own files is refused: a cut or wrong answer would replace the source (a cut
+    one left 'int ma' where a C file was), and a fix after a failed check would read it back as the file."""
+    for spec in files or []:
+        m = FILE_RANGE.match(spec)
+        if _same_file(out, m.group(1) if m else spec):
+            raise WorkerError(f"{what} is one of the task's own files ({out}): a cut or wrong answer would replace "
+                              "the source. Write to another file and move it over once it is checked")
+
+
+def load_tasks(path):
+    """A batch's tasks, checked before any of them runs: a bad line is named by its number in the file."""
+    tasks = []
+    for n, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            t = json.loads(line)
+        except ValueError as e:
+            raise WorkerError(f"{path}, line {n}: not JSON ({e.msg}, column {e.colno})")
+        if not isinstance(t, dict) or not isinstance(t.get("prompt"), str) or not isinstance(t.get("out"), str):
+            raise WorkerError(f"{path}, line {n}: a task is an object with at least \"prompt\" and \"out\"")
+        t["_line"] = n
+        tasks.append(t)
+    outs = {}
+    for t in tasks:
+        name = t.get("id", f"line {t['_line']}")
+        key = os.path.normcase(os.path.abspath(t["out"]))
+        if key in outs:
+            raise WorkerError(f"{path}: tasks {outs[key]} and {name} write the same \"out\" ({t['out']}): one would "
+                              "replace the other, and the next run would skip both")
+        outs[key] = name
+        check_out(t["out"], t.get("files"), f"{path}, task {name}: its \"out\"")
+    return tasks
+
+
 def cmd_ask(args):
-    if not healthy():
+    if args.remote:
+        use_remote(args.file or [])
+    elif not healthy():
         return _not_running()
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
     if not prompt:
         print("no prompt (-p or --prompt-file)")
         return 1
     if args.check and not args.out:
         print("--check needs -o: the check reads the output from its file ({out})")
         return 1
+    if args.out:
+        check_out(args.out, args.file)
     _, brief = find_brief(args.brief)
     t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
          "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
-         "out": args.out, "check": args.check}
+         "out": args.out, "check": args.check, "number": args.number}
     if args.retries is not None:
         t["retries"] = args.retries
     try:
@@ -1201,7 +1646,10 @@ def cmd_ask(args):
             res = run_checked(t, "ask", args.keep_thinking, brief)
         else:
             res = run_task(prompt, t["files"], with_brief(args.system or CFG["system"], brief), args.think,
-                           args.max_tokens, args.temperature, effort=args.effort)
+                           args.max_tokens, args.temperature, effort=args.effort, number=args.number)
+    except WorkerBusy as e:  # not run, as in batch and agent: nothing wrong with the task, the same command again
+        print(e)
+        return 2
     except WorkerError as e:
         print(e)
         return 1
@@ -1217,47 +1665,78 @@ def cmd_ask(args):
     return 2
 
 
+def _as_they_end(futs):
+    """as_completed, waking twice a second: on Windows a wait with no timeout does not see Ctrl+C until a task ends"""
+    pending = set(futs)
+    while pending:
+        done, pending = concurrent.futures.wait(pending, timeout=0.5,
+                                                return_when=concurrent.futures.FIRST_COMPLETED)
+        yield from done
+
+
 def cmd_batch(args):
-    if not healthy():
+    if not args.remote and not healthy():
         return _not_running()
-    tasks = [json.loads(l) for l in Path(args.tasks).read_text(encoding="utf-8").splitlines() if l.strip()]
+    tasks = load_tasks(args.tasks)
+    if args.remote:
+        use_remote([f for t in tasks for f in t.get("files") or []])
     # what every task shares goes once on the command line, not in every line: a task's own value wins
     shared = {}
     if args.system_file:
-        shared["system"] = Path(args.system_file).read_text(encoding="utf-8").strip()
+        shared["system"] = Path(args.system_file).read_text(encoding="utf-8-sig").strip()
     if args.check:
         shared["check"] = args.check
     if args.retries is not None:
         shared["retries"] = args.retries
+    if args.number:
+        shared["number"] = True
     tasks = [{**shared, **{k: v for k, v in t.items() if v is not None}} for t in tasks]
     if args.prompt_prefix:
-        prefix = Path(args.prompt_prefix).read_text(encoding="utf-8").strip()
+        prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
         tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
     brief_path, brief = find_brief(args.brief)
-    todo = [t for t in tasks if args.force or not Path(t["out"]).exists()]
-    print(f"{len(tasks)} tasks, {len(tasks) - len(todo)} already done, {len(todo)} to run"
+    # an output that exists is done, unless the task left it cut or failing its check (failed_mark): that one runs
+    # again once its task has changed, and is left alone, and said, while it has not
+    todo, same = [], []
+    for t in tasks:
+        failed = None if args.force or not Path(t["out"]).exists() else failed_before(t["out"])
+        if args.force or not Path(t["out"]).exists() or (failed and failed.get("task") != task_sig(t)):
+            todo.append(t)
+        elif failed:
+            same.append(t)
+    print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else ""))
+    if same:
+        print(f"{len(same)} failed before (cut, or failing their check) and their tasks have not changed, so they "
+              f"are not run again: {', '.join(str(t.get('id', t['out'])) for t in same)}. Change them, or --force")
     t0 = time.time()
-    failed = tokens = not_run = raised = split = 0
+    failed = tokens = not_run = kept = ended = raised = split = 0
     checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
     def one(t):
-        waited = cool_down()
+        waited = 0 if REMOTE else cool_down()  # this machine's GPU is not the one working
         if waited >= 1:
             waits.append(waited)
         return run_checked(t, "batch", args.keep_thinking, brief)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs or CFG["parallel"]) as ex:
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.jobs or (REMOTE["parallel"] if REMOTE else CFG["parallel"]))
+    try:
         futs = {ex.submit(one, t): t for t in todo}
-        for f in concurrent.futures.as_completed(futs):
+        for f in _as_they_end(futs):
             t = futs[f]
+            ended += 1
             try:
                 res = f.result()
                 tokens += res["completion_tokens"] or 0
                 cut = res["finish"] != "stop"
                 bad = res.get("check") == "fail"
                 failed += cut or bad
+                kept += cut or bad
+                if cut or bad:
+                    failed_mark(t["out"]).write_text(json.dumps({"why": "cut" if cut else "check",
+                                                                 "task": task_sig(t)}), encoding="utf-8")
                 if res.get("check"):
                     checks[res["check"]] += 1
                 raised += bool(res.get("raised"))
@@ -1273,6 +1752,15 @@ def cmd_batch(args):
             except Exception as e:
                 failed += 1
                 print(f"FAIL {t.get('id', t['out'])}: {e}")
+    except KeyboardInterrupt:
+        # the pool's threads are not daemons: left to end by themselves, the tasks still waiting would all run and
+        # the process would end with the last of them. Leaving now closes the running requests' connections, which
+        # is how the server learns to drop them.
+        ex.shutdown(wait=False, cancel_futures=True)
+        print(f"interrupted: {ended} of {len(todo)} tasks had ended. Run the same batch again for the rest: the "
+              "finished ones are skipped", flush=True)
+        os._exit(130)
+    ex.shutdown()
     print(f"done: {len(todo) - failed - not_run} ok, {failed} failed or cut, "
           + (f"{not_run} not run, " if not_run else "") + f"{tokens} tokens out in {time.time() - t0:.0f} s"
           + (f"; paused {len(waits)} times for GPU heat ({sum(waits):.0f} s)" if waits else ""))
@@ -1285,16 +1773,22 @@ def cmd_batch(args):
                                      "(their CUT lines)" if split else ""))
     if failed:
         print(RESEND)
+    if kept:
+        print(f"{kept} of them left an output (cut, or failing its check). The same batch runs a task like that "
+              "again once its line has changed (or send the changed ones in a file of their own); unchanged, it is "
+              "skipped")
     if not_run:
         print(f"{not_run} tasks were not run: the worker was taken for the whole wait (see their WAIT lines for "
               "who had it). They did not fail: run the same batch again, the finished tasks are skipped")
-    return 0 if failed == 0 and not_run == 0 else 2
+    return 0 if failed == 0 and not_run == 0 and not same else 2
 
 
 # ------------------------------------------------------------------------------------------------------- agent
 
 def agent_env(url):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_OAUTH", "AWS_BEARER"))}
+    # CLAUDE_CODE_USE_*: the caller's Bedrock or Vertex setting would send the agent there instead of to the relay
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_OAUTH", "CLAUDE_CODE_USE_", "AWS_BEARER"))}
     alias = CFG["alias"]
     env.update({
         "ANTHROPIC_BASE_URL": url,  # the relay to the local server (AgentRelay): nothing goes to Anthropic
@@ -1507,10 +2001,16 @@ def agent_turn(wait):
 def cmd_agent(args):
     if not healthy():
         return _not_running()
-    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
     if not prompt:
         print("no prompt (-p or --prompt-file)")
         return 1
+    exe = shutil.which("claude")  # before the waits below: not after half an hour of them
+    if not exe:
+        print("claude not found on PATH")
+        return 1
+    # it loads no CLAUDE.md (no setting sources): the project's brief is how it learns how the user works there
+    _, brief = find_brief(args.brief)
     turn = agent_turn(args.timeout)  # held until this process ends
     if turn is None:
         print(f"not run: {agent_holder()} still has the worker after {_span(args.timeout)} of waiting. Nothing is "
@@ -1541,12 +2041,6 @@ def cmd_agent(args):
     if args.write:
         tools += ["Write", "Edit"]
         allowed += ["Edit(./**)", "Write(./**)"]
-    exe = shutil.which("claude")
-    if not exe:
-        print("claude not found on PATH")
-        return 1
-    # it loads no CLAUDE.md (no setting sources): the project's brief is how it learns how the user works there
-    _, brief = find_brief(args.brief)
     # not --bare: it leaves only Read and Edit. No setting sources instead (no hooks, plugins or CLAUDE.md), no MCP
     # servers; the API key and base URL in agent_env keep every request on this machine.
     cmd = [exe, "-p", prompt, "--setting-sources", "", "--strict-mcp-config",
@@ -1555,6 +2049,8 @@ def cmd_agent(args):
            "--append-system-prompt", with_brief(AGENT_APPEND, brief)]
     for d in args.dir or []:
         cmd += ["--add-dir", d]
+    # which piece of work this run is, for usage.jsonl: the same search sent again is one more try of it (mark_tries)
+    piece = {"dest": str(Path(args.out).resolve()), "work": work_id(args.out, args.dir)} if args.out else {}
     relay = AgentRelay(URL, CFG["agent_think_budget"], stall_limit=AGENT_STALL)
     relay.start()
     agent_note("running", args.timeout, prompt)
@@ -1582,7 +2078,7 @@ def cmd_agent(args):
         relay.stop()
     if stopped:
         log_usage("agent", relay.tokens_in, relay.tokens_out, 0, time.time() - t0, turns=relay.requests,
-                  stopped="stall" if relay.stalled else "timeout")
+                  stopped="stall" if relay.stalled else "timeout", **piece)
         print(RESEND)
         print(f"agent {stopped} ({relay.requests} requests, {time.time() - t0:.0f} s, in {relay.tokens_in} tok, "
               f"out {relay.tokens_out} tok)")
@@ -1598,7 +2094,7 @@ def cmd_agent(args):
                  + (u.get("cache_creation_input_tokens") or 0))
     error = (d.get("terminal_reason") or "error") if d.get("is_error") else None
     log_usage("agent", tokens_in, u.get("output_tokens"), count_tokens(result), time.time() - t0,
-              turns=d.get("num_turns"), **({"error": error} if error else {}))
+              turns=d.get("num_turns"), **({"error": error} if error else {}), **piece)
     # with an error the result is the error's text: it goes on the last line, where a caller that reads only the
     # tail of the output still sees why
     line = (f"turns {d.get('num_turns')}, {time.time() - t0:.0f} s, in {tokens_in} tok, "
@@ -1635,6 +2131,9 @@ def main():
     p.add_argument("-p", "--prompt")
     p.add_argument("--prompt-file")
     p.add_argument("-f", "--file", action="append", help="file, or file:first-last for a line range")
+    p.add_argument("--number", action="store_true",
+                   help="give the model every line with its number: for answers that cite lines, not for rewrites")
+    p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
     p.add_argument("-o", "--out")
     p.add_argument("--system")
     p.add_argument("--think", action="store_true", help="let the model think first (slower, better on hard tasks)")
@@ -1654,6 +2153,8 @@ def main():
     p.add_argument("--check", help="the check for every task without its own; {out} is the task's output")
     p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
     p.add_argument("--system-file", help="the system prompt for every task without its own")
+    p.add_argument("--number", action="store_true", help="numbered lines for every task without its own \"number\"")
+    p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
     p.add_argument("--prompt-prefix", help="a file with what every task's prompt starts with (the shared rules)")
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("agent", help="Claude Code on the local model, with tools")
@@ -1671,8 +2172,12 @@ def main():
     p.add_argument("--session", nargs="?", const=os.environ.get("CLAUDE_CODE_SESSION_ID") or "",
                    help="only one Claude Code session's requests: the calling one, or the id given (its start)")
     args = ap.parse_args()
-    return {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "config": cmd_config, "ask": cmd_ask,
-            "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
+    try:
+        return {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "config": cmd_config, "ask": cmd_ask,
+                "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
+    except WorkerError as e:  # what the caller got wrong (a task file, a brief, an output's path), in one line
+        print(e)
+        return 1
 
 
 if __name__ == "__main__":

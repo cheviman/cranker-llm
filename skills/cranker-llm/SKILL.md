@@ -33,22 +33,42 @@ whole-file Read of a text file over `max_lines` (300) is refused with how to map
 `offset`/`limit` always goes through; when a file is really needed whole (to edit most of it), Read it with
 offset 1 and limit its line count. Folders outside those roots are never touched.
 
-**The scale** (a hook): the target is `ratio` local tokens for each token of Claude (`scale` in the config, 5 by
-default: a million local for 200K of Claude). Claude's tokens are the new ones of each turn (input, cache writes,
-output; not cache reads), and the worker's are its `in` + `out`. When a session that used the worker (or works under
-`scale.roots`) is below it, a note with the session's numbers comes into the context, at most every 15 minutes: hand
-over real load then, not more accents. `py scripts/local_share.py [--day YYYY-MM-DD]` (beside W) shows the day by
-session. It is a target to aim at, not a rule, and it blocks nothing.
+**The scale** (hooks): the user wants the worker to do more of the volume than Claude. `ratio` local tokens for
+each token of Claude (`scale` in the config, 5 by default: a million local for 200K of Claude) is where to aim, not
+a quota, and nothing is blocked. Claude's tokens are the new ones of each turn (input, cache writes, output; not
+cache reads). The worker's are measured by two yardsticks, kept apart:
+- **consumed**: `in` + `out` of every request. The tokens are spent whatever came of them, and a task run four
+  times is four runs;
+- **effective**: the work that was right by the first or second try (`scale.tries`). A piece of work is an output
+  and the files it is about, so sending it again, and each fix after a failed check, is one more try. Work that
+  took more tries, or was left cut, failing its check or with nothing back, is not effective.
+
+The scale is on the effective, so it is not reached by sending things again: it is reached by tasks that come out
+right, from an exact spec (what goes in, what comes out, a neighbouring file as the example) and with a `--check`.
+The hooks say so without the user having to: the rule when the session starts and after a compaction, a short
+reminder at every prompt while Claude is doing more than the worker's effective work (below `scale.least`, 1 to 1),
+and a longer note while working below the scale, at most every 15 minutes. When a note says the volume is there
+and the quality is not, don't send more: send better. **The worker's part of a task goes out first**, in the
+background, before reading or drafting that part: don't prepare a task for it by reading the files it is about.
+`py scripts/local_share.py [--day YYYY-MM-DD]` (beside W) shows the day by session, by both yardsticks.
 
 ## The three ways to use it
 
 **1. `ask`: a question about files, no tools.** The files go to the model, the answer to `-o`.
 ```
-py W ask -f src/big.c -o /tmp/map.md -p "For each function, in order, one line: `name` (line N): what it does, concretely. Nothing else."
+py W ask -f src/big.c --number -o /tmp/map.md -p "For each function, in order, one line: `name` (line N): what it does, concretely. Nothing else."
 py W ask -f src/big.c:120-260 -o out.md -p "..."     # a line range
 py W ask ... --think                                  # thinks first: slower, better on hard questions
 ```
 It prints `-> out.md: in N tok, out M tok, s`. Read the output only if needed, and only the part needed.
+
+`--number` (`"number": true` in a batch line) gives the model every line with its number in the file in front of
+it: use it whenever the answer cites lines (a map, a search, a review), because without it the model counts the
+lines by eye, and a line it gives is then a guess. It costs a couple of tokens a line. Never for a rewrite: the
+numbers would come back in the code. A line the worker cites is still checked before it is used.
+
+Exit codes: 0 done and right; 2 the output is not right (cut, its check still failing, an agent stopped) or the task
+was not run because the worker was taken, and the last lines say which; 1 an error.
 
 With `--think` the thinking counts inside `--max-tokens`, and Qwen thinks a lot: a 260-line diff's review and a
 647-line file's map spent 10,000 tokens thinking and came out empty. So every `--think` request carries a thinking
@@ -61,11 +81,21 @@ than its default `xhigh`. Maps, summaries and searches: no `--think`. If it must
 
 **2. `batch`: many tasks in parallel** (8 slots: ~118 tok/s in all on a 3090, against ~30 for one request). One JSON
 object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?, "check"?,
-"retries"?}`. Tasks whose `out`
-exists are skipped, so a batch can be stopped and resumed; `--force` redoes them.
+"retries"?, "number"?}`. Tasks whose `out`
+exists are skipped, so a batch can be stopped and resumed; `--force` redoes them. A task that left its `out` cut or
+failing its check is not done: change its line (more `max_tokens`, `think`, a narrower prompt) and run the same
+batch again, and only the changed ones run; unchanged, they are skipped and listed, so running the batch again
+after a `not run` burns nothing. The file is checked before any task runs, and an `out` is never one of the task's
+own `files`: write beside the source and move it over once it is checked.
 ```
 py W batch tasks.jsonl
 ```
+
+**`--remote`** (`ask` and `batch`) sends that run to the server under `remote` in the config instead of the local
+one, so the files leave the machine. **Only when the user asks for it**, never because the local server is down,
+busy or slow: say so and let them decide. The worker itself refuses it outside the folders the user listed in
+`remote.roots`, and reads the key from an environment variable the user sets; never ask for the key or write it
+anywhere. `status` shows whether a remote server is configured.
 
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own
 folder). For searching many files and putting an answer together. It loads none of the user's settings (no hooks,
@@ -165,11 +195,13 @@ is how a session ends with Claude doing everything and the scale at zero. In thi
 4. **One failure is that task with those parameters.** Don't conclude, tell the user or write to memory that "the
    worker can't do X" from one run: say what was tried, with what, and what was not tried.
 
-**Consumed is not effective.** Everything the worker reads and writes is consumed and counts as that. A run that
-read and gave nothing back (an agent stopped or in an error, an empty answer) is not effective: it is not kept off
-Claude, not saved, and the scale is measured without it. `usage` and `local_share.py` show both numbers. And **a
-report of the worker's work is this session's own** (`usage --session`, its row in `local_share.py`), with both
-numbers: never another session's or project's added in, never consumption passed off as work done.
+**Consumed is not effective.** Everything the worker reads and writes is consumed and counts as that, every run of
+it. Effective is another yardstick: the work that was right by the first or second try. A run that gave nothing
+back (an agent stopped or in an error, an empty answer), a cut answer, an output that still fails its check, and
+work that took three tries or more are not effective: not kept off Claude, not saved, and the scale is measured
+without them. `usage` and `local_share.py` show both numbers, and the pieces of work by the try they were right at.
+And **a report of the worker's work is this session's own** (`usage --session`, its row in `local_share.py`), with
+both numbers: never another session's or project's added in, never consumption passed off as work done.
 
 ## What to delegate (measured with Qwen3.8-27B Q4_K_XL on an RTX 3090)
 

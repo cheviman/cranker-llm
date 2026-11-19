@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.1.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.2.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -85,6 +85,7 @@ py scripts/worker.py start
 ```
 
 Models, binaries, logs and config live in `CRANKER_HOME` (`~/.cranker-llm` by default), never inside the plugin.
+A download that is cut (Ctrl+C, the connection) goes on from the pieces it has when the same command runs again.
 Already have the model or llama-server? `--model-path` checks your file's SHA-256 against the profile, and
 `--llama-server` uses your binary. On Linux and macOS, install llama.cpp b12421 or newer yourself (a CUDA, Metal or
 Vulkan build); the setup downloads it only on Windows.
@@ -93,15 +94,21 @@ Vulkan build); the setup downloads it only on Windows.
 
 ## Three ways in
 
-**`ask`**: files and an instruction in, the answer to a file. Line ranges work (`-f src/big.c:120-260`).
+**`ask`**: files and an instruction in, the answer to a file. Line ranges work (`-f src/big.c:120-260`), and
+`--number` gives the model every line with its number in front of it, for answers that cite lines (a map, a
+review): without it the model counts them by eye. Not for a rewrite, where the numbers would come back in the code.
 
 ```
-py scripts/worker.py ask -f src/big.c -o map.md -p "..."
+py scripts/worker.py ask -f src/big.c --number -o map.md -p "..."
 py scripts/worker.py ask -f diff.txt -o review.md --think --effort medium -p "..."
 ```
 
 **`batch`**: many tasks in parallel, one JSON object a line. Eight slots run at once (~118 tok/s in all on a 3090,
-against ~30 for one request). Tasks whose output exists are skipped, so a batch can be stopped and resumed.
+against ~30 for one request). Tasks whose output exists are skipped, so a batch can be stopped (Ctrl+C) and
+resumed. A task that left its output cut or failing its check is not done: it runs again once its line has changed
+(more `max_tokens`, `think`, a narrower prompt), and while it has not, the batch skips it and lists it, so the same
+batch run again burns nothing. The file is checked before any task runs (a line that is not JSON, one without
+`prompt` or `out`, two tasks with the same `out`), and an output is never written over one of the task's own files.
 
 ```
 {"id": "f1", "prompt": "Propose a name for this function...", "files": ["src/a.c:100-180"], "out": "names/f1.md"}
@@ -169,6 +176,35 @@ and `//ok, DD-MM-YYYY`, and passed a style check the first time.
 Keep for Claude: decisions, stateful debugging, anything that weighs several things at once, anything that goes
 into the repo without a mechanical check, and text a person will read as is.
 
+## A server elsewhere (`--remote`)
+
+The worker is local, and by default nothing leaves the machine. `ask --remote` and `batch --remote` send one run to
+another server instead: any OpenAI-compatible endpoint, such as a hosted model, or your own GPU reached from a
+machine that has none. It is never a default and never a fallback. It takes the flag, and it is refused unless the
+caller's folder and every file of the run are under one of `remote.roots`, which is empty until you list folders:
+
+```json
+"remote": {"url": "https://api.example.com/v1", "model": "qwen3.8-27b", "roots": ["D:/projects/public"],
+           "plain": {"reasoning_effort": "none"}, "price": [0.32, 2.40]}
+```
+
+- **The key** is read from the environment variable `CRANKER_REMOTE_KEY` (`key_env` names another, `""` means no
+  key). It is never in the config, and it is in no log and no output. `http` is refused except to this machine.
+- **The request** carries OpenAI's own fields only (`model`, `messages`, `max_tokens`, `temperature`, `top_p`),
+  because a hosted server refuses the ones llama.cpp adds. How a model is told not to think, or how much, differs by
+  server: `plain` is added to a request that should not think, `think` to one that does (by default
+  `{"reasoning_effort": ...}`), `extra` to all. There is no thinking budget there: `--max-tokens` is the only cap.
+- **Its limits** take the place of the shared context: a batch sends `parallel` requests at once (2), and a
+  request the server limits (HTTP 429) waits as long as its `Retry-After` says, up to `wait` seconds (300), and
+  then ends as `not run`.
+- **`usage` tells them apart**: `ask (remote)`, with what they cost at `price` (USD per million, in and out).
+  They count for the scale like the local ones. `status` shows the server, the folders and whether the key is set.
+- **Not the agent**: `agent` is local only.
+
+Read the server's terms before you list a folder. A free plan is often paid for with what you send: one such
+gateway stores a free plan's requests and licenses them to third parties, with no way to turn that off. Public code
+is one thing to send there; a client's is another.
+
 ## Which model
 
 | Profile | GPU | Status | Use it for |
@@ -176,6 +212,7 @@ into the repo without a mechanical check, and text a person will read as is.
 | `qwen3.8-27b-q4kxl`: Qwen3.8-27B UD-Q4_K_XL (unsloth), 17.7 GB | 24 GB | measured | everything: the default |
 | `bonsai2-27b-q2_0`: Ternary Bonsai 2 27B Q2_0 (PrismML), 7.6 GB | 12 GB and up | measured on 24 GB only | reading in volume, and speed; not exact edits |
 | `qwen3.8-27b-iq3s`: Qwen3.8-27B UD-IQ3_S (unsloth), 12.0 GB | 16 GB | untested | |
+| `daisyrose-27b-q4km`: DaisyRose-27B Q4_K_M (bartowski), 17.3 GB | 24 GB | untested | a fine-tune of Qwen3.8-27B for long agent tasks, to compare against the default |
 
 Everything here was measured on one machine: an RTX 3090 (24 GB) at 260 W, on Windows 11, on 15 and 16 November
 2026. Other GPUs and the Linux and macOS paths are not measured yet; numbers from yours are welcome (see
@@ -288,7 +325,20 @@ Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless 
 Left to itself, Claude hands the worker what is easy to hand over, not what is heavy. One session spent six hours
 giving it accents and single lines, and on 16-11-2026 the author's sessions had Claude write 10.2M new tokens
 against the worker's 4.5M. So the plugin keeps a scale: `ratio` local tokens for each token of Claude, 5 by default
-(a million local for 200K of Claude). It is a target, not a rule, and nothing is ever blocked.
+(a million local for 200K of Claude). It is where to aim, not a quota, and nothing is ever blocked.
+
+The worker's tokens are measured by **two yardsticks, kept apart**:
+
+- **Consumed**: `in` + `out` of every request, whatever came of it. The tokens are spent all the same, and a task
+  run four times is four runs.
+- **Effective**: the work that was right by the first or second try (`tries`). A piece of work is an output and the
+  files it is about, so the same file sent again in a narrower range or with another prompt is one more try of it,
+  and so is each fix the worker makes after a failed check. Work that took more tries, or was left cut, failing its
+  check or with nothing back, is not effective, whatever it consumed. Ten to one means nothing when it took four
+  runs.
+
+The scale is on the effective, and `usage` and `local_share.py` show both, with the pieces of work by the try they
+were right at.
 
 ```
 py scripts/local_share.py [--day 2026-11-16]
@@ -306,20 +356,31 @@ session   project (where it started)                    Claude       local   rat
   one count per message, subagents included. Cache reads are left out, because they are the same context sent again
   on every turn: that day they came to 800M against the 10M new.
 - **The worker's** are `in` + `out` from `usage.jsonl`. Every request logs the Claude Code session that made it, so
-  each session's share is exact. That is what it consumed; the scale is measured on the effective part, without
-  the runs that read and gave nothing back, and `local_share.py` shows both. Tokens that only burnt don't move it.
-- **The hook** (`PostToolUse` on Read, Grep, Glob, Edit, Write and Agent, and `UserPromptSubmit`): when a session that
-  has used the worker is below the scale, it adds a note to Claude's context with the session's numbers and what
-  counts as real load. That means first drafts of the code Claude is about to write (for Claude to review), maps,
-  searches across many files, diff reviews, logs, and names and comments in batch. Accents and single lines don't
-  count. It waits until the session has spent 150K tokens of Claude, and then notes at most every 15 minutes.
+  each session's share is exact, and which piece of work it was and how its output came out (cut, its check passed
+  or failed), which is what the effective part is counted from. Tokens that only burnt don't move the scale.
+- **The hooks say what the user would otherwise keep repeating.** Three moments:
+  - *When a session starts, and again after a compaction* (`SessionStart`): the rule itself. The worker's part of
+    a task goes out first and in the background, before Claude reads, searches or drafts that part; a task is not
+    prepared for the worker by reading the files it is about, because its map of them is the preparation.
+  - *At every prompt, while Claude is doing more than the worker's effective work* (`UserPromptSubmit`, below
+    `least`, 1 to 1): a short reminder with the session's numbers, before Claude starts on the request.
+  - *While it works, below the scale* (`PostToolUse` on Read, Grep, Glob, Edit, Write and Agent): the long note,
+    with what counts as real load, at most every 15 minutes.
+
+  Each one tells volume from quality. When the worker has not consumed its share, it asks for more load. When it
+  has, and little of it was effective, it asks for better tasks instead, an exact spec and a `--check` so that the
+  work is right at the first or second try, and says not to send more.
 
 ```json
-"scale": {"ratio": 5, "roots": ["D:/projects/personal"], "floor": 150000, "every_min": 15}
+"scale": {"ratio": 5, "least": 1, "tries": 2, "roots": ["D:/projects/personal"], "floor": 150000, "every_min": 15,
+          "remind": true}
 ```
 
-In the folders under `roots` the note comes even before the session has used the worker. `ratio` 0 turns the hook
-off, and `CRANKER_RATIO` overrides it.
+`ratio` is where to aim; `least` is the ratio under which every prompt is reminded; `tries` is the try by which a
+piece of work has to be right to be effective. `floor` is how many tokens of Claude a session spends before
+anything but the start's rule is said: lower it to be told sooner. In the folders under `roots` a session is told
+even before it has used the worker. `remind: false` leaves only the long note. `ratio` 0 turns the hooks off, and
+`CRANKER_RATIO` overrides it.
 
 ## Things learned the hard way
 
@@ -384,6 +445,21 @@ off, and `CRANKER_RATIO` overrides it.
 - **Hugging Face throttles some files on one connection** (0.4 MB/s, against 24 MB/s on eight), so the setup
   downloads in ranges.
 - **Windows PowerShell 5.1 splits `-p "..."` with `\"` inside** into several arguments. Use `--prompt-file`.
+- **It also writes a BOM, and `json` refuses one.** A `config.json` saved from PowerShell stopped the worker with a
+  traceback and turned the read guard off without a word (a hook that fails lets the Read through). The config,
+  the task files and the prompt files are read as `utf-8-sig`.
+- **A pid is not a process.** `stop` killed whatever had the pid in `server.pid`, and after a crash or a reboot
+  that is some other program. The file now keeps when the server started next to its pid, and `stop` kills only
+  the process that is both. A server the worker did not start is left alone, and `stop` says so.
+- **Two sessions that both find the server down both start it.** Each launched one, and the second one's pid file
+  left the first server with nothing to stop it by. `start` now takes a lock: the second waits and answers
+  "already running". A server whose own `start` was cut short while the model loaded is waited for, not started
+  again.
+- **On Windows a wait with no timeout does not see Ctrl+C.** A batch went on until its last task, the ones still
+  waiting included. It wakes twice a second now and leaves at once; the server drops the requests whose
+  connection closed.
+- **These last four were found without the GPU**, by running the worker against a stand-in for llama-server
+  (`tests/fake_llama.py`): see "Tests".
 - **An LLM loads the GPU's memory harder than a game does.** On the 3090, within 90 s of batches the fan reached
   100 % and the GPU slowed itself down with the core at only 69 C, so the GDDR6X was at its limit. `batch` waits
   while the GPU reports thermal slowdown. Raising the power limit does not help while the memory is that hot: at
@@ -400,8 +476,25 @@ off, and `CRANKER_RATIO` overrides it.
 
 `bench/bench.py` runs against the server that is running (it never starts or stops it): a file map, an exact
 rename checked against a diff computed in code, an agent search and a batch of 16, all on `bench/sample.c`, a small
-elevator controller written for it. The report goes to `bench/runs/<tag>/`. Numbers from other GPUs are the most
+elevator controller written for it. A fifth step, `lines`, maps `scripts/worker.py` (some 1,800 lines) with the
+line of each function, without and with `--number`, and counts the lines that come out exact: it is what says how
+much `--number` is worth on a model, and it has not been run on the 3090 yet. The report goes to `bench/runs/<tag>/`. Numbers from other GPUs are the most
 useful thing you can send back.
+
+## Tests
+
+```
+py -m unittest discover -s tests
+```
+
+`tests/fake_llama.py` takes llama-server's command line and answers its endpoints with no model and no GPU; what it
+answers is scripted in the prompt (`[[say:...]]`, `[[cut]]`, `[[sleep:3]]`, `[[fail:500:...]]`). The tests run the
+real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
+of its own, so the real worker, its logs and a server that is running are never touched: `ask`, `batch`, the check
+and its fixes, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
+agent's relay, `--remote` against a second stand-in that asks for a key and refuses llama.cpp's fields, and the
+setup's download against a server that drops the connection. A couple of minutes on any machine. What they cannot tell is what the model answers: that is
+`bench/bench.py`, on the GPU.
 
 ## Files and settings
 
@@ -416,6 +509,7 @@ useful thing you can send back.
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
+| `tests/test_worker.py`, `tests/fake_llama.py` | the tests, and the stand-in for llama-server they run against |
 
 Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
 `cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `scale`, `extra` (more llama-server
@@ -433,4 +527,5 @@ of the tokens went on reading assembly, maps and logs, and the weekly limit had 
 
 BSD 3-Clause (`LICENSE`). Nothing third-party ships here. llama.cpp (MIT, ggml-org) and the models are downloaded
 from their own sources under their own licences: Qwen3.8-27B is Apache 2.0 (Alibaba Cloud), with GGUF files by
-unsloth; Ternary Bonsai 2 is Apache 2.0 (Prism ML).
+unsloth; Ternary Bonsai 2 is Apache 2.0 (Prism ML); DaisyRose-27B is Apache 2.0 (RadixArk), with GGUF files by
+bartowski.
