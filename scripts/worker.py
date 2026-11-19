@@ -2,8 +2,9 @@
 
     worker.py start | stop | status | config
     worker.py ask -p "instruction" [-f file[:a-b] ...] [--number] [-o out] [--think] [--print] [--check CMD]
-                  [--brief FILE]
+                  [--brief FILE] [--remote]
     worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F] [--number]
+                  [--remote]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
 
@@ -26,6 +27,9 @@ an agent stopped) or a task that was not run because the worker was taken (the l
 1 an error (a wrong argument or task file, the server not running or gone).
 agent: Claude Code itself, headless, on the local model: Read, Grep and Glob, and with --write also Write and Edit
 inside that folder only.
+--remote (ask, batch): the run goes to the server under "remote" in the config, any OpenAI-compatible endpoint,
+instead of the local one. The files leave the machine: only from the folders under remote.roots, with the key from
+an environment variable (CRANKER_REMOTE_KEY), and only when the user asks for it.
 
 Settings: CRANKER_HOME/config.json (~/.cranker-llm by default; scripts/setup.py writes it), and the
 environment variables in ENV_OVERRIDES. Standard library only.
@@ -449,7 +453,19 @@ def _vram_line():
     return f"VRAM {v[0].replace(', ', ' of ')} MiB" if v else ""
 
 
+def _remote_line():
+    """The server elsewhere, when one is configured: where, which model, from which folders, and whether its key is
+    set (never the key)"""
+    r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    if not r["url"]:
+        return
+    key = "no key" if not r["key_env"] else f"key in {r['key_env']} ({'set' if os.environ.get(r['key_env']) else 'not set'})"
+    roots = ", ".join(map(str, r["roots"])) or "no folder listed yet: nothing can be sent"
+    print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}")
+
+
 def cmd_status(args):
+    _remote_line()
     if not healthy():
         print(f"not running ({URL}). {_vram_line()}")
         return 1
@@ -747,9 +763,12 @@ def count_tokens(text):
 def log_usage(cmd, tokens_in, tokens_out, answer, seconds, **extra):
     """One line per request in usage.jsonl: 'in' is what the model read, 'out' what it wrote (its thinking too),
     'answer' what comes back to the caller. CRANKER_USAGE_TAG marks runs that are not work (benchmarks)."""
-    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(), "model": server_model(),
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(),
+           "model": REMOTE["model"] if REMOTE else server_model(),
            "in": tokens_in or 0, "out": tokens_out or 0, "answer": answer if answer is not None else tokens_out or 0,
            "s": round(seconds, 1), **extra}
+    if REMOTE:
+        rec["remote"] = REMOTE["host"]  # not this machine's model: usage tells them apart, with what it cost
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
@@ -816,7 +835,8 @@ def cmd_usage(args):
 
     print(f"{USAGE_LOG}: {len(recs)} requests{only} from {recs[0]['ts']} to {recs[-1]['ts']}"
           + ("" if args.all else " (benchmarks left out: --all)"))
-    table("command", lambda r: r["cmd"] + (f" [{r['tag']}]" if r.get("tag") else ""))
+    table("command", lambda r: r["cmd"] + (" (remote)" if r.get("remote") else "")
+          + (f" [{r['tag']}]" if r.get("tag") else ""))
     table("project (the caller's folder)", project_of)
     table("day", lambda r: r["ts"][:10])
     cost_table([r for r in recs if not run_failed(r)], project_of)
@@ -837,6 +857,14 @@ def cmd_usage(args):
     pieces = pieces_line(recs)
     if pieces:
         print("\n" + pieces)
+    away = [r for r in recs if r.get("remote")]
+    if away:
+        price = (CFG.get("remote") or {}).get("price") or [0, 0]
+        cost = sum(r["in"] for r in away) * price[0] / 1e6 + sum(r["out"] for r in away) * price[1] / 1e6
+        print(f"\nremote: {len(away)} of these requests went to a server elsewhere "
+              f"({', '.join(sorted({str(r['remote']) for r in away}))}), {sum(r['in'] for r in away):,} tokens in and "
+              f"{sum(r['out'] for r in away):,} out: ${cost:,.2f} at the price in the config (${price[0]:g} in / "
+              f"${price[1]:g} out per million). What they read left this machine")
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
     return 0
@@ -1031,7 +1059,130 @@ def think_budget(max_tokens):
     return max(256, max_tokens - min(ANSWER_ROOM, max_tokens // 3))
 
 
+# ----- a server elsewhere (--remote): any OpenAI-compatible endpoint, for a run the caller asks to send there
+
+REMOTE = None  # set by use_remote: this run's requests go to the "remote" server of the config, not the local one
+REMOTE_DEFAULTS = {
+    "url": "",                        # its base URL, up to /v1
+    "model": "",                      # the model's name there
+    "key_env": "CRANKER_REMOTE_KEY",  # the environment variable its key is read from ("" = no key); never the config
+    "roots": [],                      # the folders files may leave this machine from: none until they are listed
+    "parallel": 2,                    # a batch's requests at once (hosted plans limit them)
+    "wait": 300,                      # s a request waits while the server limits it (HTTP 429) before it is not run
+    "extra": {},                      # fields for every request
+    "plain": {},                      # fields for a request that should not think, e.g. {"reasoning_effort": "none"}
+    "think": None,                    # fields for one that thinks; None: {"reasoning_effort": the effort}
+    "price": [0, 0],                  # USD per million tokens, in and out, for usage
+}
+EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
+# in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
+QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
+REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
+               "this machine, so only from the folders under remote.roots, and only when the user asks for it")
+
+
+def _where(p):
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(p))))
+
+
+def use_remote(files):
+    """--remote: the run goes to the server under "remote" in the config instead of the local one. The worker's
+    promise is that nothing leaves the machine, so this is never a default: it takes the flag, and the caller's
+    folder and every file of the run have to be under one of remote.roots, which is empty until the user lists
+    folders. The key comes from an environment variable, so it is in no file and no log."""
+    global REMOTE
+    r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    how = f"{CONFIG_FILE}: \"remote\": {{\"url\": \"https://.../v1\", \"model\": \"...\", \"roots\": [\"...\"]}}"
+    if not r["url"] or not r["model"]:
+        raise WorkerError(f"--remote: no server to send to. Set it in {how}")
+    parts = urlsplit(r["url"])
+    if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise WorkerError(f"--remote: {r['url']} is not https: the files and the key would cross the network in the "
+                          "clear")
+    roots = [_where(p) for p in r["roots"]]
+    for p in [os.getcwd(), *((m.group(1) if (m := FILE_RANGE.match(f)) else f) for f in files)]:
+        if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
+            raise WorkerError(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
+                              f"folders the user listed there ({how})")
+    r["key"] = os.environ.get(r["key_env"]) if r["key_env"] else None
+    if r["key_env"] and not r["key"]:
+        raise WorkerError(f"--remote: the server's key is read from the environment variable {r['key_env']}, and "
+                          "it is not set (the key is never written in the config)")
+    r["host"] = parts.hostname
+    REMOTE = r
+
+
+def _chat_remote(body):
+    """The same request, in OpenAI's own fields only: a hosted server refuses the ones llama.cpp adds. There is no
+    shared context to count there, only its limits: a 429 is waited for (Retry-After) up to remote.wait."""
+    r = REMOTE
+    asked = body.get("chat_template_kwargs") or {}
+    out = {"model": r["model"], "messages": body["messages"], "max_tokens": body["max_tokens"],
+           **{k: body[k] for k in ("temperature", "top_p") if k in body}, **r["extra"]}
+    if asked.get("enable_thinking"):
+        effort = EFFORT_ELSEWHERE[asked.get("reasoning_effort") or "xhigh"]
+        out.update(r["think"] if r["think"] is not None else {"reasoning_effort": effort})
+    else:
+        out.update(r["plain"])
+    req = urllib.request.Request(r["url"].rstrip("/") + "/chat/completions", data=json.dumps(out).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "User-Agent": "cranker-llm",
+                                          **({"Authorization": "Bearer " + r["key"]} if r["key"] else {})})
+    t0 = time.time()
+    noted = False
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=3600) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                text = " ".join(e.read().decode("utf-8", "replace").split())[:400]
+            except Exception:
+                text = str(e)
+            if e.code in (401, 403):
+                raise WorkerError(f"{r['host']} refused the key in {r['key_env'] or 'no key'} (HTTP {e.code}: {text})")
+            try:
+                after = float(e.headers.get("Retry-After") or 10)
+            except ValueError:
+                after = 10.0
+            spent = any(w in text.lower() for w in QUOTA_WORDS)  # a quota that is used up is not waited for
+            if e.code not in (429, 502, 503, 504) or after > 120 or spent:
+                raise WorkerError(f"HTTP {e.code} from {r['host']}: {text}"
+                                  + (". That is a quota or the account, not a busy moment: waiting does not help"
+                                     if spent else ""))
+            if time.time() - t0 + after > r["wait"]:
+                raise WorkerBusy(f"not run: {r['host']} kept limiting the request for {_span(r['wait'])} (HTTP "
+                                 f"{e.code}: {text[:200]}). Nothing is wrong with the task: run it again later, or "
+                                 "with fewer --jobs")
+            if not noted:  # with what the server says: its reason is what tells a busy moment from a plan's limit
+                print(f"waiting, up to {_span(r['wait'])}: {r['host']} limits the requests (HTTP {e.code}: "
+                      f"{text[:200]})", file=sys.stderr)
+                noted = True
+            time.sleep(after)
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            raise WorkerError(f"{r['host']} did not answer ({type(e).__name__}: {e})")
+    choice = (d.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    usage = d.get("usage") or {}
+    content = msg.get("content") if isinstance(msg.get("content"), str) else ""
+    thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    thinking = thinking if isinstance(thinking, str) else ""
+    written = usage.get("completion_tokens") or 0
+    thought = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    seconds = time.time() - t0
+    return {
+        "content": content, "thinking": thinking, "finish": choice.get("finish_reason"),
+        "prompt_tokens": usage.get("prompt_tokens") or 0, "completion_tokens": written, "seconds": seconds,
+        "prompt_tps": None, "gen_tps": written / seconds if seconds else None,
+        # the answer without its thinking, as the server counts it, or else by its length: there is no /tokenize
+        "answer_tokens": (max(0, written - thought) if thought is not None
+                          else written if not thinking else len(content) // 4),
+    }
+
+
 def _chat(body):
+    if REMOTE:
+        return _chat_remote(body)
     t0 = time.time()
     r = post_with_room("/v1/chat/completions", body)
     choice = r["choices"][0]
@@ -1248,8 +1399,12 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         res.update(content=again["content"], finish=again["finish"], recovered=True,
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
-                   seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"])
-    answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
+                   seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"],
+                   **({"answer_tokens": again["answer_tokens"]} if "answer_tokens" in again else {}))
+    if "answer_tokens" in res:  # a server elsewhere: counted by _chat_remote
+        answer = res.pop("answer_tokens")
+    else:
+        answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
     res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
                         seconds=res["seconds"], files=len(files),
                         **({"recovered": True} if res.get("recovered") else {}),
@@ -1370,7 +1525,9 @@ def load_tasks(path):
 
 
 def cmd_ask(args):
-    if not healthy():
+    if args.remote:
+        use_remote(args.file or [])
+    elif not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
     if not prompt:
@@ -1421,9 +1578,11 @@ def _as_they_end(futs):
 
 
 def cmd_batch(args):
-    if not healthy():
+    if not args.remote and not healthy():
         return _not_running()
     tasks = load_tasks(args.tasks)
+    if args.remote:
+        use_remote([f for t in tasks for f in t.get("files") or []])
     # what every task shares goes once on the command line, not in every line: a task's own value wins
     shared = {}
     if args.system_file:
@@ -1459,12 +1618,13 @@ def cmd_batch(args):
     waits = []
 
     def one(t):
-        waited = cool_down()
+        waited = 0 if REMOTE else cool_down()  # this machine's GPU is not the one working
         if waited >= 1:
             waits.append(waited)
         return run_checked(t, "batch", args.keep_thinking, brief)
 
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs or CFG["parallel"])
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.jobs or (REMOTE["parallel"] if REMOTE else CFG["parallel"]))
     try:
         futs = {ex.submit(one, t): t for t in todo}
         for f in _as_they_end(futs):
@@ -1870,6 +2030,7 @@ def main():
     p.add_argument("-f", "--file", action="append", help="file, or file:first-last for a line range")
     p.add_argument("--number", action="store_true",
                    help="give the model every line with its number: for answers that cite lines, not for rewrites")
+    p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
     p.add_argument("-o", "--out")
     p.add_argument("--system")
     p.add_argument("--think", action="store_true", help="let the model think first (slower, better on hard tasks)")
@@ -1890,6 +2051,7 @@ def main():
     p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
     p.add_argument("--system-file", help="the system prompt for every task without its own")
     p.add_argument("--number", action="store_true", help="numbered lines for every task without its own \"number\"")
+    p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
     p.add_argument("--prompt-prefix", help="a file with what every task's prompt starts with (the shared rules)")
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("agent", help="Claude Code on the local model, with tools")

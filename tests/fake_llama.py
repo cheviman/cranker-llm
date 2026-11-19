@@ -9,10 +9,13 @@ What a chat request gets back is scripted in its first user message:
     [[sleep:SECONDS]]  answer after that long
     [[fail:CODE:TEXT]] an HTTP error
     [[empty-think]]    with thinking on: all thinking and no answer; with it off: the answer "recovered"
+    [[busy:N]]         HTTP 429 with Retry-After: 0 the first N times this prompt is asked, as a hosted server does
     [[die]]            the server exits without answering
 
 A token is a word. --load S answers /health with 503 for the first S seconds, as llama-server does while it loads
-the model; --record FILE appends every chat request's body to FILE, one JSON a line. Standard library only.
+the model; --record FILE appends every chat request's body to FILE, one JSON a line, with its Authorization header
+under "auth"; --key KEY answers 401 to a chat request without that key, and 400 to one with a field that is not
+OpenAI's (the tests use it as the server elsewhere of --remote). Standard library only.
 """
 import argparse
 import http.server
@@ -46,11 +49,14 @@ def main():
         ap.add_argument(name)
     ap.add_argument("--load", type=float, default=float(os.environ.get("FAKE_LLAMA_LOAD", 0)))
     ap.add_argument("--record", default=os.environ.get("FAKE_LLAMA_RECORD"))
+    ap.add_argument("--key")
     args, _ = ap.parse_known_args()
     t0 = time.time()
     lock = threading.Lock()
     running = {}  # task id: its slot's state
     counter = [0]
+    asked = {}  # a [[busy:N]] prompt: how many times it was asked
+    openai = {"model", "messages", "max_tokens", "temperature", "top_p", "reasoning_effort", "stream"}
     template = (Path(args.chat_template_file).read_text(encoding="utf-8") if args.chat_template_file
                 else "{%- for message in messages %}" + LATE_SYSTEM + "{%- endfor %}")
 
@@ -96,10 +102,29 @@ def main():
                 return self.send_json({"error": {"message": "not found"}}, 404)
             if args.record:
                 with lock, open(args.record, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"path": path, **body}) + "\n")
+                    f.write(json.dumps({"path": path, "auth": self.headers.get("Authorization"), **body}) + "\n")
+            if args.key:  # a hosted server: its key, and OpenAI's fields only
+                if self.headers.get("Authorization") != "Bearer " + args.key:
+                    return self.send_json({"error": {"code": "invalid_key", "type": "authentication_error"}}, 401)
+                unknown = sorted(set(body) - openai)
+                if unknown:
+                    return self.send_json({"error": {"code": "unsupported_parameter", "param": unknown[0]}}, 400)
             messages = body.get("messages") or []
             first = next((text_of(m.get("content")) for m in messages if m.get("role") == "user"), "")
             said = dict(DIRECTIVE.findall(first))
+            if "busy" in said:
+                with lock:
+                    asked[first] = asked.get(first, 0) + 1
+                    limited = asked[first] <= int(said["busy"])
+                if limited:
+                    body = json.dumps({"error": {"type": "rate_limit_error", "message": "slow down"}}).encode("utf-8")
+                    self.send_response(429)
+                    self.send_header("Retry-After", "0")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
             thinking = bool((body.get("chat_template_kwargs") or {}).get("enable_thinking"))
             n_prompt = sum(len(text_of(m.get("content")).split()) for m in messages)
             with lock:
