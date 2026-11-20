@@ -180,7 +180,7 @@ class FenceOutTests(unittest.TestCase):
         self.assertIn("check passed", self.stdout)
         self.assertNotIn("check passed after", self.stdout)  # the first round, not a fix
         self.assertEqual(out.read_text("utf-8"), C)
-        self.assertEqual(self.seen(), [C])
+        self.assertEqual(self.seen(), ["", C])  # "": the check tried on an empty output, before any request
         self.assertEqual(len(FencedLlama.requests), 1)
 
     def test_the_fixes_go_to_the_code_not_the_fence(self):
@@ -190,7 +190,7 @@ class FenceOutTests(unittest.TestCase):
         code = self.worker("ask", "-p", "write janus.c", "-o", str(out), "--check", self.check)
         self.assertEqual(code, 0, self.stdout)
         self.assertIn("check passed after 1 fix by the worker", self.stdout)
-        self.assertEqual(self.seen(), [WRONG, C])
+        self.assertEqual(self.seen(), ["", WRONG, C])
         fix = FencedLlama.requests[1]["messages"][-1]["content"]
         self.assertIn("main must return 0", fix)
         self.assertNotIn("'`' token", fix)
@@ -229,7 +229,8 @@ class FenceOutTests(unittest.TestCase):
         # the 20-11-2026 answer: on main the fence and the paragraph went into the file, a SyntaxError on line 1
         FencedLlama.answers = {"write the test": [TRY1]}
         out = self.tmp / "subdir_project.py"
-        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check())
+        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check(),
+                           "--check-null", "none")  # an empty file compiles: this check is about fences
         self.assertEqual(code, 0, self.stdout)
         self.assertIn("check passed", self.stdout)
         self.assertNotIn("check passed after", self.stdout)
@@ -245,7 +246,8 @@ class FenceOutTests(unittest.TestCase):
         fixed = TRY1.replace("```python\n", "```python\n# fixed\n", 1)
         FencedLlama.answers = {"write the test": [TRY2, fixed]}
         out = self.tmp / "subdir_project.py"
-        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check("# fixed"))
+        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check("# fixed"),
+                           "--check-null", "none")  # an empty file compiles: this check is about fences
         self.assertEqual(code, 0, self.stdout)
         self.assertIn("check passed after 1 fix by the worker", self.stdout)
         self.assertEqual(out.read_text("utf-8"), block_of(fixed))
@@ -260,7 +262,8 @@ class FenceOutTests(unittest.TestCase):
         # only the last round's output was kept, and the first failure of a run that ended failing was lost
         FencedLlama.answers = {"write the test": ["```python\nprint(1\n```\n"]}
         out = self.tmp / "t.py"
-        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check())
+        code = self.worker("ask", "-p", "write the test", "-o", str(out), "--check", self.python_check(),
+                           "--check-null", "none")  # an empty file compiles: this check is about fences
         self.assertEqual(code, 2, self.stdout)
         self.assertIn("CHECK FAILED after 2 fixes", self.stdout)
         for n in (1, 2, 3):
@@ -288,7 +291,7 @@ class StreamedFenceTests(unittest.TestCase):
                                       "'exec')\n")
         prompt = f"[[say-file:{FIXTURES / 'prose_after_block.try1.answer'}]] write the test"
         rc, out, err = h.worker("ask", "-o", "subdir_project.py", "-p", prompt,
-                                "--check", f'"{sys.executable}" "{check}" {{out}}')
+                                "--check", f'"{sys.executable}" "{check}" {{out}}', "--check-null", "none")
         self.assertEqual(rc, 0, out + err)
         self.assertTrue(h.requests()[0]["stream"])
         self.assertEqual((h.work / "subdir_project.py").read_text(encoding="utf-8"), block_of(TRY1))

@@ -9,7 +9,9 @@ Run the local worker's `usage --session`, with `--since $ARGUMENTS` if a date wa
 "${CLAUDE_PLUGIN_ROOT}/scripts/worker.py" usage --session` elsewhere. That is this session's own work: show its
 tables as they are, then one line with this session's "kept off Claude", the share of it that comes from `agent` (an
 upper bound: the agent's input counts Claude Code's own prompt on every turn), and the runs that ended in nothing
-if it lists any. This line is the answer to "how much did the worker do here".
+if it lists any. This line is the answer to "how much did the worker do here". When the quality line says that some
+of the right pieces passed a check never tried or had no check, say how many in that line too: they count as
+effective, but nothing proved them right.
 
 Then run `usage` again without `--session` and show its tables under their own heading, "all sessions and
 projects". Never add another session's or project's numbers to this session's, and never report the total as this

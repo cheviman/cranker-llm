@@ -94,8 +94,10 @@ class CutTests(unittest.TestCase):
         if ctx:
             env["CRANKER_CTX"] = str(ctx)
         cmd = f'"{sys.executable}" "{self.tmp / f"check_{check}.py"}" "{{out}}"'
+        # --check-null none: check_pass passes anything, and these tests are about the cuts, not the check
         r = subprocess.run([sys.executable, str(WORKER), "batch", str(self.tmp / "tasks.jsonl"), "--check", cmd,
-                            "--retries", str(retries)], cwd=self.tmp, env=env, capture_output=True, text=True,
+                            "--check-null", "none", "--retries", str(retries)], cwd=self.tmp, env=env,
+                           capture_output=True, text=True,
                            encoding="utf-8", timeout=120)
         self.stdout = r.stdout + r.stderr
         line = next((l for l in r.stdout.splitlines() if re.match(r"^(ok  |CUT |BAD |FAIL)t: ", l)), "")

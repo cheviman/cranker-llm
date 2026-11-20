@@ -81,7 +81,7 @@ than its default `xhigh`. Maps, summaries and searches: no `--think`. If it must
 
 **2. `batch`: many tasks in parallel** (8 slots: ~118 tok/s in all on a 3090, against ~30 for one request). One JSON
 object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?, "check"?,
-"retries"?, "number"?}`. Tasks whose `out`
+"check_null"?, "check_good"?, "retries"?, "number"?, "context"?: [...]}`. Tasks whose `out`
 exists are skipped, so a batch can be stopped and resumed; `--force` redoes them. A task that left its `out` cut or
 failing its check is not done: change its line (more `max_tokens`, `think`, a narrower prompt) and run the same
 batch again, and only the changed ones run; unchanged, they are skipped and listed, so running the batch again
@@ -157,7 +157,10 @@ that, and both go with every task that writes something:
   and `agent`. In a repo the user doesn't own, `--brief ""`. The first time a project gets code, names or comments from the worker and has
   no brief, Claude writes one from that project's CLAUDE.md: only the rules the code must follow (language,
   indentation, headers and markers, what is never done), 5 to 20 lines, not Claude's own workflow. It is a file in
-  the user's repo: say so when it is created. `--brief FILE` uses another one, `--brief ""` none.
+  the user's repo: say so when it is created. `--brief FILE` uses another one, `--brief ""` none. A run without one
+  whose tasks write code (an `out` that is not a document) or ask for changes (patch, diff, change, fix, apply...)
+  prints `no brief: ...` on stderr: on 20-11-2026 OutRunners had none, nothing said so, and a batch of designs
+  came back with formats made up. Write the brief then, or say why not, before sending the batch again.
 - **The check**: `--check "CMD {out}"` (or `"check"` in a batch line), a command that exits 0 when the output is
   right: a compile, a test, a style script. The worker runs it and hands the model its errors until it passes
   (`check_retries`, 2; from the second fix on it thinks first). What comes back to Claude is only what still fails:
@@ -176,13 +179,60 @@ that, and both go with every task that writes something:
   in ...`. **Read the notes when the line says so**: on 20-11-2026 they reported a stale toolchain path on the machine
   the check ran on, which no fix of the file could get past. Two blocks or more are written as they came, and the
   line says how many: which one is the file can't be told, so narrow the task to one file.
-- **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`, and
-  `--check` for all of them; a line's own value wins. The line then holds only what is its own.
+- **The check is tried before it is trusted.** Before any request, the worker runs it on an output that changes
+  nothing, which it must fail (an empty one by default; `--check-null FILE`, `"check_null"`, gives the real null:
+  the file as it is now, an empty patch), and with `--check-good FILE` (`"check_good"`) on a known-good output,
+  which it must pass. A check that passes the null or fails the good stops the run with exit 1 and its output,
+  nothing sent: fix the check, not the task. So **a check that only compiles is refused** (an empty file
+  compiles): make it also run the code, or look for what the change must produce. `--check-null none` only when an
+  empty answer can be right. The probes run on `<stem>.cranker-probe<suffix>` beside the `out` (deleted after), so
+  a check that counts its runs or logs what it saw sees them too. A check with no `{out}` in it can't be tried on a
+  copy and is refused too: put `{out}` in it, or run it untried with `--check-null none`.
+- **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`,
+  `--context` (the files, next section), and `--check` (with `--check-null`/`--check-good`) for all of them; a
+  line's own value wins. The line then holds only what is its own.
 
 The check proves what it checks, and nothing more. What passes still gets read in the diff like any draft, and an
 output without a check is checked by Claude as before. `usage` shows the rework by project: first time / by the
 worker / for Claude. When "for Claude" stays high, the prompt, the brief or the check is what needs work, not
 more rounds.
+
+## Before a wide batch: the context pack
+
+A worker sees only its files and its prompt. On 20-11-2026 a batch of 14 designs for OutRunners went out with 4
+sites of C each, and came back with `symbols.txt` lines in formats nobody uses, data addresses where instruction
+addresses go, a structure that does not exist, and "no change in the core" said without seeing the core. The
+model was not the cause: the format was in the parser, the instruction addresses in the listing, the solved cases
+in earlier rounds, and none of it was in the request. So before a batch of design or change tasks (more than a
+handful, or any that writes code or a plan to apply), build a **context pack**, a folder that goes to every task
+with `--context DIR` (or `"context": [...]` in a line; files, `file:a-b` ranges and folders, which give their files
+in name order):
+
+1. **The formats, from the code that reads them**: the parser's line range (in OutRunners,
+   `tools/core/disassemble.py:232-548`, its `load_names`), never a format retyped from memory in the prompt. What
+   the reader accepts is the format.
+2. **The mechanisms the change goes through, with their code ranges**: how the core types a pointer, where a
+   local is declared, what decides a register. The task may then say what the core lacks, with the line.
+3. **2 to 4 solved cases, each with its before and after** (a diff of an earlier round, or the two versions):
+   what a right answer looks like in this project, and the size of one.
+4. **The data the task needs**: the listing ranges with the instruction addresses, the tables, the current
+   `symbols.txt` lines of the names involved. A worker that has to quote a value must have it in front of it.
+
+Then the prompt: what it may not invent ("if what you need is not in the files, name what is missing instead of
+guessing"), what it cannot know ("say `unknown` for the core unless its code is in the files"), and the answer's
+form. And **the check that measures the real result**: the metric or the test the change must move, run on the
+patched copy, not "it applies and compiles". Try it by hand before the batch with a change that does nothing (it
+must fail; that is `--check-null`) and with a known good one (it must pass; `--check-good`): on 20-11-2026 a check
+that only applied and compiled passed a patch that changed nothing, and one that decompiled "with the patched
+copy" ran the real code (the script put `tools/core` first in `sys.path`), so the worker failed three times
+against code that never had its patch. The worker tries both again before the first request.
+
+The pack goes first in every request (after the system prompt and the brief), so it is the same prefix in every
+task: a server that caches prompts reads it once. The batch's first line says its size (`context N files (X
+chars) first in every request`); it counts in every request, so keep it to what the tasks need, in ranges, and
+split a task whose answer will not fit (the biggest OutRunners design was cut thinking at 48,000 tokens: it held
+too many uses for one answer). The pack's files are not what the work is about: a task sent again with a pack is
+the same piece of work, its next try.
 
 ## The shared context
 
@@ -234,6 +284,10 @@ it. Effective is another yardstick: the work that was right by the first or seco
 back (an agent stopped or in an error, an empty answer), a cut answer, an output that still fails its check, and
 work that took three tries or more are not effective: not kept off Claude, not saved, and the scale is measured
 without them. `usage` and `local_share.py` show both numbers, and the pieces of work by the try they were right at.
+A right piece is only as right as its check: `usage` splits the right ones into those that passed a check tried
+before it ran, those whose check was never tried (`--check-null none`, or older runs) and those with no check
+(right only because nothing sent them again), and its table of checked tasks has a `tried` column. Many right
+"at the first try" on checks never tried, or with no check, is not quality yet: say so in a report.
 And **a report of the worker's work is this session's own** (`usage --session`, its row in `local_share.py`), with
 both numbers: never another session's or project's added in, never consumption passed off as work done.
 
