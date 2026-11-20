@@ -23,6 +23,9 @@ py W config        # where the settings and the model are
   this GPU. **Downloading is the user's call**: tell them the profile, the files, their size and source (the
   `--dry-run` output) and wait for a yes before `setup.py --profile NAME --yes`.
 - "not running": `py W start` (10-90 s; the first start may patch the model's chat template and restart once).
+- "local worker off" (`status`; the user ran `local off` to free the GPU's memory): **never start it or turn it
+  back on yourself**. `ask` and `batch` go to the remote server with no flag, from `remote.roots` only; a task whose
+  files may not leave is refused: do that part yourself. `agent` and `--local` are refused.
   Starting needs no permission when it is configured; stopping does: **never `stop` the server unless the user asks**:
   another session of theirs may be using it.
 - `start` refusing for the GPU power limit (`max_power_w` in the config): tell the user; never pass

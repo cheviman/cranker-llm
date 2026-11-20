@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.5.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.6.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -346,6 +346,21 @@ that errs in other things catches more), the volume to the local one. Under `"re
 - **They say so**: a task's line says `MODEL as ROLE`, an escalated one `fixes from fix N on by MODEL as ROLE
   (escalated)`; a batch says how many tasks go to each role; `usage.jsonl` keeps the model and the role of every
   request, and `usage` prices each model at its own `price`; `status` lists the roles.
+
+### Fully remote: the local worker off
+
+When every run goes to the server elsewhere anyway, llama-server only holds the GPU's memory (and the RAM it maps).
+`worker.py local off` stops the server this worker started and writes `"local": false` in the config; `local on`
+takes it out again, and `start` starts the server as ever. While it is off:
+
+- `ask` and `batch` go where `--remote` sends them, with no flag: turning the local worker off is the standing yes,
+  as spill is. The rule is the same: a run whose files are not all under `remote.roots` is refused, and says both
+  reasons, instead of starting the server. A role keeps its own model.
+- `start`, `agent` (Claude Code on the local model), `--local` and a role that is `"local"` are refused.
+  `remote.escalate` pointing at a local role is left alone; a task that names one is refused.
+- The read guard sends the map to the remote server, and lets a Read through when the file may not leave: there is
+  nobody to map it.
+- `status` says so, with the GPU's memory. `CRANKER_LOCAL=0` turns it off for one command or one shell.
 
 Read the server's terms before you list a folder. A free plan is often paid for with what you send: one such
 gateway stores a free plan's requests and licenses them to third parties, with no way to turn that off. Public code
@@ -657,17 +672,17 @@ setup's download against a server that drops the connection. A couple of minutes
 | `commands/` | `/worker-status`, `/worker-usage` |
 | `hooks/hooks.json`, `scripts/read_guard.py` | the read guard (off until `read_guard.roots` lists folders) |
 | `hooks/hooks.json`, `scripts/local_share.py` | the scale: the day's report, and the note to sessions below it |
-| `scripts/worker.py` | start, stop, status, config, ask, batch, agent, usage |
+| `scripts/worker.py` | start, stop, local, status, config, ask, batch, agent, usage |
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
 | `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
-Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
+Settings are in `CRANKER_HOME/config.json`: `local`, `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
 `cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `scale`, `extra` (more llama-server
 options), `system`, `sampling`, `max_tokens`, `check_retries`, `check_timeout`. `worker.py config` prints the
-values in effect. These environment variables override them: `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`,
+values in effect. These environment variables override them: `CRANKER_LOCAL`, `CRANKER_MODEL`, `CRANKER_SERVER`, `CRANKER_TEMPLATE`,
 `CRANKER_PORT`, `CRANKER_CTX`, `CRANKER_PARALLEL`, `CRANKER_SPEC`, `CRANKER_EXTRA`, `CRANKER_RATIO`. `CRANKER_BRIEF`
 names the brief (or `none`). A project's brief is `.cranker/brief.md`.
 
