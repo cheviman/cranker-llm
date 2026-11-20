@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.3.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.4.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -266,6 +266,32 @@ file of the run are under `remote.roots`. `--remote` is still how a run goes the
 
 Spill is the user's say, like the folders: with it on, what the remote's terms do with a free plan's requests is
 done to every run from those folders that finds the local worker full.
+
+**Roles: a model for each kind of task.** Claude orchestrates and each stage goes where it is done best: the draft to
+one model, its review to another of another family (a model reviewing its own draft tends to agree with it, one
+that errs in other things catches more), the volume to the local one. Under `"remote"`, `roles` names them:
+
+```json
+"remote": {"url": "https://api.example.com/v1", "model": "deepseek-v4.1-flash", "roots": ["D:/projects/public"],
+           "plain": {"reasoning_effort": "none"},
+           "roles": {"draft": "glm-5.3",
+                     "review": {"model": "kimi-k3", "plain": {}, "price": [2.66, 13.31]},
+                     "volume": "local"},
+           "escalate": "review", "escalate_after": 1}
+```
+
+- **A role** is a model's name on the same server, an object whose fields (`model`, `plain`, `think`, `extra`,
+  `price`) take the place of the server's own for it (a model that refuses `"reasoning_effort": "none"` needs its
+  own `plain`), or `local`, the worker on this machine.
+- **`ask --role review`**, a batch line's `"role"`, or `batch --role draft` for every line without its own, sends
+  the task there. No `--remote`: listing a role is the user's standing yes for the runs that name it, as spill is.
+  The files still leave only from `remote.roots`, and the remote's `parallel` caps all its roles together.
+- **`--escalate ROLE`** (a line's `"escalate"`, or `remote.escalate` for every task with a check, `""` none): once a
+  task's answer failed its check `escalate_after` times (1), its fixes go to that role. By default that is its second
+  try, which still counts as effective, and the bigger model is paid only for what the first one could not get right.
+- **They say so**: a task's line says `MODEL as ROLE`, an escalated one `fixes from fix N on by MODEL as ROLE
+  (escalated)`; a batch says how many tasks go to each role; `usage.jsonl` keeps the model and the role of every
+  request, and `usage` prices each model at its own `price`; `status` lists the roles.
 
 Read the server's terms before you list a folder. A free plan is often paid for with what you send: one such
 gateway stores a free plan's requests and licenses them to third parties, with no way to turn that off. Public code

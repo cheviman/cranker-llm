@@ -110,6 +110,18 @@ its tasks, the next go there as far as `remote.parallel` allows). Nothing to pas
 do not hold back a batch because the local worker is busy. `--local` keeps a run here (a client's code that sits
 under a listed folder). Turning spill on, or listing a folder, is the user's call, never yours.
 
+**`remote.roles`** is the user's choice of a model for each kind of task (`status` lists them):
+`--role NAME` on `ask`, `"role"` in a batch line (`batch --role NAME` for the lines without one) sends that task to
+the role's model, with no `--remote`, and only from the folders under `remote.roots`; a role may also be `local`.
+Claude orchestrates: it writes the spec and the check, sends the draft to the role for drafts and its review to a
+role of **another family** (a model reviewing its own draft tends to agree with it), then reads the diff and the
+findings, drops the false ones and decides; the commit stays Claude's, with the user's yes. With a check,
+`--escalate NAME` (`"escalate"` in a line, `remote.escalate` for all) sends the fixes to that role once the first
+answer failed (`remote.escalate_after`, 1: its second try, which still counts as effective), so a bigger model is
+paid only for what the first one could not get right. The line says `MODEL as ROLE`, or `fixes from fix N on by
+MODEL as ROLE (escalated)`; `usage` prices each model apart. Use the roles that are listed and never invent one;
+adding a role or changing its model is the user's call: a role's model may bill their credits.
+
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own
 folder). For searching many files and putting an answer together. It loads none of the user's settings (no hooks,
 plugins, CLAUDE.md or MCP servers).
