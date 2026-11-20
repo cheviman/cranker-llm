@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.2.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.3.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -132,7 +132,17 @@ until it passes or runs out of `check_retries` (2 by default; from the second fi
 check is any command that exits 0 when the output is right, with `{out}` standing for the output's path. It runs in
 the caller's folder, several at once in a batch, so it must write only files of its own. An answer that is one
 fenced code block and nothing else (`` ```c ... ``` ``) is written to `-o` or `out` without its fence, so the check
-sees the code and not the fence; any other answer (prose, a markdown file with several blocks) is written as it came.
+sees the code and not the fence. When the output is a code file (anything but a document: `.md`, `.txt`, `.rst`,
+`.log` or no extension, where the text around a block is the answer; `CMakeLists.txt` and `Makefile` count as
+code), an answer with exactly one fenced block and text before or after it has the block written to the file and
+the text to `<out>.notes.md`, under a heading for each answer, and its line says so. Twice on 20-11-2026 a Python
+draft came back as its block and a paragraph after it; written as it came, the check failed on line 1 (the fence)
+and then on line 141 (the paragraph), and the fixes didn't help because the model kept adding the paragraph. The
+paragraph was worth reading, though: the second one reported a stale toolchain path on the machine the check ran
+on. A fix of a code file asks for the whole file in one block and nothing else, and for a paragraph after it only
+when the cause is outside the file. Two blocks or more are written as they came and the line says how many: which
+one is the file can't be told (two files asked for in one reply, a before and an after, the file and an example of
+its use), and choosing one would drop code without a word. Any other answer is written as it came.
 
 ```
 py scripts/worker.py ask --prompt-file spec.txt -o slug.py --check "py test_slug.py {out}"
@@ -140,7 +150,9 @@ py scripts/worker.py batch fixes.jsonl --check "py build_chunk.py {out}" --promp
 ```
 
 Each output ends one of three ways: `check passed`, `check passed after N fixes by the worker`, or `CHECK FAILED`
-with the last errors in `<out>.check.txt`, left for Claude. `usage` adds them up by project (first time / by the
+with the last errors in `<out>.check.txt`, left for Claude, and every failed round's in `<out>.check.N.txt` (only
+the last was kept once, and the first failure of a run, an MSYS2 cmake on the `PATH`, was lost with it); an output
+that passes in the end leaves none of them. `usage` adds them up by project (first time / by the
 worker / for Claude). In a `batch`, `--check`, `--retries`, `--system-file` and `--prompt-prefix` apply to every
 task that doesn't set its own, so the shared rules are written once and not in every line.
 
@@ -150,6 +162,30 @@ holds it beside the prompt; with `--think` the thinking budget stays and the ext
 task's line and its `.check.txt` start with `cut by max_tokens N`, and say `max_tokens raised N -> M` when the
 retry took it. Cut again, or with no room to raise it, the task stops there: it `needs splitting`. When a plain fix
 moves to thinking, the answer keeps the room it had and the thinking budget comes on top.
+
+**An answer that goes round in a loop is stopped while it is written.** The worker reads every answer as it streams
+(local and `--remote`), and stops the request (it closes the connection, and llama-server drops it at once) when
+the answer starts writing the same thing over and over: its last 30 lines with a letter in them, numbers aside, are
+3 different lines or fewer, or 90% of its last 800 words repeat, word for word, passages of 32 it had already
+written. What the request itself holds, as many times as it holds it, doesn't count, so a rewrite may copy a file's
+repetitions. The line starts `REPEATING: the answer went round in a loop (...)` (`LOOP` in a batch), the output
+keeps what came before the loop, and the run is not effective. Its `next:` says not to raise `--max-tokens`: on
+20-11-2026 a review with 6,000 tokens wrote a few findings, then `sdk/tests/subdir_project.py:N: fine.` for every N
+from 136 down to 1 until the limit, and its line said `cut by max_tokens: raise --max-tokens`, which would only have
+bought a longer loop. Stopped, it ends at line 195. With a check, a loop is not handed back as a fix. The thresholds
+were measured on that review and on 151 outputs of the worker (maps, reviews, searches, notes, C, C++ and Python
+drafts, test logs): the loop had 1 different line in 30, the fewest of the 151 was 10; their verbatim repetition
+was 25% at most. The other side: a task that asks for more than 30 lines of one form it was not given (the same
+line for every N) is stopped too.
+
+Sampler penalties were measured as a first line, and none is on by default. The 20-11 review, run again 4 times on
+the remote and 3 times on Qwen3.8, did not loop once, so no penalty could be shown to prevent the loop; their cost
+could be measured. Copying a 304-line file (its tabs as spaces), Qwen3.8 with DRY (`dry_multiplier` 0.8) stopped
+after 445 tokens of 4,846, with 307 of the 316 lines wrong, both times: it penalizes the copy of what the prompt
+holds, which is what a rewrite is. With `repeat_penalty` 1.1 it copied as well as without one (the same 18 lines
+where it lined up tab-aligned comments its own way, as plain runs do too). The remote gave the same repetitive list
+with `frequency_penalty` 2.0 as without it, so it does not seem to apply it, and copied the file exactly with 0.5.
+Either can still be set: `sampling` in the config for llama-server, `remote.extra` for the remote.
 
 ### The brief: how you work there
 
@@ -196,6 +232,8 @@ and the brief; a link inside a listed folder that points out of it counts as whe
   because a hosted server refuses the ones llama.cpp adds. How a model is told not to think, or how much, differs by
   server: `plain` is added to a request that should not think, `think` to one that does (by default
   `{"reasoning_effort": ...}`), `extra` to all. There is no thinking budget there: `--max-tokens` is the only cap.
+  It is streamed (`stream`, `stream_options`, OpenAI's too), so an answer that goes round in a loop is stopped
+  there as here; `"stream": false` is for a server that refuses them.
 - **Its limits** take the place of the shared context: a batch sends `parallel` requests at once (2), and a
   request the server limits (HTTP 429) waits as long as its `Retry-After` says, up to `wait` seconds (300), and
   then ends as `not run`.
@@ -516,7 +554,9 @@ py -m unittest discover -s tests
 ```
 
 `tests/fake_llama.py` takes llama-server's command line and answers its endpoints with no model and no GPU; what it
-answers is scripted in the prompt (`[[say:...]]`, `[[cut]]`, `[[sleep:3]]`, `[[fail:500:...]]`). The tests run the
+answers is scripted in the prompt (`[[say:...]]`, `[[say-file:...]]`, `[[loop:...]]`, `[[cut]]`, `[[sleep:3]]`,
+`[[fail:500:...]]`), streamed a word an event when the request asks for it. `tests/fixtures/` keeps real answers
+that went wrong, so a test runs the worker on exactly what the model sent. The tests run the
 real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
 of its own, so the real worker, its logs and a server that is running are never touched: `ask`, `batch`, the check
 and its fixes, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
@@ -538,6 +578,7 @@ setup's download against a server that drops the connection. A couple of minutes
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
 | `tests/test_worker.py`, `tests/fake_llama.py` | the tests, and the stand-in for llama-server they run against |
+| `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
 `cache_type`, `spec`, `threads`, `max_power_w`, `thermal_pause`, `read_guard`, `scale`, `extra` (more llama-server

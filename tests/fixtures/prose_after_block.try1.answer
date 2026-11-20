@@ -1,0 +1,182 @@
+```python
+#!/usr/bin/env python3
+"""
+Name:         subdir_project.py
+Description:  A project outside sdk/ that adds sdk/ with add_subdirectory and calls saturn_add_disc from its
+              own folder builds, and its A.BIN is byte for byte the repository's hello.
+Version:      0.1.0
+Created:      20-11-2026
+Modified:     20-11-2026
+Author:       Sebastian Toyos
+
+Why the reference is the repository's hello: the project's program is hello's main.c, so the two builds differ
+only in which folder calls saturn_add_disc. Every byte that changes is something saturn_add_disc takes from the
+folder that included saturn.cmake instead of from its own, which is the bug this test pins down.
+
+    py sdk/tests/subdir_project.py <repository's build of the sdk> [--keep <folder>]
+
+The sdk comes from the build's CMakeCache.txt, never from this file's location. CMAKE in the environment picks
+the cmake to run (default: the one on PATH).
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# Only these are certain to be in the cache; the rest are passed on when the build had them.
+REQUIRED = ("CMAKE_HOME_DIRECTORY", "CMAKE_TOOLCHAIN_FILE", "CMAKE_GENERATOR")
+OPTIONAL = ("CMAKE_MAKE_PROGRAM", "CMAKE_BUILD_TYPE", "SATURN_HOST_TOOLS", "SATURN_TOOLCHAIN")
+# The others are paths and go through the cmake's own form; the build type is a word.
+PLAIN = ("CMAKE_BUILD_TYPE",)
+
+
+def read_cache(path):
+	"""The cache's NAME=value entries; comment lines start with # or //."""
+	values = {}
+	for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+		if not line or line.startswith(("#", "//")):
+			continue
+		if "=" not in line:
+			continue
+		name, value = line.split("=", 1)
+		# The entry is NAME:TYPE=value; the type is of no use here.
+		values[name.split(":", 1)[0]] = value
+	return values
+
+
+def cache_path(value):
+	"""A cache value as a path: MSYS2's cmake writes /c/x, a native cmake writes C:/x."""
+	m = re.match(r"^/([A-Za-z])/(.*)$", value)
+	return Path(f"{m.group(1).upper()}:/{m.group(2)}") if m else Path(value)
+
+
+def posix_form(path):
+	"""C:/x as MSYS2's /c/x."""
+	s = Path(path).as_posix()
+	m = re.match(r"^([A-Za-z]):/(.*)$", s)
+	return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
+
+
+def cmake_form(cmake, folder):
+	"""How to write an absolute path for the cmake on PATH.
+
+	MSYS2 ships /usr/bin/cmake, a POSIX build: it reads C:/x as a path relative to the current folder, looks
+	for <cwd>/C:/x and stops with "The source directory ... does not exist", so only /c/x reaches the file. A
+	native cmake reads /c/x as <drive>:/c/x. One file, asked for by the native form, tells which one this is.
+	"""
+	probe = folder / "cmake-form-probe.txt"
+	probe.write_text("probe\n", encoding="utf-8")
+	try:
+		r = subprocess.run([cmake, "-E", "cat", probe.as_posix()], capture_output=True, text=True)
+		native = r.returncode == 0
+	finally:
+		probe.unlink()
+	if native:
+		return lambda p: Path(p).as_posix()
+	return posix_form
+
+
+def make_lists(sdk):
+	# The sdk is written as the cmake reads it, so the same file works whichever build of cmake reads it.
+	return (
+		"cmake_minimum_required(VERSION 3.21)\n"
+		"project(game LANGUAGES C CXX ASM)\n"
+		f'add_subdirectory("{sdk}" sdk)\n'
+		"saturn_add_disc(game\n"
+		"\tSOURCES main.c\n"
+		'\tIP_TITLE "SATURN-FULLSET HELLO"\n'
+		")\n"
+	)
+
+
+def main():
+	args = sys.argv[1:]
+	keep = None
+	if "--keep" in args:
+		i = args.index("--keep")
+		if i + 1 >= len(args):
+			print("--keep needs a folder")
+			return 2
+		keep = Path(args[i + 1]).resolve()
+		del args[i:i + 2]
+	if len(args) != 1:
+		print(f"usage: {sys.argv[0]} <repository's build of the sdk> [--keep <folder>]")
+		return 2
+
+	build = Path(args[0]).resolve()
+	cache = build / "CMakeCache.txt"
+	if not cache.is_file():
+		print(f"not found: {cache}")
+		return 1
+	values = read_cache(cache)
+	for name in REQUIRED:
+		if not values.get(name):
+			print(f"FAIL: {name} not in CMakeCache.txt")
+			return 1
+
+	sdk = cache_path(values["CMAKE_HOME_DIRECTORY"]).resolve()
+	toolchain = cache_path(values["CMAKE_TOOLCHAIN_FILE"])
+	reference = build / "samples" / "hello" / "hello.cd" / "A.BIN"
+	source = sdk / "samples" / "hello" / "main.c"
+	cmake = os.environ.get("CMAKE", "cmake")
+	for path in (reference, source):
+		if not path.is_file():
+			print(f"not found: {path}")
+			return 1
+
+	base = keep if keep else Path(tempfile.mkdtemp(prefix="janus-subdir-"))
+	base.mkdir(parents=True, exist_ok=True)
+	game = base / "game"
+	if game.exists():
+		print(f"{game} already exists")
+		return 1
+	try:
+		as_cmake = cmake_form(cmake, base)
+		game.mkdir()
+		shutil.copyfile(source, game / "main.c")
+		(game / "CMakeLists.txt").write_text(make_lists(as_cmake(sdk)), encoding="utf-8")
+
+		configure = [cmake, "-S", as_cmake(game), "-B", as_cmake(game / "build"),
+			"-G", values["CMAKE_GENERATOR"], "--toolchain", as_cmake(toolchain),
+			"-DSATURN_BUILD_SAMPLES=OFF"]
+		for name in OPTIONAL:
+			value = values.get(name)
+			if not value:
+				continue
+			configure.append(f"-D{name}={value if name in PLAIN else as_cmake(cache_path(value))}")
+		for cmd in (configure, [cmake, "--build", as_cmake(game / "build")]):
+			r = subprocess.run(cmd, capture_output=True, text=True)
+			if r.returncode:
+				print(f"FAIL: {' '.join(cmd)} (exit {r.returncode})\n{r.stdout[-4000:]}\n{r.stderr[-4000:]}")
+				return 1
+
+		out = game / "build"
+		for name in ("game.iso", "game.cue", "game.cd/A.BIN", "game.ip/IP.BIN"):
+			if not (out / name).is_file():
+				print(f"FAIL: {name} was not built")
+				return 1
+		got = (out / "game.cd" / "A.BIN").read_bytes()
+		want = reference.read_bytes()
+		if got != want:
+			first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+			print(f"FAIL: A.BIN differs from {reference}: {len(got)} bytes against {len(want)}, first difference at 0x{first:X}")
+			return 1
+		print(f"subdir_project: A.BIN identical to the repository's hello ({len(got)} bytes)")
+		if keep:
+			print(f"the disc: {out / 'game.cue'}")
+		return 0
+	finally:
+		if not keep:
+			shutil.rmtree(base, ignore_errors=True)
+
+
+if __name__ == "__main__":
+	sys.exit(main())
+```
+
+What is still uncertain: the probe assumes the cmake on PATH answers `cmake -E cat` with the file's contents when it reads a native absolute path, which is how I tell a native cmake from MSYS2's `/usr/bin/cmake`; if that subcommand is unavailable the probe falls to the POSIX form on a native cmake, and the configure would then fail for a different reason than the bug.

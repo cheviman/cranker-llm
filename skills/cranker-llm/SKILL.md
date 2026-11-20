@@ -67,8 +67,8 @@ it: use it whenever the answer cites lines (a map, a search, a review), because 
 lines by eye, and a line it gives is then a guess. It costs a couple of tokens a line. Never for a rewrite: the
 numbers would come back in the code. A line the worker cites is still checked before it is used.
 
-Exit codes: 0 done and right; 2 the output is not right (cut, its check still failing, an agent stopped) or the task
-was not run because the worker was taken, and the last lines say which; 1 an error.
+Exit codes: 0 done and right; 2 the output is not right (cut, looping, its check still failing, an agent stopped)
+or the task was not run because the worker was taken, and the last lines say which; 1 an error.
 
 With `--think` the thinking counts inside `--max-tokens`, and Qwen thinks a lot: a 260-line diff's review and a
 647-line file's map spent 10,000 tokens thinking and came out empty. So every `--think` request carries a thinking
@@ -99,7 +99,9 @@ rest go in one of those folders too, not in the scratchpad. It reads the key fro
 sets; never ask for the key or write it anywhere. `status` shows whether a remote server is configured.
 
 The user asking in their own words ("hacelo en la nube", "mandalo remoto", "send it to the cloud") is asking for
-`--remote`: that run goes there whatever the local worker's load.
+`--remote`: that run goes there whatever the local worker's load. A server there that refuses a streamed request
+(`stream`, `stream_options`) needs `"stream": false` under `remote`; that is the user's config, and without the
+stream a loop there runs to `--max-tokens`.
 
 **`remote.spill`** is the user's standing yes for the rest: with `"spill": true` in the config, an `ask` that finds
 the local worker full (an agent has it, no room in the context, or the server is down) goes to the remote by itself
@@ -151,8 +153,15 @@ that, and both go with every task that writes something:
   a batch, so it writes only files of its own (one object file per task, say). A check that runs the draft (a test
   script, a program) builds the folder it runs in again on every run, never reusing one a previous round's draft
   could have changed: a draft test's cleanup once deleted the project's `main.c`, and every later round failed on the
-  missing file instead of on its own errors. An answer that is one fenced block and nothing else (`` ```c ... ``` ``)
-  is written without its fence, so a check doesn't need to strip it.
+  missing file instead of on its own errors. Every round that fails keeps its check's output in
+  `<out>.check.N.txt` (N from 1), not only the last: an early round may show a fault of the machine the later ones
+  hide. An answer that is one fenced block and nothing else (`` ```c ... ``` ``) is written without its fence, so a
+  check doesn't need to strip it. For a code file (any `out` but a document: `.md`, `.txt`, `.rst`, `.log`, none;
+  `CMakeLists.txt` and `Makefile` are code), an answer with exactly one fenced block and text before or after it has
+  the block written to `out` and the text to `<out>.notes.md`; its line ends `the text around the code kept apart
+  in ...`. **Read the notes when the line says so**: on 20-11-2026 they reported a stale toolchain path on the machine
+  the check ran on, which no fix of the file could get past. Two blocks or more are written as they came, and the
+  line says how many: which one is the file can't be told, so narrow the task to one file.
 - **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`, and
   `--check` for all of them; a line's own value wins. The line then holds only what is its own.
 
@@ -260,6 +269,14 @@ counts by project. Tests and benchmarks go with `CRANKER_USAGE_TAG=bench` so the
 - `cut by max_tokens N`: raise `--max-tokens`, or ask it to think less. With a check, the worker already asked for
   it again with 1.5 times the room; `needs splitting` means even that was cut: fewer files or functions per task,
   or line ranges, not a bigger limit.
+- `REPEATING: the answer went round in a loop (...)` (`LOOP` in a batch): the worker reads every answer as it is
+  written (local and `--remote`), and one that writes the same lines over and over, numbers aside (`file:N: fine.`
+  for every N), or the same passages word for word, is stopped there, as not effective, and a check does not hand it
+  back as a fix. **Don't raise `--max-tokens`**: the room went to the loop. Send it narrower, and say what to leave
+  out ("only the defects; nothing for the lines that are fine"), or `--think`. A task that asks for more than 30
+  lines of one form it was not given (the same line for every N) is stopped too: ask for a range or a script that
+  prints them. Code that needs a repeated text (a test's input) builds it in code (`text * 20`): a test draft asked
+  for "a paragraph repeated 20 times" wrote "and again and again..." for 22,500 tokens (20-11-2026).
 - `agent stopped: N turns in a row ended at the output cap`: what it had to write does not fit in a turn. One file
   per run, or have the code written by `ask`/`batch` with `--check`.
 - "Context size has been exceeded": see "The shared context". `curl -s http://127.0.0.1:8090/slots` shows the slots.

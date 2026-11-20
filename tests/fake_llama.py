@@ -4,6 +4,8 @@ worker uses (/health, /props, /slots, /tokenize, /v1/chat/completions, /v1/messa
 What a chat request gets back is scripted in its first user message:
 
     [[say:TEXT]]       the answer (default "ok")
+    [[say-file:PATH]]  the answer is that file's text (a real answer kept as a test's fixture)
+    [[loop:TEXT]]      streamed: TEXT over and over, {n} in it counting 1, 2, 3..., until max_tokens words
     [[then:TEXT]]      the answer once the request carries more turns (the worker's fix after a failed check)
     [[cut]]            finish_reason "length"
     [[sleep:SECONDS]]  answer after that long
@@ -12,10 +14,13 @@ What a chat request gets back is scripted in its first user message:
     [[busy:N]]         HTTP 429 with Retry-After: 0 the first N times this prompt is asked, as a hosted server does
     [[die]]            the server exits without answering
 
-A token is a word. --load S answers /health with 503 for the first S seconds, as llama-server does while it loads
-the model; --record FILE appends every chat request's body to FILE, one JSON a line, with its Authorization header
-under "auth"; --key KEY answers 401 to a chat request without that key, and 400 to one with a field that is not
-OpenAI's (the tests use it as the server elsewhere of --remote). Standard library only.
+A token is a word. A chat request with "stream": true is answered as llama-server and OpenAI do, as server-sent
+events: a word an event, the counts in the last one. --load S answers /health with 503 for the first S seconds, as
+llama-server does while it loads the model; --record FILE appends every chat request's body to FILE, one JSON a
+line, with its Authorization header under "auth"; --streams FILE appends, for every streamed answer, how many words
+it sent and whether the client closed the connection before its end; --key KEY answers 401 to a chat request
+without that key, and 400 to one with a field that is not OpenAI's (the tests use it as the server elsewhere of
+--remote). Standard library only.
 """
 import argparse
 import http.server
@@ -50,13 +55,14 @@ def main():
     ap.add_argument("--load", type=float, default=float(os.environ.get("FAKE_LLAMA_LOAD", 0)))
     ap.add_argument("--record", default=os.environ.get("FAKE_LLAMA_RECORD"))
     ap.add_argument("--key")
+    ap.add_argument("--streams", default=os.environ.get("FAKE_LLAMA_STREAMS"))
     args, _ = ap.parse_known_args()
     t0 = time.time()
     lock = threading.Lock()
     running = {}  # task id: its slot's state
     counter = [0]
     asked = {}  # a [[busy:N]] prompt: how many times it was asked
-    openai = {"model", "messages", "max_tokens", "temperature", "top_p", "reasoning_effort", "stream"}
+    openai = {"model", "messages", "max_tokens", "temperature", "top_p", "reasoning_effort", "stream", "stream_options"}
     template = (Path(args.chat_template_file).read_text(encoding="utf-8") if args.chat_template_file
                 else "{%- for message in messages %}" + LATE_SYSTEM + "{%- endfor %}")
 
@@ -73,6 +79,36 @@ def main():
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def stream(self, words, thoughts, finish, n_prompt):
+            """The answer as server-sent events, a word an event, until its end or until the client leaves"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            sent, closed = 0, False
+
+            def event(obj):
+                self.wfile.write(b"data: " + json.dumps(obj).encode("utf-8") + b"\n\n")
+
+            try:
+                event({"choices": [{"index": 0, "delta": {"role": "assistant", "content": None}}]})
+                for thought in thoughts:
+                    event({"choices": [{"index": 0, "delta": {"reasoning_content": thought}}]})
+                for word in words:
+                    event({"choices": [{"index": 0, "delta": {"content": word}, "finish_reason": None}]})
+                    sent += 1
+                event({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+                event({"choices": [], "usage": {"prompt_tokens": n_prompt, "completion_tokens": sent + len(thoughts)},
+                       "timings": {"prompt_per_second": 1000.0, "predicted_per_second": 30.0}})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:  # the client left: ConnectionAbortedError, ConnectionResetError, BrokenPipeError
+                closed = True
+            if args.streams:
+                with lock, open(args.streams, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"sent": sent, "closed": closed}) + "\n")
 
         def do_GET(self):
             path = self.path.split("?")[0]
@@ -140,11 +176,19 @@ def main():
                     code, _, message = said["fail"].partition(":")
                     return self.send_json({"error": {"message": message, "code": int(code)}}, int(code))
                 answer, reasoning = said.get("say", "ok"), ""
+                if "say-file" in said:
+                    answer = Path(said["say-file"]).read_text(encoding="utf-8")
                 if "then" in said and len(messages) > 2:
                     answer = said["then"]
                 if "empty-think" in said:
                     answer, reasoning = ("", "half a thought") if thinking else ("recovered", "")
                 finish = "length" if "cut" in said else "stop"
+                if body.get("stream") and path == "/v1/chat/completions":
+                    if "loop" in said:
+                        words, finish = looping(said["loop"], body.get("max_tokens") or 4096), "length"
+                    else:
+                        words = re.findall(r"\s*\S+\s*", answer)
+                    return self.stream(words, re.findall(r"\S+\s*", reasoning), finish, n_prompt)
                 n_out = len((answer + " " + reasoning).split())
                 if path == "/v1/messages":
                     return self.send_json({
@@ -159,6 +203,15 @@ def main():
             finally:
                 with lock:
                     running.pop(task, None)
+
+    def looping(text, limit):
+        """TEXT over and over, with {n} counting, word by word: `limit` words in all"""
+        n = 0
+        while limit > 0:
+            n += 1
+            for word in re.findall(r"\s*\S+\s*", text.replace("{n}", str(n)) + "\n")[:limit]:
+                limit -= 1
+                yield word
 
     class Server(http.server.ThreadingHTTPServer):
         allow_reuse_address = False  # on Windows it would let a second server take the same port
