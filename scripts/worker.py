@@ -1151,6 +1151,10 @@ def _where(p):
 REMOTE_HOW = f"{CONFIG_FILE}: \"remote\": {{\"url\": \"https://.../v1\", \"model\": \"...\", \"roots\": [\"...\"]}}"
 
 
+class NotUnderRoots(WorkerError):
+    """A file that may not leave this machine (may_leave)"""
+
+
 def may_leave(paths, roots):
     """Refuses any of these that is not under one of remote.roots. It is asked of every file the worker reads into
     a remote request, not only the -f ones: the prompt, system and prefix files, a batch's task file and the brief
@@ -1159,8 +1163,8 @@ def may_leave(paths, roots):
     for p in paths:
         p = m.group(1) if (m := FILE_RANGE.match(str(p))) else p
         if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
-            raise WorkerError(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
-                              f"folders the user listed there ({REMOTE_HOW})")
+            raise NotUnderRoots(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
+                                f"folders the user listed there ({REMOTE_HOW})")
 
 
 def remote_key(r):
@@ -2238,10 +2242,20 @@ def escalation_of(t):
 
 def place(t, files):
     """Resolves where a task's role sends it, and its escalation's, before anything runs: a role that is not
-    listed, or files that may not leave for it (remote.roots), refuse the task with why"""
+    listed, or files that may not leave for it (remote.roots), refuse the task with why. remote.escalate is for
+    every checked task, and a task whose files may not leave keeps its fixes where it runs: an escalation sends its
+    files, and the check's output with its errors, to the role's model. One the task names (--escalate, its
+    "escalate") is refused instead, as a role is."""
     t["_server"] = server_for(t.get("role"), files)
     t["_escalate_role"] = escalation_of(t)  # the task's own, or remote.escalate's
-    t["_escalate"] = server_for(t["_escalate_role"], files) if t["_escalate_role"] else None
+    t["_escalate"] = None
+    if t["_escalate_role"]:
+        try:
+            t["_escalate"] = server_for(t["_escalate_role"], files)
+        except NotUnderRoots:
+            if "escalate" in t:
+                raise
+            t["_escalate_role"] = None
     return t
 
 

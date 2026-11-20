@@ -1,7 +1,7 @@
 {
   "name": "cranker-llm",
   "description": "A local LLM (llama.cpp on your GPU) as Claude Code's worker: it reads, summarises, names and searches in volume so those tokens stay off Claude, which orchestrates and checks. Measures the tokens it keeps off Claude.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": {
     "name": "Sebastian Toyos",
     "url": "https://github.com/cheviman"

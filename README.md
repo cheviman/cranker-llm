@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.4.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.4.1
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -289,6 +289,10 @@ that errs in other things catches more), the volume to the local one. Under `"re
 - **`--escalate ROLE`** (a line's `"escalate"`, or `remote.escalate` for every task with a check, `""` none): once a
   task's answer failed its check `escalate_after` times (1), its fixes go to that role. By default that is its second
   try, which still counts as effective, and the bigger model is paid only for what the first one could not get right.
+  A fix carries the task's files and **the check's output** (its errors), so `remote.escalate` leaves alone a task
+  whose files may not leave: its fixes stay where it ran. One that names its escalation and may not leave is refused.
+  The same holds for every fix sent elsewhere (`--remote`, spill, a role): a check whose output quotes files from
+  outside `remote.roots` sends what it prints.
 - **They say so**: a task's line says `MODEL as ROLE`, an escalated one `fixes from fix N on by MODEL as ROLE
   (escalated)`; a batch says how many tasks go to each role; `usage.jsonl` keeps the model and the role of every
   request, and `usage` prices each model at its own `price`; `status` lists the roles.
