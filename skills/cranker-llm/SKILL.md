@@ -98,6 +98,16 @@ busy or slow: say so and let them decide. The worker itself refuses it outside t
 rest go in one of those folders too, not in the scratchpad. It reads the key from an environment variable the user
 sets; never ask for the key or write it anywhere. `status` shows whether a remote server is configured.
 
+The user asking in their own words ("hacelo en la nube", "mandalo remoto", "send it to the cloud") is asking for
+`--remote`: that run goes there whatever the local worker's load.
+
+**`remote.spill`** is the user's standing yes for the rest: with `"spill": true` in the config, an `ask` that finds
+the local worker full (an agent has it, no room in the context, or the server is down) goes to the remote by itself
+when all its files are under `remote.roots`, and a batch runs on both at once (while the local worker runs one of
+its tasks, the next go there as far as `remote.parallel` allows). Nothing to pass for it: send work as always, and
+do not hold back a batch because the local worker is busy. `--local` keeps a run here (a client's code that sits
+under a listed folder). Turning spill on, or listing a folder, is the user's call, never yours.
+
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own
 folder). For searching many files and putting an answer together. It loads none of the user's settings (no hooks,
 plugins, CLAUDE.md or MCP servers).
