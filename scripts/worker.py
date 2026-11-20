@@ -2,9 +2,9 @@
 
     worker.py start | stop | status | config
     worker.py ask -p "instruction" [-f file[:a-b] ...] [--number] [-o out] [--think] [--print] [--check CMD]
-                  [--brief FILE] [--remote]
+                  [--brief FILE] [--remote | --local]
     worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F] [--number]
-                  [--remote]
+                  [--remote | --local]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
 
@@ -32,6 +32,10 @@ inside that folder only.
 --remote (ask, batch): the run goes to the server under "remote" in the config, any OpenAI-compatible endpoint,
 instead of the local one. The files leave the machine: only from the folders under remote.roots, with the key from
 an environment variable (CRANKER_REMOTE_KEY), and only when the user asks for it.
+remote.spill (true in the config, the user's say): with the local worker full (an agent has it, its context has no
+room, the request is over its context, or it is not running) a request whose files are all under remote.roots goes
+there by itself instead of waiting, and a batch's tasks run here and there at the same time. A failure there (a
+quota, its limits, the network) sends the rest back here. --local keeps a run here.
 
 Settings: CRANKER_HOME/config.json (~/.cranker-llm by default; scripts/setup.py writes it), and the
 environment variables in ENV_OVERRIDES. Standard library only.
@@ -461,9 +465,11 @@ def _remote_line():
     r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
     if not r["url"]:
         return
-    key = "no key" if not r["key_env"] else f"key in {r['key_env']} ({'set' if os.environ.get(r['key_env']) else 'not set'})"
+    key = "no key" if not r["key_env"] else f"key in {r['key_env']} ({'set' if remote_key(r) else 'not set'})"
     roots = ", ".join(map(str, r["roots"])) or "no folder listed yet: nothing can be sent"
-    print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}")
+    spill = ("; spill on: a request the local worker has no room for goes there by itself" if r["spill"] else "")
+    print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}"
+          + spill)
 
 
 def cmd_status(args):
@@ -688,15 +694,18 @@ def _post_seen(path, body):
     return fut
 
 
-def post_with_room(path, body):
+def post_with_room(path, body, spill=False):
     """The slots share one context pool (-kvu). The server does not turn a request away when the pool is full:
     decoding fails and every running request fails with it (HTTP 500, POOL_FULL). So a request is sent only where
     the running ones leave room for it (counted with its answer at most) and ADMIT_MARGIN more, one at a time
     (_Admission), else it waits. One over the whole context is an error at once: split it, use line ranges or lower
-    --max-tokens."""
+    --max-tokens. spill: the request may go elsewhere (remote.spill), so where it would wait, or the server is not
+    there, or it is over the context, LocalFull says why at once."""
     ctx = CFG["ctx"]
     need = needed_tokens(body)
     if need is not None and need > ctx - ADMIT_MARGIN:
+        if spill:
+            raise LocalFull(f"{need} tokens with the answer, over the local context ({ctx})")
         raise WorkerError(f"{need} tokens with the answer, over the context ({ctx}) alone: "
                           f"split it, use line ranges or lower --max-tokens")
     t0 = time.time()
@@ -724,8 +733,12 @@ def post_with_room(path, body):
                     raise WorkerError(f"HTTP {e.code}: {text[:500]}")
                 error = f"HTTP {e.code}: {text[:300]}"
             except (OSError, http.client.HTTPException) as e:  # the connection, not an answer: the server went away
+                if spill:
+                    raise LocalFull(f"the local server did not answer ({type(e).__name__})")
                 raise WorkerError(f"the server did not answer ({type(e).__name__}: {e}). `status` says whether it "
                                   f"still runs; its log is {SERVER_LOG}")
+        if spill:
+            raise LocalFull(error)
         if time.time() - t0 > CFG["context_wait"]:
             if fut is not None:
                 raise WorkerError(f"{error} -- still no room after {CFG['context_wait']} s")
@@ -762,15 +775,17 @@ def count_tokens(text):
         return None
 
 
-def log_usage(cmd, tokens_in, tokens_out, answer, seconds, **extra):
+def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
     """One line per request in usage.jsonl: 'in' is what the model read, 'out' what it wrote (its thinking too),
-    'answer' what comes back to the caller. CRANKER_USAGE_TAG marks runs that are not work (benchmarks)."""
+    'answer' what comes back to the caller. CRANKER_USAGE_TAG marks runs that are not work (benchmarks). where: the
+    server elsewhere the request went to (--remote's by default), never its key."""
+    where = where or REMOTE
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(),
-           "model": REMOTE["model"] if REMOTE else server_model(),
+           "model": where["model"] if where else server_model(),
            "in": tokens_in or 0, "out": tokens_out or 0, "answer": answer if answer is not None else tokens_out or 0,
            "s": round(seconds, 1), **extra}
-    if REMOTE:
-        rec["remote"] = REMOTE["host"]  # not this machine's model: usage tells them apart, with what it cost
+    if where:
+        rec["remote"] = where["host"]  # not this machine's model: usage tells them apart, with what it cost
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
@@ -1075,10 +1090,12 @@ REMOTE_DEFAULTS = {
     "plain": {},                      # fields for a request that should not think, e.g. {"reasoning_effort": "none"}
     "think": None,                    # fields for one that thinks; None: {"reasoning_effort": the effort}
     "price": [0, 0],                  # USD per million tokens, in and out, for usage
+    "spill": False,                   # with the local worker full, a request that may leave goes there by itself
 }
 EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
 # in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
 QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
+LOCAL_HELP = "keep this run on the local worker, even with remote.spill on"
 REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
                "this machine, so only from the folders under remote.roots, and only when the user asks for it")
 
@@ -1103,12 +1120,27 @@ def may_leave(paths, roots):
                               f"folders the user listed there ({REMOTE_HOW})")
 
 
-def use_remote(files):
-    """--remote: the run goes to the server under "remote" in the config instead of the local one. The worker's
-    promise is that nothing leaves the machine, so this is never a default: it takes the flag, and the caller's
-    folder and every file read into the run (may_leave) have to be under one of remote.roots, which is empty until
-    the user lists folders. The key comes from an environment variable, so it is in no file and no log."""
-    global REMOTE
+def remote_key(r):
+    """The server's key: its environment variable, or on Windows the user's own environment, where setx writes it
+    (a Claude Code started before the setx, and every command it runs, does not have it). Never the config.
+    CRANKER_USER_ENV=0 reads the process's environment only."""
+    if not r["key_env"]:
+        return None
+    key = os.environ.get(r["key_env"])
+    if not key and WINDOWS and os.environ.get("CRANKER_USER_ENV") != "0":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+                key = winreg.QueryValueEx(k, r["key_env"])[0]
+        except OSError:
+            key = None
+    return key or None
+
+
+def remote_server(files=None):
+    """The server under "remote" in the config, with its key and host, for a run that sends there: refused (with
+    why) when it has no URL or model, is not https, a file (files, with the caller's folder) is not under
+    remote.roots, or its key is not set."""
     r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
     if not r["url"] or not r["model"]:
         raise WorkerError(f"--remote: no server to send to. Set it in {REMOTE_HOW}")
@@ -1116,19 +1148,79 @@ def use_remote(files):
     if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
         raise WorkerError(f"--remote: {r['url']} is not https: the files and the key would cross the network in the "
                           "clear")
-    may_leave([os.getcwd(), *(f for f in files if f)], r["roots"])
-    r["key"] = os.environ.get(r["key_env"]) if r["key_env"] else None
+    if files is not None:
+        may_leave([os.getcwd(), *(f for f in files if f)], r["roots"])
+    r["key"] = remote_key(r)
     if r["key_env"] and not r["key"]:
         raise WorkerError(f"--remote: the server's key is read from the environment variable {r['key_env']}, and "
                           "it is not set (the key is never written in the config)")
     r["host"] = parts.hostname
-    REMOTE = r
+    return r
 
 
-def _chat_remote(body):
+def use_remote(files):
+    """--remote: the run goes to the server under "remote" in the config instead of the local one. The worker's
+    promise is that nothing leaves the machine, so this is never a default: it takes the flag, and the caller's
+    folder and every file read into the run (may_leave) have to be under one of remote.roots, which is empty until
+    the user lists folders. The key comes from an environment variable, so it is in no file and no log."""
+    global REMOTE
+    REMOTE = remote_server(list(files))
+
+
+# ----- remote.spill: with the local worker full, a request that may leave goes to the server elsewhere by itself
+
+class LocalFull(WorkerError):
+    """The local worker has no room for the request now: post_with_room(spill=True) says so instead of waiting"""
+
+
+SPILL = {"server": None, "off": None, "slots": None}  # the server, why it is off (once off, for the whole run)
+_SPILL_LOCK = threading.Lock()
+_ON = threading.local()  # this thread's task: .spill, the server it may go to (spill_for); .down, the local is not up
+
+
+def spill_server():
+    """The remote with remote.spill on, or None: spill is off, the server cannot be used (no key...), or a failure
+    there turned it off for the rest of this run. Once per process: a batch's threads share one count of requests."""
+    with _SPILL_LOCK:
+        if SPILL["server"] is None and SPILL["off"] is None:
+            r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+            if not r["spill"] or not r["roots"]:
+                SPILL["off"] = "remote.spill is off"
+            else:
+                try:
+                    SPILL["server"] = remote_server()
+                    SPILL["slots"] = threading.BoundedSemaphore(max(1, int(SPILL["server"]["parallel"])))
+                except WorkerError as e:
+                    SPILL["off"] = str(e)
+        return None if SPILL["off"] else SPILL["server"]
+
+
+def spill_for(files):
+    """The server a run's requests may spill to: spill is on, and the caller's folder and every file read into
+    them (the brief, the prompt and task files too) are under remote.roots. None: the run stays here, as ever."""
+    r = spill_server()
+    if r is None:
+        return None
+    try:
+        may_leave([os.getcwd(), *(f for f in files if f)], r["roots"])
+    except WorkerError:
+        return None
+    return r
+
+
+def _spill_off(why):
+    with _SPILL_LOCK:
+        if SPILL["off"] is None:
+            SPILL["off"] = why
+            print(f"remote.spill off for the rest of this run, the requests wait for the local worker: {why}",
+                  file=sys.stderr, flush=True)
+
+
+def _chat_remote(body, r=None):
     """The same request, in OpenAI's own fields only: a hosted server refuses the ones llama.cpp adds. There is no
-    shared context to count there, only its limits: a 429 is waited for (Retry-After) up to remote.wait."""
-    r = REMOTE
+    shared context to count there, only its limits: a 429 is waited for (Retry-After) up to remote.wait. r: the
+    server, --remote's (REMOTE) by default"""
+    r = r or REMOTE
     asked = body.get("chat_template_kwargs") or {}
     out = {"model": r["model"], "messages": body["messages"], "max_tokens": body["max_tokens"],
            **{k: body[k] for k in ("temperature", "top_p") if k in body}, **r["extra"]}
@@ -1184,6 +1276,7 @@ def _chat_remote(body):
     thought = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
     seconds = time.time() - t0
     return {
+        "where": r,
         "content": content, "thinking": thinking, "finish": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens") or 0, "completion_tokens": written, "seconds": seconds,
         "prompt_tps": None, "gen_tps": written / seconds if seconds else None,
@@ -1194,14 +1287,86 @@ def _chat_remote(body):
 
 
 def _chat(body):
+    """One request, to the local worker, or elsewhere: with --remote, or with remote.spill when the local worker
+    is full and this thread's task may leave (_ON.spill). The result's "where" is the server elsewhere, or None."""
     if REMOTE:
         return _chat_remote(body)
+    there = getattr(_ON, "spill", None)
+    if there is None:
+        return _chat_local(body)
     t0 = time.time()
-    r = post_with_room("/v1/chat/completions", body)
+    noted = False
+    while True:
+        if SPILL["off"]:
+            return _chat_local(body)  # a failure there: here, waiting as ever
+        if getattr(_ON, "down", False):
+            full = "the local server is not running"
+        else:
+            # a batch (_ON.share) runs on both at once: with a request of its own already running here, the next
+            # one goes there while it has a free slot. The local GPU shares its speed among its requests (a map
+            # alone at 29 tok/s, five at once at 8 to 15 each), the remote does not. One decision at a time
+            # (_SHARE_LOCK): the batch's threads all start together.
+            with _SHARE_LOCK:
+                here_first = not getattr(_ON, "share", False) or _SHARE["here"] == 0
+                if here_first:
+                    _SHARE["here"] += 1
+            if not here_first:
+                res = _there(body, there)
+                if res is not None:
+                    return res
+                if SPILL["off"]:
+                    continue
+                with _SHARE_LOCK:
+                    _SHARE["here"] += 1
+            try:
+                return _chat_local(body, spill=True)
+            except LocalFull as e:
+                full = str(e)
+            finally:
+                with _SHARE_LOCK:
+                    _SHARE["here"] -= 1
+        res = _there(body, there)
+        if res is not None:
+            return res
+        if SPILL["off"]:
+            continue
+        if time.time() - t0 > CFG["context_wait"]:
+            raise WorkerBusy(f"not run: {full}, and {there['host']} had its {there['parallel']} requests (remote."
+                             f"parallel) running, still after {_span(CFG['context_wait'])}. Nothing is wrong with the "
+                             "task: run it again later")
+        if not noted:
+            print(f"waiting: {full}, and {there['host']} has its {there['parallel']} requests running",
+                  file=sys.stderr, flush=True)
+            noted = True
+        time.sleep(1)
+
+
+_SHARE = {"here": 0}  # this process's spill requests running on the local worker
+_SHARE_LOCK = threading.Lock()
+
+
+def _there(body, there):
+    """The request on the server elsewhere if it has a free slot (remote.parallel): its result, or None when it has
+    none, or when it failed, which turns spill off for the rest of the run (a quota, its limits, the network)"""
+    if not SPILL["slots"].acquire(blocking=False):
+        return None
+    try:
+        return _chat_remote(body, there)
+    except (WorkerError, OSError, http.client.HTTPException, ValueError) as e:
+        _spill_off(f"{there['host']}: {e}")
+        return None
+    finally:
+        SPILL["slots"].release()
+
+
+def _chat_local(body, spill=False):
+    t0 = time.time()
+    r = post_with_room("/v1/chat/completions", body, spill)
     choice = r["choices"][0]
     msg = choice["message"]
     t = r.get("timings", {})
     return {
+        "where": None,
         "content": msg.get("content") or "",
         "thinking": msg.get("reasoning_content") or "",
         "finish": choice.get("finish_reason"),
@@ -1458,7 +1623,9 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         body["reasoning_budget_tokens"] = think_tokens
         body["reasoning_budget_message"] = BUDGET_MESSAGE
     res = _chat(body)
-    res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens)
+    where = res.pop("where", None)
+    res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens,
+               remote=where["host"] if where else None)
     if think and not res["content"].strip() and res["thinking"]:
         # still no answer (a server that ignores the budget): the thinking goes back as text and the model concludes
         # from it without thinking; the summary says so, to be checked
@@ -1467,6 +1634,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                        "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
                                                      + RECOVER.format(thinking=res["thinking"])}],
                        **CFG["sampling"]["plain"]})
+        again.pop("where", None)
         res.update(content=again["content"], finish=again["finish"], recovered=True, limit=CFG["max_tokens"],
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
@@ -1478,7 +1646,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
     # "cut": the limit an answer cut by max_tokens ran into; True for any other finish that is not a whole answer
     res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
-                        seconds=res["seconds"], files=len(files),
+                        seconds=res["seconds"], files=len(files), where=where,
                         **({"recovered": True} if res.get("recovered") else {}),
                         **({"attempt": attempt} if attempt else {}),
                         **({"cut": res["limit"]} if res["finish"] == "length" else
@@ -1511,6 +1679,8 @@ def cut_line(res):
 def summary(res, out):
     s = (f"in {res['prompt_tokens']} tok ({res['prompt_tps'] or 0:.0f} tok/s), "
          f"out {res['completion_tokens']} tok ({res['gen_tps'] or 0:.1f} tok/s), {res['seconds']:.1f} s")
+    if res.get("remote") and not REMOTE:
+        s += f", on {res['remote']} (remote.spill)"
     if res.get("recovered"):
         s += ", RECOVERED: its thinking ran out, the answer was concluded from it (check it)"
     lead = ""
@@ -1633,9 +1803,10 @@ def load_tasks(path):
 
 
 def cmd_ask(args):
+    could_spill = not args.remote and not args.local and spill_server() is not None
     if args.remote:
         use_remote([*(args.file or []), args.prompt_file])
-    elif not healthy():
+    elif not could_spill and not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
     if not prompt:
@@ -1649,6 +1820,11 @@ def cmd_ask(args):
     brief_path, brief = find_brief(args.brief)
     if REMOTE and brief_path:
         may_leave([brief_path], REMOTE["roots"])
+    if could_spill:
+        _ON.spill = spill_for([*(args.file or []), args.prompt_file, brief_path])
+        _ON.down = not healthy()
+        if _ON.down and not _ON.spill:
+            return _not_running()
     t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
          "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
          "out": args.out, "check": args.check, "number": args.number}
@@ -1688,7 +1864,9 @@ def _as_they_end(futs):
 
 
 def cmd_batch(args):
-    if not args.remote and not healthy():
+    could_spill = not args.remote and not args.local and spill_server() is not None
+    up = args.remote or healthy()
+    if not up and not could_spill:
         return _not_running()
     tasks = load_tasks(args.tasks)
     if args.remote:
@@ -1720,8 +1898,20 @@ def cmd_batch(args):
             todo.append(t)
         elif failed:
             same.append(t)
+    # remote.spill: the tasks whose files may all leave can go there when the local worker is full (spills[id])
+    spills = {}
+    if could_spill:
+        common = [args.tasks, args.system_file, args.prompt_prefix, brief_path]
+        spills = {id(t): spill_for([*common, *(t.get("files") or [])]) for t in todo}
+    there = next((r for r in spills.values() if r), None)
+    if not up and not there:
+        return _not_running()
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same)} already done, {len(todo)} to run"
-          + (f"; brief {brief_path}" if brief else ""))
+          + (f"; brief {brief_path}" if brief else "")
+          + (f"; {sum(1 for r in spills.values() if r)} of them may go to {there['host']} as well (remote.spill)"
+             if there else ""))
+    if not up and there:
+        print(f"the local worker is not running: only the tasks that may leave run, on {there['host']}")
     if same:
         print(f"{len(same)} failed before (cut, or failing their check) and their tasks have not changed, so they "
               f"are not run again: {', '.join(str(t.get('id', t['out'])) for t in same)}. Change them, or --force")
@@ -1730,14 +1920,24 @@ def cmd_batch(args):
     checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
+    away = 0
+
     def one(t):
-        waited = 0 if REMOTE else cool_down()  # this machine's GPU is not the one working
-        if waited >= 1:
-            waits.append(waited)
-        return run_checked(t, "batch", args.keep_thinking, brief)
+        _ON.spill, _ON.down, _ON.share = spills.get(id(t)), not up, True
+        try:
+            if not up and not _ON.spill:
+                raise WorkerBusy("not run: the local worker is not running, and this task's files may not leave "
+                                 "(remote.roots). Start it (worker.py start) and run the batch again")
+            waited = 0 if REMOTE or not up else cool_down()  # this machine's GPU is not the one working
+            if waited >= 1:
+                waits.append(waited)
+            return run_checked(t, "batch", args.keep_thinking, brief)
+        finally:
+            _ON.spill = _ON.down = _ON.share = None
 
     ex = concurrent.futures.ThreadPoolExecutor(
-        max_workers=args.jobs or (REMOTE["parallel"] if REMOTE else CFG["parallel"]))
+        max_workers=args.jobs or (REMOTE["parallel"] if REMOTE else
+                                  CFG["parallel"] + (int(there["parallel"]) if there else 0)))
     try:
         futs = {ex.submit(one, t): t for t in todo}
         for f in _as_they_end(futs):
@@ -1757,6 +1957,7 @@ def cmd_batch(args):
                     checks[res["check"]] += 1
                 raised += bool(res.get("raised"))
                 split += bool(res.get("split"))
+                away += bool(res.get("remote") and not REMOTE)
                 tag = "CUT " if cut else "BAD " if bad else "ok  "
                 print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad or cut else None)}")
             except WorkerBusy as e:  # never sent: not a failure of the task, and nothing to change in it
@@ -1779,7 +1980,8 @@ def cmd_batch(args):
     ex.shutdown()
     print(f"done: {len(todo) - failed - not_run} ok, {failed} failed or cut, "
           + (f"{not_run} not run, " if not_run else "") + f"{tokens} tokens out in {time.time() - t0:.0f} s"
-          + (f"; paused {len(waits)} times for GPU heat ({sum(waits):.0f} s)" if waits else ""))
+          + (f"; paused {len(waits)} times for GPU heat ({sum(waits):.0f} s)" if waits else "")
+          + (f"; {away} of them on {there['host']} (remote.spill)" if there else ""))
     if any(checks.values()):
         print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
               f"{checks['fail']} still failing (their errors in <out>.check.txt)")
@@ -2150,6 +2352,7 @@ def main():
     p.add_argument("--number", action="store_true",
                    help="give the model every line with its number: for answers that cite lines, not for rewrites")
     p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
+    p.add_argument("--local", action="store_true", help=LOCAL_HELP)
     p.add_argument("-o", "--out")
     p.add_argument("--system")
     p.add_argument("--think", action="store_true", help="let the model think first (slower, better on hard tasks)")
@@ -2171,6 +2374,7 @@ def main():
     p.add_argument("--system-file", help="the system prompt for every task without its own")
     p.add_argument("--number", action="store_true", help="numbered lines for every task without its own \"number\"")
     p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
+    p.add_argument("--local", action="store_true", help=LOCAL_HELP)
     p.add_argument("--prompt-prefix", help="a file with what every task's prompt starts with (the shared rules)")
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("agent", help="Claude Code on the local model, with tools")

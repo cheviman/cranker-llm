@@ -82,7 +82,8 @@ class Home:
 
     def env(self, **more):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CRANKER_", "CLAUDE_CODE_SESSION"))}
-        return {**env, "CRANKER_HOME": str(self.dir), **more}
+        # CRANKER_USER_ENV=0: the remote's key from the test's environment only, not from the user's (setx)
+        return {**env, "CRANKER_HOME": str(self.dir), "CRANKER_USER_ENV": "0", **more}
 
     def start(self, script, *args, **env):
         p = subprocess.Popen([PY, str(script), *map(str, args)], cwd=self.work, env=self.env(**env),

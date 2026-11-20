@@ -203,6 +203,32 @@ and the brief; a link inside a listed folder that points out of it counts as whe
   They count for the scale like the local ones. `status` shows the server, the folders and whether the key is set.
 - **Not the agent**: `agent` is local only.
 
+**Spill: there when here is busy.** With `"spill": true` in the `"remote"` block, a request that would wait for the
+local worker goes to the server elsewhere by itself, without `--remote`, as long as the caller's folder and every
+file of the run are under `remote.roots`. `--remote` is still how a run goes there whatever the load:
+
+```json
+"remote": {"url": "https://api.example.com/v1", "model": "...", "roots": ["D:/projects/public"], "spill": true}
+```
+
+- **Full** is one of four things: an agent has the worker; the shared context has no room for the request; the
+  request is over the local context on its own; or the local server is not running.
+- **A batch** runs on both at once, without waiting to be full: while one of its tasks runs here, the next go there
+  as far as `remote.parallel` allows, and the rest here. The GPU shares its speed among its requests (a map alone at
+  29 tok/s, five at once at 8 to 15 each); a batch of six maps that left only the one over the context to the remote
+  took 106 s, as long as the slowest of the five that stayed.
+- **A failure there** (a quota, its limits, a refused key, the network) turns spill off for the rest of the run, and
+  the requests wait for the local worker as ever.
+- **`--local`** keeps a run here, and a file outside `remote.roots` never goes.
+- **They say so**: a summary that went there says `on HOST (remote.spill)`; `batch`'s first line
+  ends `; N of them may go to HOST as well (remote.spill)`, and its `done:` line `; K of them on HOST
+  (remote.spill)`. `status` says `spill on`, and `usage` counts them as remote.
+- **The key on Windows** is also read from the user's environment, where `setx` writes it, so a Claude Code started
+  before the `setx` finds it. `CRANKER_USER_ENV=0` reads the process's environment only.
+
+Spill is the user's say, like the folders: with it on, what the remote's terms do with a free plan's requests is
+done to every run from those folders that finds the local worker full.
+
 Read the server's terms before you list a folder. A free plan is often paid for with what you send: one such
 gateway stores a free plan's requests and licenses them to third parties, with no way to turn that off. Public code
 is one thing to send there; a client's is another.
