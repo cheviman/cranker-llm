@@ -471,8 +471,13 @@ def _remote_line():
     key = "no key" if not r["key_env"] else f"key in {r['key_env']} ({'set' if remote_key(r) else 'not set'})"
     roots = ", ".join(map(str, r["roots"])) or "no folder listed yet: nothing can be sent"
     spill = ("; spill on: a request the local worker has no room for goes there by itself" if r["spill"] else "")
+    roles = ", ".join(f"{name} {v if isinstance(v, str) else (v or {}).get('model')}"
+                      for name, v in (r["roles"] or {}).items())
+    roles = (f"; roles: {roles}" + (f"; escalate: {r['escalate']} after {r['escalate_after']} failed answer"
+                                    + ("s" if r["escalate_after"] != 1 else "") if r["escalate"] else "")
+             if roles else "")
     print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}"
-          + spill)
+          + spill + roles)
 
 
 def cmd_status(args):
@@ -783,14 +788,15 @@ def count_tokens(text):
 def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
     """One line per request in usage.jsonl: 'in' is what the model read, 'out' what it wrote (its thinking too),
     'answer' what comes back to the caller. CRANKER_USAGE_TAG marks runs that are not work (benchmarks). where: the
-    server elsewhere the request went to (--remote's by default), never its key."""
-    where = where or REMOTE
+    server elsewhere the request went to (None: this machine's), never its key; its model, and its role if any."""
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": cmd, "cwd": os.getcwd(),
            "model": where["model"] if where else server_model(),
            "in": tokens_in or 0, "out": tokens_out or 0, "answer": answer if answer is not None else tokens_out or 0,
            "s": round(seconds, 1), **extra}
     if where:
         rec["remote"] = where["host"]  # not this machine's model: usage tells them apart, with what it cost
+        if where.get("role"):
+            rec["role"] = where["role"]
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
@@ -803,6 +809,17 @@ def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
             f.write(json.dumps(rec) + "\n")
     except OSError:
         pass
+
+
+def remote_prices():
+    """USD per million tokens (in, out) by model: remote.price for the server's own model, a role's "price" for its
+    model. The usage of a model with no price set counts as free"""
+    conf = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    prices = {conf["model"]: conf["price"]} if conf.get("model") and conf.get("price") else {}
+    for v in (conf.get("roles") or {}).values():
+        if isinstance(v, dict) and v.get("model") and v.get("price"):
+            prices[v["model"]] = v["price"]
+    return prices
 
 
 def cmd_usage(args):
@@ -881,12 +898,24 @@ def cmd_usage(args):
         print("\n" + pieces)
     away = [r for r in recs if r.get("remote")]
     if away:
-        price = (CFG.get("remote") or {}).get("price") or [0, 0]
-        cost = sum(r["in"] for r in away) * price[0] / 1e6 + sum(r["out"] for r in away) * price[1] / 1e6
+        prices = remote_prices()
+        cost = sum(r["in"] * prices.get(r["model"], (0, 0))[0] + r["out"] * prices.get(r["model"], (0, 0))[1]
+                   for r in away) / 1e6
+        models = sorted({r["model"] for r in away})
+        one = prices.get(models[0]) if len(models) == 1 else None
         print(f"\nremote: {len(away)} of these requests went to a server elsewhere "
               f"({', '.join(sorted({str(r['remote']) for r in away}))}), {sum(r['in'] for r in away):,} tokens in and "
-              f"{sum(r['out'] for r in away):,} out: ${cost:,.2f} at the price in the config (${price[0]:g} in / "
-              f"${price[1]:g} out per million). What they read left this machine")
+              f"{sum(r['out'] for r in away):,} out: ${cost:,.2f} at the "
+              + (f"price in the config (${one[0]:g} in / ${one[1]:g} out per million). What they read left this "
+                 "machine" if one else "prices in the config. What they read left this machine. By model:"))
+        for model in [] if one else models:
+            rows = [r for r in away if r["model"] == model]
+            roles = sorted({r["role"] for r in rows if r.get("role")})
+            i, o = sum(r["in"] for r in rows), sum(r["out"] for r in rows)
+            price = prices.get(model)
+            print(f"  {model}" + (f" (as {', '.join(roles)})" if roles else "") + f": {len(rows)} requests, {i:,} in, "
+                  f"{o:,} out, " + (f"${(i * price[0] + o * price[1]) / 1e6:,.2f} at ${price[0]:g} / ${price[1]:g}"
+                                    if price else "no price in the config (remote.price, or the role's \"price\")"))
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
     return 0
@@ -1100,11 +1129,16 @@ REMOTE_DEFAULTS = {
     "spill": False,                   # with the local worker full, a request that may leave goes there by itself
     "stream": True,                   # the answer as it is written, so a loop is stopped (LoopWatch); False: a
                                       # server that refuses stream or stream_options
+    "roles": {},                      # {"draft": "glm-5.3", "review": {"model": ..., "price": [...]}, "x": "local"}
+    "escalate": None,                 # the role a checked task's fixes go to once it failed (--escalate)
+    "escalate_after": 1,              # how many failed answers before that: 1, its first fix (its second try)
 }
 EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
 # in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
 QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
 LOCAL_HELP = "keep this run on the local worker, even with remote.spill on"
+ROLE_HELP = "a role of remote.roles: the model the user chose for this kind of task (draft, review...)"
+ESCALATE_HELP = "with a check: the role its fixes go to once it failed (default: remote.escalate; '' none)"
 REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
                "this machine, so only from the folders under remote.roots, and only when the user asks for it")
 
@@ -1146,11 +1180,51 @@ def remote_key(r):
     return key or None
 
 
-def remote_server(files=None):
+# ----- remote.roles: Claude orchestrates and each stage goes to the model the user chose for it (20-11-2026): the
+# draft to one, its review to another of another family, which errs in other things, the volume to the local one.
+# A role is a model's name on the remote server, an object that also sets its own fields there (a model that refuses
+# "reasoning_effort": "none" needs its own "plain"; "price" for usage), or "local". Listing a role is the user's
+# standing yes for the runs that name it, as spill is: no --remote, but the files still leave only from remote.roots.
+LOCAL = "local"
+ROLE_FIELDS = ("model", "plain", "think", "extra", "price")
+ROLES_HOW = (f"{CONFIG_FILE}: \"remote\": {{..., \"roles\": {{\"draft\": \"glm-5.3\", \"review\": {{\"model\": "
+             "\"kimi-k3\", \"plain\": {}, \"price\": [2.66, 13.31]}, \"volume\": \"local\"}}")
+
+
+def role_of(name):
+    """What remote.roles says of a role: LOCAL, or the fields of the remote server it sets (its model at least)"""
+    roles = (CFG.get("remote") or {}).get("roles") or {}
+    if name not in roles:
+        listed = ", ".join(roles) or "none listed"
+        raise WorkerError(f"no role {name!r} in remote.roles ({listed}): {ROLES_HOW}")
+    v = roles[name]
+    if v == LOCAL:
+        return LOCAL
+    fields = {"model": v} if isinstance(v, str) else dict(v) if isinstance(v, dict) else {}
+    if not fields.get("model") or not isinstance(fields["model"], str):
+        raise WorkerError(f"remote.roles.{name}: a model's name, \"local\", or an object with its \"model\": "
+                          f"{ROLES_HOW}")
+    return {k: fields[k] for k in ROLE_FIELDS if k in fields}
+
+
+def server_for(role, files):
+    """Where a task with this role goes: None (no role: as ever), LOCAL, or the remote server with the role's model
+    and fields, once the caller's folder and every file of the task may leave (remote.roots)"""
+    if not role:
+        return None
+    if role_of(role) == LOCAL:
+        return LOCAL
+    return remote_server(files, role)
+
+
+def remote_server(files=None, role=None):
     """The server under "remote" in the config, with its key and host, for a run that sends there: refused (with
     why) when it has no URL or model, is not https, a file (files, with the caller's folder) is not under
-    remote.roots, or its key is not set."""
+    remote.roots, or its key is not set. role: one of remote.roles, whose fields (its model...) take the place of the
+    server's own."""
     r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    if role:
+        r.update(role_of(role), role=role)
     if not r["url"] or not r["model"]:
         raise WorkerError(f"--remote: no server to send to. Set it in {REMOTE_HOW}")
     parts = urlsplit(r["url"])
@@ -1305,11 +1379,26 @@ def _chat_remote(body, r=None):
     }
 
 
-def _chat(body):
-    """One request, to the local worker, or elsewhere: with --remote, or with remote.spill when the local worker
-    is full and this thread's task may leave (_ON.spill). The result's "where" is the server elsewhere, or None."""
-    if REMOTE:
-        return _chat_remote(body)
+_REMOTE_SLOTS = {}  # the server elsewhere's requests at once (remote.parallel), for all the roles: one account
+_REMOTE_SLOTS_LOCK = threading.Lock()
+
+
+def _remote_slots(r):
+    with _REMOTE_SLOTS_LOCK:
+        if r["url"] not in _REMOTE_SLOTS:
+            _REMOTE_SLOTS[r["url"]] = threading.BoundedSemaphore(max(1, int(r["parallel"])))
+        return _REMOTE_SLOTS[r["url"]]
+
+
+def _chat(body, server=None):
+    """One request, to the local worker, or elsewhere: to a role's server (server: LOCAL, or the remote one with the
+    role's model), with --remote, or with remote.spill when the local worker is full and this thread's task may leave
+    (_ON.spill). The result's "where" is the server elsewhere, or None."""
+    if server == LOCAL:
+        return _chat_local(body)
+    if server or REMOTE:
+        with _remote_slots(server or REMOTE):
+            return _chat_remote(body, server)
     there = getattr(_ON, "spill", None)
     if there is None:
         return _chat_local(body)
@@ -1689,7 +1778,8 @@ RAISE = 1.5
 def answer_room(prompt, step, history):
     """The most max_tokens a request can have: what the context holds beside its prompt, with post_with_room's
     accounting (a request over it alone is refused there). None if the server cannot count it."""
-    if REMOTE:  # a server elsewhere: its context is not this machine's to count
+    server = step.get("server")
+    if server != LOCAL and (server or REMOTE):  # a server elsewhere: its context is not this machine's to count
         return None
     need = needed_tokens({"messages": build_messages(prompt, step["files"], step["system"], history,
                                                      step["number"])})
@@ -1702,11 +1792,12 @@ def run_checked(t, cmd, keep_thinking, brief):
     out. The result says how it ended: check = pass (first time) | fixed (by its retries) | fail (left for Claude,
     with the check's last output in out.check.txt). A cut answer counts as failing: its retry asks for it again as
     it was, with more max_tokens (RAISE, as far as the context holds it), once; 'raised' says from what to what, and
-    'split' why it stops when even that is cut."""
+    'split' why it stops when even that is cut. t["_server"]: where its role sends it (server_for); t["_escalate"]:
+    where its fixes go once it failed remote.escalate_after answers ('escalated' says to which role)."""
     out = Path(t["out"])
     args = dict(files=t.get("files", []), system=with_brief(t.get("system") or CFG["system"], brief),
                 think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
-                cmd=cmd, effort=t.get("effort"), number=bool(t.get("number")), log=False)
+                cmd=cmd, effort=t.get("effort"), number=bool(t.get("number")), log=False, server=t.get("_server"))
     work = work_id(out, t.get("files"))
 
     def logged(res, **how):
@@ -1716,9 +1807,13 @@ def run_checked(t, cmd, keep_thinking, brief):
 
     res = run_task(t["prompt"], **args)
     write_out(out, res, keep_thinking)
+    # the task's own role and model, said in its line (after an escalation too); a local role's is this machine's
+    own = ({"role": t["role"], "model": LOCAL} if t.get("_server") == LOCAL
+           else {"role": res.get("role"), "model": res.get("model")})
     check = t.get("check")
     if not check:
         logged(res)
+        res.update(own)
         return res
     retries = t.get("retries", CFG["check_retries"])
     note = out.with_name(out.name + ".check.txt")
@@ -1728,7 +1823,8 @@ def run_checked(t, cmd, keep_thinking, brief):
     totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
     previous = None
     step, history = dict(args), None  # how the last answer was asked for: a cut one is asked for again the same way
-    raised = split = None
+    raised = split = escalated = None
+    escalate, after = t.get("_escalate"), int((CFG.get("remote") or {}).get("escalate_after") or 1)
     while True:
         passed, log = run_check(check, out)
         cut = res["finish"] == "length"
@@ -1759,6 +1855,11 @@ def run_checked(t, cmd, keep_thinking, brief):
             history = [{"role": "assistant", "content": res["content"]},
                        {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log, form=form,
                                                                      again=SAME_AGAIN if same else "")}]
+            if escalate and not escalated and fixes >= after and not same_server(escalate, step["server"]):
+                # the fixes go to the role above: a model that errs in other things, and whose credits go only to
+                # what the first one could not get right (from its second try by default, which is still effective)
+                step = {**step, "server": escalate}
+                escalated = (t["_escalate_role"], escalate["model"] if isinstance(escalate, dict) else LOCAL, fixes)
             if not step["think"] and (fixes >= 2 or same):
                 # a plain fix that did not take: the next one thinks first (medium effort, so it does not spend
                 # the whole budget thinking). The answer keeps the room it had and the thinking comes on top: with
@@ -1779,7 +1880,7 @@ def run_checked(t, cmd, keep_thinking, brief):
     res.update(totals)
     cut = res["finish"] == "length"
     res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
-    res.update(tries=tries, raised=raised, split=split)
+    res.update(tries=tries, raised=raised, split=split, escalated=escalated, **own)
     rounds = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
@@ -1794,8 +1895,16 @@ def run_checked(t, cmd, keep_thinking, brief):
         note.write_text((head + "\n" if head else "") + f"$ {check}\n{log}\n" + more, encoding="utf-8")
     log_quality(t.get("id"), out, check, res["check"], tries,
                 **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
-                **({"split": True} if split else {}), **({"repeat": True} if looped else {}))
+                **({"split": True} if split else {}), **({"repeat": True} if looped else {}),
+                **({"escalated": escalated[0]} if escalated else {}))
     return res
+
+
+def same_server(a, b):
+    """Whether two of run_task's servers are one model: LOCAL, a remote server, or None (the run's own)"""
+    def model(s):
+        return s["model"] if isinstance(s, dict) else REMOTE["model"] if s is None and REMOTE else LOCAL
+    return model(a) == model(b)
 
 
 def round_log(out, n):
@@ -1825,8 +1934,9 @@ def build_messages(prompt, files=(), system=None, history=None, number=False):
 
 
 def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temperature=None, cmd="ask", effort=None,
-             history=None, attempt=0, number=False, log=True, think_tokens=None):
-    """One request. history: more turns after the first (the model's last answer and what to fix in it). log=False:
+             history=None, attempt=0, number=False, log=True, think_tokens=None, server=None):
+    """One request (server: where it goes, a role's: see _chat). history: more turns after the first (the model's
+    last answer and what to fix in it). log=False:
     its line for usage.jsonl comes back in res["usage"] for the caller to write (run_checked, after the check).
     think_tokens: its thinking budget, when not think_budget(max_tokens): the room a cut answer gains goes to the
     answer, not to more thinking. The result carries the limits it ran with (max_tokens, think_tokens) and 'limit',
@@ -1846,10 +1956,11 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         think_tokens = think_tokens or think_budget(max_tokens)
         body["reasoning_budget_tokens"] = think_tokens
         body["reasoning_budget_message"] = BUDGET_MESSAGE
-    res = _chat(body)
+    res = _chat(body, server)
     where = res.pop("where", None)
     res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens,
-               remote=where["host"] if where else None)
+               remote=where["host"] if where else None, model=where["model"] if where else None,
+               role=where.get("role") if where else None)
     if think and not res["content"].strip() and res["thinking"]:
         # still no answer (a server that ignores the budget): the thinking goes back as text and the model concludes
         # from it without thinking; the summary says so, to be checked
@@ -1857,7 +1968,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
                                                      + RECOVER.format(thinking=res["thinking"])}],
-                       **STREAM, **CFG["sampling"]["plain"]})
+                       **STREAM, **CFG["sampling"]["plain"]}, server)
         again.pop("where", None)
         res.update(content=again["content"], finish=again["finish"], repeat=again.get("repeat"), recovered=True,
                    limit=CFG["max_tokens"],
@@ -1918,7 +2029,9 @@ def cut_line(res):
 def summary(res, out):
     s = (f"in {res['prompt_tokens']} tok ({res['prompt_tps'] or 0:.0f} tok/s), "
          f"out {res['completion_tokens']} tok ({res['gen_tps'] or 0:.1f} tok/s), {res['seconds']:.1f} s")
-    if res.get("remote") and not REMOTE:
+    if res.get("role"):
+        s += f", {res['model']} as {res['role']}"
+    elif res.get("remote") and not REMOTE:
         s += f", on {res['remote']} (remote.spill)"
     if res.get("recovered"):
         s += ", RECOVERED: its thinking ran out, the answer was concluded from it (check it)"
@@ -1939,6 +2052,9 @@ def summary(res, out):
     elif res.get("check") == "fail":
         s += (f", {'left for Claude' if lead else 'CHECK FAILED'} after {fixes}{raised}"
               + (f": {out}.check.txt" if out else ""))
+    if res.get("escalated"):
+        role, model, n = res["escalated"]
+        s += f", fixes from fix {n} on by {model} as {role} (escalated)"
     if res.get("notes"):
         s += f", the text around the code kept apart in {res['notes']}"
     if res.get("blocks"):
@@ -2015,7 +2131,8 @@ def notes_file(out):
     return Path(out).with_name(Path(out).name + ".notes.md")
 
 
-TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number")
+TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number",
+             "role", "escalate")
 
 
 def task_sig(t):
@@ -2113,11 +2230,34 @@ def load_tasks(path):
     return tasks
 
 
+def escalation_of(t):
+    """The role a checked task's fixes go to once it failed: its own "escalate", else remote.escalate; "" none"""
+    name = t.get("escalate", (CFG.get("remote") or {}).get("escalate"))
+    return name if name and t.get("check") else None
+
+
+def place(t, files):
+    """Resolves where a task's role sends it, and its escalation's, before anything runs: a role that is not
+    listed, or files that may not leave for it (remote.roots), refuse the task with why"""
+    t["_server"] = server_for(t.get("role"), files)
+    t["_escalate_role"] = escalation_of(t)  # the task's own, or remote.escalate's
+    t["_escalate"] = server_for(t["_escalate_role"], files) if t["_escalate_role"] else None
+    return t
+
+
 def cmd_ask(args):
-    could_spill = not args.remote and not args.local and spill_server() is not None
+    try:
+        far = bool(args.role) and role_of(args.role) != LOCAL
+    except WorkerError as e:
+        print(e)
+        return 1
+    if args.local and far:
+        print(f"--local and --role {args.role}: that role is a model elsewhere ({role_of(args.role)['model']})")
+        return 1
+    could_spill = not args.remote and not args.local and not args.role and spill_server() is not None
     if args.remote:
         use_remote([*(args.file or []), args.prompt_file])
-    elif not could_spill and not healthy():
+    elif not far and not could_spill and not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
     if not prompt:
@@ -2138,15 +2278,19 @@ def cmd_ask(args):
             return _not_running()
     t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
          "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
-         "out": args.out, "check": args.check, "number": args.number}
+         "out": args.out, "check": args.check, "number": args.number, "role": args.role}
     if args.retries is not None:
         t["retries"] = args.retries
+    if args.escalate is not None:
+        t["escalate"] = args.escalate
     try:
+        place(t, [*(args.file or []), args.prompt_file, brief_path])
         if args.out:
             res = run_checked(t, "ask", args.keep_thinking, brief)
         else:
             res = run_task(prompt, t["files"], with_brief(args.system or CFG["system"], brief), args.think,
-                           args.max_tokens, args.temperature, effort=args.effort, number=args.number)
+                           args.max_tokens, args.temperature, effort=args.effort, number=args.number,
+                           server=t["_server"])
     except WorkerBusy as e:  # not run, as in batch and agent: nothing wrong with the task, the same command again
         print(e)
         return 2
@@ -2177,7 +2321,8 @@ def _as_they_end(futs):
 def cmd_batch(args):
     could_spill = not args.remote and not args.local and spill_server() is not None
     up = args.remote or healthy()
-    if not up and not could_spill:
+    roles = bool((CFG.get("remote") or {}).get("roles"))  # a task's role may send it elsewhere: seen below
+    if not up and not could_spill and not roles:
         return _not_running()
     tasks = load_tasks(args.tasks)
     if args.remote:
@@ -2193,6 +2338,10 @@ def cmd_batch(args):
         shared["retries"] = args.retries
     if args.number:
         shared["number"] = True
+    if args.role:
+        shared["role"] = args.role
+    if args.escalate is not None:
+        shared["escalate"] = args.escalate
     tasks = [{**shared, **{k: v for k, v in t.items() if v is not None}} for t in tasks]
     if args.prompt_prefix:
         prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
@@ -2209,20 +2358,36 @@ def cmd_batch(args):
             todo.append(t)
         elif failed:
             same.append(t)
-    # remote.spill: the tasks whose files may all leave can go there when the local worker is full (spills[id])
+    common = [args.tasks, args.system_file, args.prompt_prefix, brief_path]
+    for t in todo:  # where each role sends its task, refused before anything runs
+        name = t.get("id", t["out"])
+        try:
+            if args.local and t.get("role") and role_of(t["role"]) != LOCAL:
+                raise WorkerError(f"--local, and its role {t['role']} is a model elsewhere")
+            place(t, [*common, *(t.get("files") or [])])
+        except WorkerError as e:
+            raise WorkerError(f"task {name}: {e}")
+    far = next((t["_server"] for t in todo if isinstance(t["_server"], dict)), None)
+    # remote.spill: the tasks with no role whose files may all leave can go there when the local worker is full
     spills = {}
     if could_spill:
-        common = [args.tasks, args.system_file, args.prompt_prefix, brief_path]
-        spills = {id(t): spill_for([*common, *(t.get("files") or [])]) for t in todo}
+        spills = {id(t): spill_for([*common, *(t.get("files") or [])]) for t in todo if t["_server"] is None}
     there = next((r for r in spills.values() if r), None)
-    if not up and not there:
+    if not up and not there and not far:
         return _not_running()
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else "")
           + (f"; {sum(1 for r in spills.values() if r)} of them may go to {there['host']} as well (remote.spill)"
              if there else ""))
-    if not up and there:
-        print(f"the local worker is not running: only the tasks that may leave run, on {there['host']}")
+    named = {}
+    for t in todo:
+        if t.get("role"):
+            model = t["_server"]["model"] if isinstance(t["_server"], dict) else LOCAL
+            named[(t["role"], model)] = named.get((t["role"], model), 0) + 1
+    if named:
+        print("roles: " + ", ".join(f"{n} as {role} ({model})" for (role, model), n in sorted(named.items())))
+    if not up and (there or far):
+        print("the local worker is not running: only the tasks that go elsewhere run")
     if same:
         print(f"{len(same)} failed before (cut, or failing their check) and their tasks have not changed, so they "
               f"are not run again: {', '.join(str(t.get('id', t['out'])) for t in same)}. Change them, or --force")
@@ -2236,19 +2401,23 @@ def cmd_batch(args):
     def one(t):
         _ON.spill, _ON.down, _ON.share = spills.get(id(t)), not up, True
         try:
-            if not up and not _ON.spill:
+            elsewhere = isinstance(t["_server"], dict)
+            if not up and not _ON.spill and not elsewhere:
                 raise WorkerBusy("not run: the local worker is not running, and this task's files may not leave "
                                  "(remote.roots). Start it (worker.py start) and run the batch again")
-            waited = 0 if REMOTE or not up else cool_down()  # this machine's GPU is not the one working
+            # this machine's GPU is not the one working
+            waited = 0 if (REMOTE and t["_server"] != LOCAL) or elsewhere or not up else cool_down()
             if waited >= 1:
                 waits.append(waited)
             return run_checked(t, "batch", args.keep_thinking, brief)
         finally:
             _ON.spill = _ON.down = _ON.share = None
 
-    ex = concurrent.futures.ThreadPoolExecutor(
-        max_workers=args.jobs or (REMOTE["parallel"] if REMOTE else
-                                  CFG["parallel"] + (int(there["parallel"]) if there else 0)))
+    # here and there at once: the local slots and the remote's requests (remote.parallel, one count for its roles)
+    away_width = int((there or far or {}).get("parallel") or 0)
+    width = (int(REMOTE["parallel"]) + (CFG["parallel"] if any(t["_server"] == LOCAL for t in todo) else 0)
+             if REMOTE else CFG["parallel"] + away_width)
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs or width)
     try:
         futs = {ex.submit(one, t): t for t in todo}
         for f in _as_they_end(futs):
@@ -2680,6 +2849,8 @@ def main():
     p.add_argument("--keep-thinking", action="store_true", help="save the thinking next to -o")
     p.add_argument("--check", help="a command that passes (exit 0) when the output is right; {out} is its path")
     p.add_argument("--retries", type=int, help="how many times the worker fixes its output for the check")
+    p.add_argument("--role", help=ROLE_HELP)
+    p.add_argument("--escalate", help=ESCALATE_HELP)
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("batch")
     p.add_argument("tasks")
@@ -2688,6 +2859,8 @@ def main():
     p.add_argument("--keep-thinking", action="store_true")
     p.add_argument("--check", help="the check for every task without its own; {out} is the task's output")
     p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
+    p.add_argument("--role", help=ROLE_HELP + " (for every task without its own \"role\")")
+    p.add_argument("--escalate", help=ESCALATE_HELP)
     p.add_argument("--system-file", help="the system prompt for every task without its own")
     p.add_argument("--number", action="store_true", help="numbered lines for every task without its own \"number\"")
     p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
