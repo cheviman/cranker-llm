@@ -1,0 +1,141 @@
+```python
+#!/usr/bin/env python3
+"""
+Name:         subdir_project.py
+Description:  A project outside sdk/ that adds sdk/ with add_subdirectory and calls saturn_add_disc from a
+              folder of its own builds, and its A.BIN is byte for byte the hello sample's built in the repository.
+Version:      0.1.0
+Created:      20-11-2026
+Modified:     20-11-2026
+Author:       Sebastian Toyos
+
+Why the reference is the repository's hello: the project's program is hello's main.c, so the two builds differ
+only in which folder calls saturn_add_disc. Any byte that changes is something saturn_add_disc takes from the
+folder that included saturn.cmake instead of its own: the path of saturn_make_ip.cmake (the rule that makes
+IP.BIN) and the path of janus-stage.specs (the specs the disc link reads). When saturn.cmake keeps those in the
+including folder, both come out empty and ninja stops on '/saturn_make_ip.cmake', needed by 'game.ip/IP.BIN',
+missing and no known rule to make it.
+
+    py sdk/tests/subdir_project.py <repository's build of the sdk> [--keep <folder>]
+
+The cmake to run is the one that configured the reference build (its CMAKE_COMMAND), so both builds run the
+same cmake: on the machine that runs this, the first cmake on PATH is an MSYS2 one that can't read Windows
+paths. CMAKE in the environment overrides it. The toolchain and the other settings come from the reference's
+CMakeCache.txt and go to cmake exactly as the cache writes them: no path translation.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def read_cache(cache):
+	"""The entries of a CMakeCache.txt as a dict, skipping comment lines."""
+	entries = {}
+	for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+		if line.startswith("#") or line.startswith("//"):
+			continue
+		if "=" not in line or ":" not in line.split("=", 1)[0]:
+			continue
+		name, value = line.split("=", 1)
+		entries[name.split(":", 1)[0]] = value
+	return entries
+
+
+def main():
+	args = sys.argv[1:]
+	keep = None
+	if "--keep" in args:
+		i = args.index("--keep")
+		if i + 1 >= len(args):
+			print("--keep needs a folder")
+			return 2
+		keep = Path(args[i + 1]).resolve()
+		del args[i:i + 2]
+	if len(args) != 1:
+		print(f"usage: {sys.argv[0]} <repository's build of the sdk> [--keep <folder>]")
+		return 2
+
+	build = Path(args[0]).resolve()
+	cache = build / "CMakeCache.txt"
+	if not cache.is_file():
+		print(f"not found: {cache}")
+		return 1
+	entries = read_cache(cache)
+
+	# The sdk folder comes from the build's own cache, never from this file's location.
+	for name in ("CMAKE_HOME_DIRECTORY", "CMAKE_TOOLCHAIN_FILE", "CMAKE_GENERATOR"):
+		if not entries.get(name):
+			print(f"FAIL: {name} not in CMakeCache.txt")
+			return 1
+	sdk = Path(entries["CMAKE_HOME_DIRECTORY"])
+	reference = build / "samples" / "hello" / "hello.cd" / "A.BIN"
+	hello_main = sdk / "samples" / "hello" / "main.c"
+	for path in (reference, hello_main):
+		if not path.is_file():
+			print(f"not found: {path}")
+			return 1
+
+	cmake = os.environ.get("CMAKE") or entries.get("CMAKE_COMMAND") or "cmake"
+
+	base = keep if keep else Path(tempfile.mkdtemp(prefix="janus-subdir-"))
+	base.mkdir(parents=True, exist_ok=True)
+	game = base / "game"
+	if game.exists():
+		print(f"{game} already exists")
+		return 1
+	try:
+		game.mkdir(parents=True)
+		shutil.copyfile(hello_main, game / "main.c")
+		(game / "CMakeLists.txt").write_text(
+			"cmake_minimum_required(VERSION 3.21)\n"
+			"project(game LANGUAGES C CXX ASM)\n"
+			f'add_subdirectory("{sdk.as_posix()}" sdk)\n'
+			"saturn_add_disc(game\n"
+			"\tSOURCES main.c\n"
+			'\tIP_TITLE "SATURN-FULLSET HELLO"\n'
+			")\n",
+			encoding="utf-8")
+
+		configure = [cmake, "-S", str(game), "-B", str(game / "build"),
+			"-G", entries["CMAKE_GENERATOR"],
+			"--toolchain", entries["CMAKE_TOOLCHAIN_FILE"],
+			"-DSATURN_BUILD_SAMPLES=OFF"]
+		for name in ("CMAKE_MAKE_PROGRAM", "CMAKE_BUILD_TYPE", "SATURN_HOST_TOOLS", "SATURN_TOOLCHAIN"):
+			if entries.get(name):
+				configure.append(f"-D{name}={entries[name]}")
+
+		for cmd in (configure, [cmake, "--build", str(game / "build")]):
+			r = subprocess.run(cmd, capture_output=True, text=True)
+			if r.returncode:
+				print(f"FAIL: {' '.join(cmd)} (exit {r.returncode})\n{r.stdout[-4000:]}\n{r.stderr[-4000:]}")
+				return 1
+
+		out = game / "build"
+		for name in ("game.iso", "game.cue", "game.cd/A.BIN", "game.ip/IP.BIN"):
+			if not (out / name).is_file():
+				print(f"FAIL: {name} was not built")
+				return 1
+		got = (out / "game.cd" / "A.BIN").read_bytes()
+		want = reference.read_bytes()
+		if got != want:
+			first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+			print(f"FAIL: A.BIN differs from {reference}: {len(got)} bytes against {len(want)}, first difference at 0x{first:X}")
+			return 1
+		print(f"subdir_project: A.BIN identical to the repository's hello ({len(got)} bytes)")
+		if keep:
+			print(f"the disc: {out / 'game.cue'}")
+		return 0
+	finally:
+		if not keep:
+			shutil.rmtree(base, ignore_errors=True)
+
+
+if __name__ == "__main__":
+	sys.exit(main())
+```
+
+I have to be honest about what I could not settle: the checker's run failed at configure with `No sh2eb-elf-gcc in C:/Users/sebas/.local/x-tools/sh2eb-elf-janus/bin`, i.e. the `SATURN_TOOLCHAIN` value the reference build's cache carries is not usable on the machine that ran the check. The spec I was given says to pass that value on verbatim, and the file above does exactly that, so it will fail the same way again. I did not find a change that both keeps the spec's command and gets past that error, and I did not want to invent a workaround (skipping or rewriting the toolchain path) that the spec forbids and that I cannot verify. The two names the check asks for are now used for a real purpose in the docstring (they are what `saturn_add_disc` takes from the including folder, and what the bug leaves empty), but the run itself still stops before the build, so I cannot claim this passes.

@@ -43,6 +43,7 @@ environment variables in ENV_OVERRIDES. Standard library only.
 
 import argparse
 import atexit
+import collections
 import concurrent.futures
 import hashlib
 import http.client
@@ -152,6 +153,8 @@ def _post(path, body, timeout=3600):
     req = urllib.request.Request(URL + path, data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        if body.get("stream") and "text/event-stream" in (r.headers.get("Content-Type") or ""):
+            return read_stream(r, body["messages"])  # leaving the with closes the connection: a loop stops there
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -724,14 +727,16 @@ def post_with_room(path, body, spill=False):
         if fut is not None:
             try:
                 return fut.result()
-            except urllib.error.HTTPError as e:
+            except (urllib.error.HTTPError, StreamError) as e:
+                # a streamed request whose decoding fails once it has started says so in the stream, not in its status
+                code = "in the stream" if isinstance(e, StreamError) else f"HTTP {e.code}"
                 try:
-                    text = e.read().decode("utf-8", "replace")
+                    text = e.text if isinstance(e, StreamError) else e.read().decode("utf-8", "replace")
                 except Exception:
                     text = str(e)
                 if not any(k in text.lower() for k in POOL_FULL):
-                    raise WorkerError(f"HTTP {e.code}: {text[:500]}")
-                error = f"HTTP {e.code}: {text[:300]}"
+                    raise WorkerError(f"{code}: {text[:500]}")
+                error = f"{code}: {text[:300]}"
             except (OSError, http.client.HTTPException) as e:  # the connection, not an answer: the server went away
                 if spill:
                     raise LocalFull(f"the local server did not answer ({type(e).__name__})")
@@ -903,6 +908,8 @@ def tries_asked():
 def _wrong(r):
     if r.get("stopped") or r.get("error") or not r.get("answer"):
         return "gave nothing back"  # an agent the worker stopped or that ended in an error, an empty answer
+    if r.get("repeat"):
+        return "went round in a loop"
     if r.get("cut"):
         return "were cut"
     if r.get("check") == "fail":
@@ -950,8 +957,8 @@ def pieces_line(recs):
     more = sum(1 for r in pieces.values() if r["_why"] and r["_tries"] > most and not _wrong(r))
     wrong = len(pieces) - first - by - more
     return (f"quality, by piece of work (an output and the files it is about): {len(pieces)} pieces, {first} right at "
-            f"the first try, {by} by try {most}, {more} took more tries, {wrong} left wrong (cut, failing their "
-            f"check, nothing back). Effective is the first two: right by try {most}")
+            f"the first try, {by} by try {most}, {more} took more tries, {wrong} left wrong (cut, looping, failing "
+            f"their check, nothing back). Effective is the first two: right by try {most}")
 
 
 # USD per million tokens (input, output): Anthropic's API list prices on 2026-11-03. Cache reads are $0.20 on both.
@@ -1091,6 +1098,8 @@ REMOTE_DEFAULTS = {
     "think": None,                    # fields for one that thinks; None: {"reasoning_effort": the effort}
     "price": [0, 0],                  # USD per million tokens, in and out, for usage
     "spill": False,                   # with the local worker full, a request that may leave goes there by itself
+    "stream": True,                   # the answer as it is written, so a loop is stopped (LoopWatch); False: a
+                                      # server that refuses stream or stream_options
 }
 EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
 # in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
@@ -1229,6 +1238,8 @@ def _chat_remote(body, r=None):
         out.update(r["think"] if r["think"] is not None else {"reasoning_effort": effort})
     else:
         out.update(r["plain"])
+    if r.get("stream", True):  # OpenAI's own fields: the usage comes in the stream's last event
+        out.update(stream=True, stream_options={"include_usage": True})
     req = urllib.request.Request(r["url"].rstrip("/") + "/chat/completions", data=json.dumps(out).encode("utf-8"),
                                  headers={"Content-Type": "application/json", "User-Agent": "cranker-llm",
                                           **({"Authorization": "Bearer " + r["key"]} if r["key"] else {})})
@@ -1237,8 +1248,13 @@ def _chat_remote(body, r=None):
     while True:
         try:
             with urllib.request.urlopen(req, timeout=3600) as resp:
-                d = json.loads(resp.read().decode("utf-8"))
+                if "text/event-stream" in (resp.headers.get("Content-Type") or ""):
+                    d = read_stream(resp, body["messages"])
+                else:
+                    d = json.loads(resp.read().decode("utf-8"))
             break
+        except StreamError as e:
+            raise WorkerError(f"{r['host']} failed the request while answering: {e.text[:400]}")
         except urllib.error.HTTPError as e:
             try:
                 text = " ".join(e.read().decode("utf-8", "replace").split())[:400]
@@ -1272,11 +1288,14 @@ def _chat_remote(body, r=None):
     content = msg.get("content") if isinstance(msg.get("content"), str) else ""
     thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
     thinking = thinking if isinstance(thinking, str) else ""
+    if not usage and d.get("pieces"):  # a stream stopped before its end has no counts, and no /tokenize: by length
+        usage = {"prompt_tokens": sum(len(m.get("content") or "") for m in body["messages"]) // 4,
+                 "completion_tokens": max(d["pieces"], (len(content) + len(thinking)) // 4)}
     written = usage.get("completion_tokens") or 0
     thought = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
     seconds = time.time() - t0
     return {
-        "where": r,
+        "where": r, "repeat": d.get("repeat"),
         "content": content, "thinking": thinking, "finish": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens") or 0, "completion_tokens": written, "seconds": seconds,
         "prompt_tps": None, "gen_tps": written / seconds if seconds else None,
@@ -1364,18 +1383,183 @@ def _chat_local(body, spill=False):
     r = post_with_room("/v1/chat/completions", body, spill)
     choice = r["choices"][0]
     msg = choice["message"]
-    t = r.get("timings", {})
+    t = r.get("timings") or {}
+    usage = r.get("usage") or {}
+    content, thinking = msg.get("content") or "", msg.get("reasoning_content") or ""
+    if not usage and r.get("pieces"):  # a stream stopped before its end has no counts: the server's tokenizer
+        usage = {"prompt_tokens": count_tokens("\n".join(m["content"] for m in body["messages"])) or 0,
+                 "completion_tokens": count_tokens(thinking + content) or r["pieces"]}
+    seconds = time.time() - t0
+    written = usage.get("completion_tokens") or 0
     return {
         "where": None,
-        "content": msg.get("content") or "",
-        "thinking": msg.get("reasoning_content") or "",
+        "repeat": r.get("repeat"),
+        "content": content,
+        "thinking": thinking,
         "finish": choice.get("finish_reason"),
-        "prompt_tokens": r.get("usage", {}).get("prompt_tokens") or 0,
-        "completion_tokens": r.get("usage", {}).get("completion_tokens") or 0,
-        "seconds": time.time() - t0,
+        "prompt_tokens": usage.get("prompt_tokens") or 0,
+        "completion_tokens": written,
+        "seconds": seconds,
         "prompt_tps": t.get("prompt_per_second"),
-        "gen_tps": t.get("predicted_per_second"),
+        "gen_tps": t.get("predicted_per_second") or (written / seconds if seconds else None),
     }
+
+
+# ----- streaming, and an answer that goes round in a loop, stopped while it is written
+
+class StreamError(WorkerError):
+    """A streamed request that failed once its answer had started: the server says so in the stream (its status was
+    200 by then). .text is what it said"""
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.text = text
+
+
+def read_stream(resp, messages):
+    """A streamed answer (server-sent events), put together in the shape of a whole one. LoopWatch reads the answer
+    as it comes, and once it goes round in a loop the reading stops: the caller then leaves the response, which
+    closes the connection, and that is how the server learns to drop the request. The finish_reason is then
+    "repeat" and "repeat" says what repeated; "pieces" counts the events that brought text, for a stream stopped
+    before the counts of its last event."""
+    watch = LoopWatch(messages)
+    content, thinking = [], []
+    finish = repeat = None
+    usage, timings, pieces = {}, {}, 0
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if line.startswith("error:"):  # llama-server's way to fail a stream that has started
+            raise StreamError(line[6:].strip())
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            d = json.loads(data)
+        except ValueError:
+            continue
+        if d.get("error"):
+            raise StreamError(json.dumps(d["error"]))
+        usage = d.get("usage") or usage
+        timings = d.get("timings") or timings
+        for c in d.get("choices") or []:
+            delta = c.get("delta") or {}
+            thought = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(thought, str) and thought:
+                thinking.append(thought)
+                pieces += 1
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                content.append(text)
+                pieces += 1
+                repeat = repeat or watch.feed(text)
+            finish = c.get("finish_reason") or finish
+        if repeat:
+            finish = "repeat"
+            break
+    return {"choices": [{"finish_reason": finish, "message": {"role": "assistant", "content": "".join(content),
+                                                              "reasoning_content": "".join(thinking)}}],
+            "usage": usage, "timings": timings, "repeat": repeat, "pieces": pieces}
+
+
+# On 20-11-2026 a review (ask --remote, max_tokens 6000) wrote a few findings, then `sdk/tests/subdir_project.py:N:
+# fine.` for every N from 136 down to 1, until max_tokens: the room went to the loop, and its line said "cut by
+# max_tokens: raise --max-tokens", which would only have bought more of it. Measured on that review and on 151
+# outputs of the worker (maps, reviews, searches, notes, C, C++ and Python drafts, test logs):
+# - lines: among the last 30 lines with a letter in them, with their numbers aside, the loop had 1 different line,
+#   and the fewest in any of the 151 was 10. LOOP_FORMS (3) also catches a loop of two or three lines in turn;
+# - words: no output of the 151 repeated, word for word, passages of 32 words it had already written in more than a
+#   quarter of any 800 words (0.25); one that writes the same paragraphs over and over repeats them all (1.0). A
+#   passage of numbers and signs only (a table of zeros) does not count, there as in the measure.
+# What the request's own messages hold, as many times as they hold it, does not count: a rewrite copies its file,
+# the repetitions in it too.
+LOOP_LINES, LOOP_FORMS = 30, 3
+LOOP_WORDS, LOOP_SPAN, LOOP_SHARE = 32, 800, 0.9
+_NUMBER = re.compile(r"0[xX][0-9a-fA-F]+|\d+")
+_WORD = re.compile(r"\w+|[^\w\s]")
+_LETTER = re.compile(r"[^\W\d_]")
+
+
+class LoopWatch:
+    """Reads an answer as it streams: feed() says what repeats once it goes round in a loop, else None"""
+
+    def __init__(self, messages):
+        given = "\n".join(m["content"] for m in messages if isinstance(m.get("content"), str))
+        self.lines_given = collections.Counter(self.form(line) for line in given.splitlines())
+        words = _WORD.findall(given)
+        self.runs_given = collections.Counter(hash(tuple(words[i:i + LOOP_WORDS]))
+                                              for i in range(len(words) - LOOP_WORDS + 1))
+        self.line = self.pending = ""
+        self.forms = collections.deque(maxlen=LOOP_LINES)
+        self.last = collections.deque(maxlen=LOOP_WORDS)
+        self.lettered = 0  # words in self.last that start with a letter
+        self.written = set()
+        self.span = collections.deque()
+        self.repeated = 0
+
+    @staticmethod
+    def form(line):
+        """A line as a loop is told by: with its numbers aside, as `file:N: fine.` for every N"""
+        return _NUMBER.sub("#", line.strip())
+
+    def feed(self, text):
+        self.line += text
+        *ended, self.line = self.line.split("\n")
+        for line in ended:
+            said = self._line(line)
+            if said:
+                return said
+        self.pending += text
+        cut = max(self.pending.rfind(c) for c in " \t\r\n")  # whole words only: a word may go on in the next piece
+        if cut < 0:
+            return None
+        words, self.pending = _WORD.findall(self.pending[:cut]), self.pending[cut + 1:]
+        for word in words:
+            said = self._word(word)
+            if said:
+                return said
+        return None
+
+    def _line(self, line):
+        form = self.form(line)
+        if not _LETTER.search(form):  # blank, or numbers and signs only: a table, a brace
+            return None
+        if self.lines_given[form] > 0:
+            self.lines_given[form] -= 1
+            return None
+        self.forms.append(form)
+        if len(self.forms) < LOOP_LINES:
+            return None
+        counts = collections.Counter(self.forms)
+        if len(counts) > LOOP_FORMS:
+            return None
+        top, times = counts.most_common(1)[0]
+        return (f"{len(counts)} different line{'s' if len(counts) > 1 else ''} in its last {LOOP_LINES}, numbers "
+                f"aside: \"{top[:80]}\" {times} times")
+
+    def _word(self, word):
+        if len(self.last) == LOOP_WORDS:  # the word that leaves the run
+            self.lettered -= self.last[0][0].isalpha() or self.last[0][0] == "_"
+        self.last.append(word)
+        self.lettered += word[0].isalpha() or word[0] == "_"
+        if len(self.last) < LOOP_WORDS:
+            return None
+        run = hash(tuple(self.last))
+        if self.runs_given[run] > 0:
+            self.runs_given[run] -= 1
+            again = False
+        else:  # a run of numbers and signs only (a table of zeros) repeats as tables do, as in the measure
+            again = self.lettered > 0 and run in self.written
+        self.written.add(run)
+        self.span.append(again)
+        self.repeated += again
+        if len(self.span) > LOOP_SPAN:
+            self.repeated -= self.span.popleft()
+        if len(self.span) < LOOP_SPAN or self.repeated < LOOP_SHARE * LOOP_SPAN:
+            return None
+        return (f"{self.repeated / LOOP_SPAN:.0%} of its last {LOOP_SPAN} words repeat, word for word, passages it had "
+                "already written")
 
 
 # ----- the project's brief: how the user works there (style, rules), so it is not repeated in every prompt
@@ -1433,8 +1617,17 @@ CHECK_TAIL = 6000  # chars of the check's output that go back to the model
 FIX_PROMPT = ("Your output above was saved to {out} and checked with `{cmd}`. The check is right and your output is "
               "wrong:\n\n```\n{log}\n```\n\n{again}Change your output so that it passes: work out from each error "
               "what the check expects, and fix the cause, not just the line it names. Leave alone what the errors do "
-              "not touch. Output the WHOLE result again, in the same form the instructions asked for, with nothing "
-              "before or after it.")
+              "not touch. {form}")
+FIX_FORM = ("Output the WHOLE result again, in the same form the instructions asked for, with nothing before or after "
+            "it.")
+# A code file's fix: on 20-11-2026 a Python draft came back twice as its block and a paragraph after it, and the
+# paragraph went into the file; the second one reported a real fault of the machine the check ran on (a stale
+# toolchain path). The block goes to the file and any text around it beside it (split_answer), so the paragraph
+# costs the file nothing; it is asked for only when the cause is outside the file.
+FIX_FORM_CODE = ("Output the WHOLE file again as one fenced code block and nothing before or after it: the block is "
+                 "what is written to the file. Only if the check fails for a cause outside the file (a path, a tool or "
+                 "a setting of the machine it runs on), say so in a short paragraph after the block: it is kept apart "
+                 "from the file, for the one who reads the result.")
 SAME_AGAIN = "Your last fix came back unchanged, so it failed the same way: this time change it. "
 QUALITY_LOG = LOGS / "quality.jsonl"
 
@@ -1529,6 +1722,8 @@ def run_checked(t, cmd, keep_thinking, brief):
         return res
     retries = t.get("retries", CFG["check_retries"])
     note = out.with_name(out.name + ".check.txt")
+    for old in round_logs(out):
+        old.unlink(missing_ok=True)
     tries = fixes = 0
     totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
     previous = None
@@ -1537,8 +1732,12 @@ def run_checked(t, cmd, keep_thinking, brief):
     while True:
         passed, log = run_check(check, out)
         cut = res["finish"] == "length"
+        looped = res["finish"] == "repeat"
         logged(res, check="pass" if passed else "fail")  # the check's own word: a cut answer's line says "cut" too
-        if (passed and not cut) or tries >= retries:
+        if not passed or cut or looped:  # every round that failed keeps its output, not only the last one
+            round_log(out, tries + 1).write_text(f"$ {check}\n{log}\n", encoding="utf-8")
+        # a loop is not fixed by handing it back (its tokens as the fix's history), nor by more room
+        if looped or (passed and not cut) or tries >= retries:
             break
         if cut:
             if raised:
@@ -1556,8 +1755,9 @@ def run_checked(t, cmd, keep_thinking, brief):
             fixes += 1
             same = res["content"].strip() == previous
             previous = res["content"].strip()
+            form = FIX_FORM if is_document(out) else FIX_FORM_CODE
             history = [{"role": "assistant", "content": res["content"]},
-                       {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log,
+                       {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log, form=form,
                                                                      again=SAME_AGAIN if same else "")}]
             if not step["think"] and (fixes >= 2 or same):
                 # a plain fix that did not take: the next one thinks first (medium effort, so it does not spend
@@ -1575,22 +1775,46 @@ def run_checked(t, cmd, keep_thinking, brief):
         res = run_task(t["prompt"], **step, history=history, attempt=tries)
         for k in totals:
             totals[k] += res[k]
-        write_out(out, res, keep_thinking)
+        write_out(out, res, keep_thinking, answer=tries + 1)
     res.update(totals)
     cut = res["finish"] == "length"
-    res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut else "fail"
+    res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
     res.update(tries=tries, raised=raised, split=split)
+    rounds = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
+        for old in rounds:  # what passed in the end leaves only itself, as before
+            old.unlink(missing_ok=True)
     else:
-        head = (cut_line(res) if cut else
+        head = (repeat_line(res) if looped else cut_line(res) if cut else
                 f"max_tokens was raised {raised[0]} -> {raised[1]} after a cut; the check still fails:" if raised
                 else "")
-        note.write_text((head + "\n" if head else "") + f"$ {check}\n{log}\n", encoding="utf-8")
+        more = (f"\nthe check's output of every round: {', '.join(p.name for p in rounds)}\n" if len(rounds) > 1
+                else "")
+        note.write_text((head + "\n" if head else "") + f"$ {check}\n{log}\n" + more, encoding="utf-8")
     log_quality(t.get("id"), out, check, res["check"], tries,
                 **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
-                **({"split": True} if split else {}))
+                **({"split": True} if split else {}), **({"repeat": True} if looped else {}))
     return res
+
+
+def round_log(out, n):
+    """The check's output for the n-th answer of a task that failed it (n from 1): only the last one was kept once,
+    and the first failure of a run that ended failing (an MSYS2 cmake on the PATH, 20-11-2026) was lost"""
+    return out.with_name(f"{out.name}.check.{n}.txt")
+
+
+def round_logs(out):
+    """The round_log files beside an output, in their order"""
+    pattern = re.compile(re.escape(out.name) + r"\.check\.(\d+)\.txt")
+    try:
+        found = [(int(m.group(1)), p) for p in out.parent.iterdir() if (m := pattern.fullmatch(p.name))]
+    except OSError:
+        return []
+    return [p for _, p in sorted(found)]
+
+
+STREAM = {"stream": True, "stream_options": {"include_usage": True}}  # read as it is written: LoopWatch
 
 
 def build_messages(prompt, files=(), system=None, history=None, number=False):
@@ -1617,7 +1841,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         kwargs["reasoning_effort"] = effort
     messages = build_messages(prompt, files, system, history, number)
     body = {"model": CFG["alias"], "messages": messages, "max_tokens": max_tokens, "chat_template_kwargs": kwargs,
-            **sampling}
+            **STREAM, **sampling}
     if think:
         think_tokens = think_tokens or think_budget(max_tokens)
         body["reasoning_budget_tokens"] = think_tokens
@@ -1633,9 +1857,10 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                        "chat_template_kwargs": {"enable_thinking": False},
                        "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
                                                      + RECOVER.format(thinking=res["thinking"])}],
-                       **CFG["sampling"]["plain"]})
+                       **STREAM, **CFG["sampling"]["plain"]})
         again.pop("where", None)
-        res.update(content=again["content"], finish=again["finish"], recovered=True, limit=CFG["max_tokens"],
+        res.update(content=again["content"], finish=again["finish"], repeat=again.get("repeat"), recovered=True,
+                   limit=CFG["max_tokens"],
                    prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
                    seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"],
@@ -1644,12 +1869,14 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         answer = res.pop("answer_tokens")
     else:
         answer = count_tokens(res["content"]) if res["thinking"] else res["completion_tokens"]
-    # "cut": the limit an answer cut by max_tokens ran into; True for any other finish that is not a whole answer
+    # "cut": the limit an answer cut by max_tokens ran into; True for any other finish that is not a whole answer,
+    # with "repeat" for one stopped going round in a loop
     res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
                         seconds=res["seconds"], files=len(files), where=where,
                         **({"recovered": True} if res.get("recovered") else {}),
                         **({"attempt": attempt} if attempt else {}),
                         **({"cut": res["limit"]} if res["finish"] == "length" else
+                           {"cut": True, "repeat": True} if res["finish"] == "repeat" else
                            {"cut": True} if res["finish"] != "stop" else {}))
     if log:
         log_usage(**res.pop("usage"))
@@ -1662,6 +1889,18 @@ RESEND = ("next: send it again with something changed, not a fix by hand (unless
           "--think, more --max-tokens, a narrower task (line ranges, one function), a --check, or the rule or example "
           "the prompt missed. If the limit is the worker's own, tell the user what in cranker-llm would fix it. One "
           "failure is that task with those parameters, not what the worker can't do.")
+# ... and a loop's, where more room is the wrong change
+REPEAT_NEXT = ("next: don't raise --max-tokens: the room went to the loop, and more would only buy more of it. Send it "
+               "again with something changed: a narrower task (fewer files, line ranges, one question), what to leave "
+               "out said outright (\"only the defects; nothing for what is fine\"), or --think. What came before the "
+               "loop is in the output, a draft like any other: check it before using any of it. One loop is that "
+               "task with those parameters, not what the worker can't do.")
+
+
+def repeat_line(res):
+    """What an answer stopped going round in a loop says first (the task's line, and its .check.txt)"""
+    return (f"REPEATING: the answer went round in a loop ({res['repeat']}) and was stopped there, "
+            f"{res['completion_tokens']} tokens out of max_tokens {res['limit']}")
 
 
 def cut_line(res):
@@ -1686,6 +1925,8 @@ def summary(res, out):
     lead = ""
     if res["finish"] == "length":
         lead = cut_line(res) + " "
+    elif res["finish"] == "repeat":
+        lead = repeat_line(res) + " "
     elif res["finish"] != "stop":
         s += f", FINISH={res['finish']}"
     raised = res.get("raised")
@@ -1698,24 +1939,80 @@ def summary(res, out):
     elif res.get("check") == "fail":
         s += (f", {'left for Claude' if lead else 'CHECK FAILED'} after {fixes}{raised}"
               + (f": {out}.check.txt" if out else ""))
+    if res.get("notes"):
+        s += f", the text around the code kept apart in {res['notes']}"
+    if res.get("blocks"):
+        s += f", {res['blocks']} fenced blocks: written as they came"
     return lead + (f"-> {out}: " if out else "") + s
 
 
 # Asked for a file, the model often wraps the whole of it in one fenced block (```c ... ```). Written as it came, the
 # fence lines went into janus.c, its check failed on line 1, and the fixes went to the fence, not to the code
-# (18-11-2026). So an answer that is one fenced block and nothing else is written without the fence; any other
-# (prose, a markdown file with several blocks, text around the block) as it came.
-FENCED = re.compile(r"```[^`\r\n]*\r?\n(.*?\r?\n)?```", re.S)
+# (18-11-2026). So an answer that is one fenced block and nothing else is written without the fence (unfence). And
+# on 20-11-2026 a Python draft came back twice as its block and a paragraph after it ("What is still uncertain:
+# ..."): the file kept the fence and the paragraph, and its check failed on line 1 and then on line 141, the
+# paragraph. So when the output is a code file (not a document: is_document), an answer with exactly one fenced
+# block and text before or after it has the block written to the file and the text beside it, in <out>.notes.md
+# (split_answer): the text was worth reading, the second one reported a fault of the machine the check ran on.
+# Two blocks or more are written as they came: which one is the file can't be told (two files asked for in one
+# reply, a before and an after, the file and an example of its use), so choosing one would drop code without a
+# word, and joining them would make a file nobody asked for. Their check fails on the first fence, and the fix
+# asks for the whole file in one block.
+FENCE_OPEN = re.compile(r"[ \t]*```[^`]*")
+FENCE_CLOSE = re.compile(r"[ \t]*```[ \t]*")
 FENCE_LINE = re.compile(r"^[ \t]*```", re.M)
+DOCUMENTS = {"", ".md", ".markdown", ".mdx", ".rst", ".adoc", ".asciidoc", ".org", ".txt", ".text", ".log"}
+CODE_NAMES = {"cmakelists.txt", "makefile", "gnumakefile", "dockerfile", "requirements.txt"}
+
+
+def is_document(out):
+    """An output that is prose (a map, a review, notes): the text around a code block is the answer there, so only an
+    answer that is the block alone loses its fence. Any other output is a code file."""
+    out = Path(out)
+    return out.name.lower() not in CODE_NAMES and out.suffix.lower() in DOCUMENTS
+
+
+def fenced(text):
+    """An answer's fenced code blocks: (its lines, [(opening line, closing line), ...]), or None when a fence is left
+    open or one stands inside a block (```c inside ```markdown): such an answer is not taken apart."""
+    lines = text.splitlines(keepends=True)
+    blocks, start = [], None
+    for i, line in enumerate(lines):
+        bare = line.rstrip("\r\n")
+        if start is None:
+            if FENCE_OPEN.fullmatch(bare):
+                start = i
+        elif FENCE_CLOSE.fullmatch(bare):
+            blocks.append((start, i))
+            start = None
+        elif FENCE_LINE.match(bare):
+            return None
+    return None if start is not None else (lines, blocks)
+
+
+def split_answer(text):
+    """(what goes to a code file, the text around it, the answer's fenced blocks): with exactly one block, its inside
+    (line ends as they came) and the text before and after it; otherwise the answer as it came and no text."""
+    found = fenced(text)
+    if not found:
+        return text, "", 0
+    lines, blocks = found
+    if len(blocks) != 1:
+        return text, "", len(blocks)
+    (a, b), = blocks
+    around = ("".join(lines[:a]).strip() + "\n\n" + "".join(lines[b + 1:]).strip()).strip()
+    return "".join(lines[a + 1:b]), around, 1
 
 
 def unfence(text):
     """The inside of an answer that is exactly one fenced code block (whitespace around it aside, with or without a
     language tag, no other fence inside); any other answer unchanged."""
-    m = FENCED.fullmatch(text.strip())
-    if not m or FENCE_LINE.search(m.group(1) or ""):
-        return text
-    return m.group(1) or ""
+    inside, around, blocks = split_answer(text)
+    return inside if blocks == 1 and not around else text
+
+
+def notes_file(out):
+    return Path(out).with_name(Path(out).name + ".notes.md")
 
 
 TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number")
@@ -1741,11 +2038,25 @@ def failed_before(out):
         return None
 
 
-def write_out(out, res, keep_thinking):
+def write_out(out, res, keep_thinking, answer=1):
+    """Writes an answer to its output: a code file gets the code and its notes file the text around it, each
+    answer's under its own heading (answer: which of the task's answers it is; the first starts the notes again)"""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     failed_mark(out).unlink(missing_ok=True)  # a new output: the batch marks it again if this one fails too
-    out.write_text(unfence(res["content"]), encoding="utf-8")
+    notes = notes_file(out)
+    if answer == 1:
+        notes.unlink(missing_ok=True)
+    if is_document(out):
+        text, around, blocks = unfence(res["content"]), "", 0
+    else:
+        text, around, blocks = split_answer(res["content"])
+    out.write_text(text, encoding="utf-8")
+    if around:
+        with open(notes, "a", encoding="utf-8") as f:
+            f.write(f"## answer {answer}\n\n{around}\n\n")
+    res["notes"] = str(notes) if notes.exists() else None
+    res["blocks"] = blocks if blocks > 1 else None
     if keep_thinking and res["thinking"]:
         out.with_name(out.name + ".thinking.md").write_text(res["thinking"], encoding="utf-8")
 
@@ -1850,7 +2161,7 @@ def cmd_ask(args):
     print(summary(res, args.out), file=sys.stderr if not args.out else sys.stdout)
     if res["finish"] == "stop" and res.get("check") != "fail":
         return 0
-    print(RESEND, file=sys.stderr if not args.out else sys.stdout)
+    print(REPEAT_NEXT if res["finish"] == "repeat" else RESEND, file=sys.stderr if not args.out else sys.stdout)
     return 2
 
 
@@ -1916,7 +2227,7 @@ def cmd_batch(args):
         print(f"{len(same)} failed before (cut, or failing their check) and their tasks have not changed, so they "
               f"are not run again: {', '.join(str(t.get('id', t['out'])) for t in same)}. Change them, or --force")
     t0 = time.time()
-    failed = tokens = not_run = kept = ended = raised = split = 0
+    failed = tokens = not_run = kept = ended = raised = split = loops = 0
     checks = {"pass": 0, "fixed": 0, "fail": 0}
     waits = []
 
@@ -1946,19 +2257,21 @@ def cmd_batch(args):
             try:
                 res = f.result()
                 tokens += res["completion_tokens"] or 0
+                looped = res["finish"] == "repeat"
                 cut = res["finish"] != "stop"
                 bad = res.get("check") == "fail"
                 failed += cut or bad
                 kept += cut or bad
+                loops += looped
                 if cut or bad:
-                    failed_mark(t["out"]).write_text(json.dumps({"why": "cut" if cut else "check",
-                                                                 "task": task_sig(t)}), encoding="utf-8")
+                    why = "repeat" if looped else "cut" if cut else "check"
+                    failed_mark(t["out"]).write_text(json.dumps({"why": why, "task": task_sig(t)}), encoding="utf-8")
                 if res.get("check"):
                     checks[res["check"]] += 1
                 raised += bool(res.get("raised"))
                 split += bool(res.get("split"))
                 away += bool(res.get("remote") and not REMOTE)
-                tag = "CUT " if cut else "BAD " if bad else "ok  "
+                tag = "LOOP " if looped else "CUT " if cut else "BAD " if bad else "ok  "
                 print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad or cut else None)}")
             except WorkerBusy as e:  # never sent: not a failure of the task, and nothing to change in it
                 not_run += 1
@@ -1984,17 +2297,21 @@ def cmd_batch(args):
           + (f"; {away} of them on {there['host']} (remote.spill)" if there else ""))
     if any(checks.values()):
         print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
-              f"{checks['fail']} still failing (their errors in <out>.check.txt)")
+              f"{checks['fail']} still failing (their errors in <out>.check.txt, every round's in "
+              "<out>.check.N.txt)")
     if raised or split:
         print(f"cuts: {raised} answers cut by max_tokens asked for again with more (x{RAISE:g}, as far as the "
               "context holds it)" + (f"; {split} need splitting, cut even so or with no room to raise "
                                      "(their CUT lines)" if split else ""))
-    if failed:
+    if loops:
+        print(f"loops: {loops} answers went round in a loop and were stopped there (their LOOP lines)")
+        print(REPEAT_NEXT)
+    if failed > loops:
         print(RESEND)
     if kept:
-        print(f"{kept} of them left an output (cut, or failing its check). The same batch runs a task like that "
-              "again once its line has changed (or send the changed ones in a file of their own); unchanged, it is "
-              "skipped")
+        print(f"{kept} of them left an output (cut, looping, or failing its check). The same batch runs a task like "
+              "that again once its line has changed (or send the changed ones in a file of their own); unchanged, it "
+              "is skipped")
     if not_run:
         print(f"{not_run} tasks were not run: the worker was taken for the whole wait (see their WAIT lines for "
               "who had it). They did not fail: run the same batch again, the finished tasks are skipped")
