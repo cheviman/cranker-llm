@@ -523,6 +523,38 @@ class Remote(unittest.TestCase):
         self.assertIn("no server to send to", h.worker("ask", "--remote", "-p", "x", **self.KEY)[1])
         self.assertEqual(h.requests(h.away), [])
 
+    def test_every_file_read_into_the_request_is_checked_not_only_the_f_ones(self):
+        h = self.home()
+        out_of = lambda name, text: (h.dir / name).write_text(text, encoding="utf-8") and str(h.dir / name)
+        prompt, brief, system = out_of("prompt.txt", "x"), out_of("brief.md", "rules"), out_of("system.txt", "be brief")
+        tasks_in = h.file("tasks.jsonl", json.dumps({"prompt": "x", "out": "a.md"}) + "\n")
+        tasks_out = out_of("tasks.jsonl", json.dumps({"prompt": "x", "out": "a.md"}) + "\n")
+        for args in (("ask", "--prompt-file", prompt), ("ask", "-p", "x", "--brief", brief),
+                     ("batch", tasks_out), ("batch", tasks_in, "--system-file", system),
+                     ("batch", tasks_in, "--prompt-prefix", prompt)):
+            rc, out, _ = h.worker(*args, "--remote", **self.KEY)
+            self.assertEqual(rc, 1, f"{args}: {out}")
+            self.assertIn("is not under remote.roots", out)
+        self.assertEqual(h.requests(h.away), [])
+        inside = h.file("prompt.txt", "[[say:from a file]]")  # under the listed folder, the same options go
+        self.assertEqual(h.worker("ask", "--remote", "--prompt-file", inside, "--brief",
+                                  h.file(".cranker/brief.md", "rules"), **self.KEY)[0], 0)
+        self.assertEqual(len(h.requests(h.away)), 1)
+
+    def test_a_link_out_of_the_listed_folder_is_out_of_it(self):
+        h = self.home()
+        secret = h.dir / "not-listed.c"
+        secret.write_text("int secret;\n", encoding="utf-8")
+        link = h.work / "looks-listed.c"
+        try:
+            os.symlink(secret, link)
+        except OSError:
+            self.skipTest("this account cannot make symbolic links")
+        rc, out, _ = h.worker("ask", "--remote", "-f", link, "-p", "x", **self.KEY)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("is not under remote.roots", out)
+        self.assertEqual(h.requests(h.away), [])
+
     def test_ask_goes_there_in_openais_own_fields_and_usage_tells_it_apart(self):
         h = self.home(plain={"reasoning_effort": "none"}, price=[1, 2])
         src = h.file("src.c", "one\ntwo\n")

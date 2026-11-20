@@ -1082,28 +1082,39 @@ REMOTE_HELP = ("send this run to the server under \"remote\" in the config inste
 
 
 def _where(p):
-    return os.path.normcase(os.path.abspath(os.path.expanduser(str(p))))
+    """Where a path really is: a link inside a listed folder that points out of it is out of it"""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(p))))
+
+
+REMOTE_HOW = f"{CONFIG_FILE}: \"remote\": {{\"url\": \"https://.../v1\", \"model\": \"...\", \"roots\": [\"...\"]}}"
+
+
+def may_leave(paths, roots):
+    """Refuses any of these that is not under one of remote.roots. It is asked of every file the worker reads into
+    a remote request, not only the -f ones: the prompt, system and prefix files, a batch's task file and the brief
+    go out too."""
+    roots = [_where(p) for p in roots]
+    for p in paths:
+        p = m.group(1) if (m := FILE_RANGE.match(str(p))) else p
+        if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
+            raise WorkerError(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
+                              f"folders the user listed there ({REMOTE_HOW})")
 
 
 def use_remote(files):
     """--remote: the run goes to the server under "remote" in the config instead of the local one. The worker's
     promise is that nothing leaves the machine, so this is never a default: it takes the flag, and the caller's
-    folder and every file of the run have to be under one of remote.roots, which is empty until the user lists
-    folders. The key comes from an environment variable, so it is in no file and no log."""
+    folder and every file read into the run (may_leave) have to be under one of remote.roots, which is empty until
+    the user lists folders. The key comes from an environment variable, so it is in no file and no log."""
     global REMOTE
     r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
-    how = f"{CONFIG_FILE}: \"remote\": {{\"url\": \"https://.../v1\", \"model\": \"...\", \"roots\": [\"...\"]}}"
     if not r["url"] or not r["model"]:
-        raise WorkerError(f"--remote: no server to send to. Set it in {how}")
+        raise WorkerError(f"--remote: no server to send to. Set it in {REMOTE_HOW}")
     parts = urlsplit(r["url"])
     if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
         raise WorkerError(f"--remote: {r['url']} is not https: the files and the key would cross the network in the "
                           "clear")
-    roots = [_where(p) for p in r["roots"]]
-    for p in [os.getcwd(), *((m.group(1) if (m := FILE_RANGE.match(f)) else f) for f in files)]:
-        if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
-            raise WorkerError(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
-                              f"folders the user listed there ({how})")
+    may_leave([os.getcwd(), *(f for f in files if f)], r["roots"])
     r["key"] = os.environ.get(r["key_env"]) if r["key_env"] else None
     if r["key_env"] and not r["key"]:
         raise WorkerError(f"--remote: the server's key is read from the environment variable {r['key_env']}, and "
@@ -1526,7 +1537,7 @@ def load_tasks(path):
 
 def cmd_ask(args):
     if args.remote:
-        use_remote(args.file or [])
+        use_remote([*(args.file or []), args.prompt_file])
     elif not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
@@ -1538,7 +1549,9 @@ def cmd_ask(args):
         return 1
     if args.out:
         check_out(args.out, args.file)
-    _, brief = find_brief(args.brief)
+    brief_path, brief = find_brief(args.brief)
+    if REMOTE and brief_path:
+        may_leave([brief_path], REMOTE["roots"])
     t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
          "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
          "out": args.out, "check": args.check, "number": args.number}
@@ -1582,7 +1595,8 @@ def cmd_batch(args):
         return _not_running()
     tasks = load_tasks(args.tasks)
     if args.remote:
-        use_remote([f for t in tasks for f in t.get("files") or []])
+        use_remote([args.tasks, args.system_file, args.prompt_prefix,
+                    *(f for t in tasks for f in t.get("files") or [])])
     # what every task shares goes once on the command line, not in every line: a task's own value wins
     shared = {}
     if args.system_file:
@@ -1598,6 +1612,8 @@ def cmd_batch(args):
         prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
         tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
     brief_path, brief = find_brief(args.brief)
+    if REMOTE and brief_path:
+        may_leave([brief_path], REMOTE["roots"])
     # an output that exists is done, unless the task left it cut or failing its check (failed_mark): that one runs
     # again once its task has changed, and is left alone, and said, while it has not
     todo, same = [], []
