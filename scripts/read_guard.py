@@ -54,17 +54,26 @@ def main():
     lines = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
     if lines <= max_lines:
         return
-    url = f"http://{cfg.get('host', '127.0.0.1')}:{cfg.get('port', 8090)}/health"
-    try:
-        with urllib.request.urlopen(url, timeout=0.5) as r:
-            running = json.loads(r.read()).get("status") == "ok"
-    except Exception:
-        running = False
     py = "py" if os.name == "nt" else "python3"
-    start = "" if running else f"The worker is not running: start it first ({py} \"{WORKER}\" start). "
+    local = os.environ.get("CRANKER_LOCAL") or cfg.get("local", True)
+    if str(local).strip().lower() in ("false", "0", "off", "no"):
+        # the local worker is off (`worker.py local off`): the map goes to the remote server, which takes files from
+        # remote.roots only. A file it may not have is read as ever: there is nobody to map it.
+        away = [norm(r) for r in (cfg.get("remote") or {}).get("roots") or []]
+        if not any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in away):
+            return
+        start = "The local worker is off: the map goes to the remote server (the same command). "
+    else:
+        url = f"http://{cfg.get('host', '127.0.0.1')}:{cfg.get('port', 8090)}/health"
+        try:
+            with urllib.request.urlopen(url, timeout=0.5) as r:
+                running = json.loads(r.read()).get("status") == "ok"
+        except Exception:
+            running = False
+        start = "" if running else f"The worker is not running: start it first ({py} \"{WORKER}\" start). "
     reason = (
         f"{ti['file_path']} has {lines} lines: in these folders a file over {max_lines} lines is not read whole "
-        f"(cranker-llm's read guard). {start}Map it with the local worker first, e.g. {py} \"{WORKER}\" ask -f "
+        f"(cranker-llm's read guard). {start}Map it with the worker first, e.g. {py} \"{WORKER}\" ask -f "
         f"\"{ti['file_path']}\" --number -o <scratch>/map.md -p \"For each function, in order, one line: `name` (line N): "
         f"what it does, concretely. Nothing else.\" -- then Read only the range you need (offset and limit). If the "
         f"whole file is really needed (editing most of it), Read it with offset 1 and limit {lines}."

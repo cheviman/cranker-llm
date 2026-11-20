@@ -79,6 +79,8 @@ AGENT_LOCK = LOGS / "agent.lock"
 AGENT_INFO = LOGS / "agent.json"  # who holds AGENT_LOCK (agent_note)
 
 DEFAULTS = {
+    "local": True,             # false: no llama-server here (the GPU's and the RAM's memory free): every run goes to
+                               # "remote", and one whose files may not leave is refused (`worker.py local off|on`)
     "llama_server": "",        # path to llama-server; "" = HOME/bin, then PATH
     "model": "",               # path to the .gguf
     "template": "auto",        # auto: the model's own, patched if it refuses a late system message; model; or a path
@@ -105,7 +107,7 @@ DEFAULTS = {
     "check_timeout": 300,          # s one run of a check may take
     "agent_think_budget": 4096,    # tokens an agent's turn may think before it must act (of its 8,000 per turn)
 }
-ENV_OVERRIDES = {"CRANKER_SERVER": "llama_server", "CRANKER_MODEL": "model",
+ENV_OVERRIDES = {"CRANKER_LOCAL": "local", "CRANKER_SERVER": "llama_server", "CRANKER_MODEL": "model",
                  "CRANKER_TEMPLATE": "template", "CRANKER_PORT": "port", "CRANKER_CTX": "ctx",
                  "CRANKER_PARALLEL": "parallel", "CRANKER_SPEC": "spec", "CRANKER_EXTRA": "extra"}
 
@@ -124,7 +126,9 @@ def load_config():
         v = os.environ.get(env)
         if v is None or v == "":
             continue
-        if isinstance(DEFAULTS[key], int) and not isinstance(DEFAULTS[key], bool):
+        if isinstance(DEFAULTS[key], bool):
+            v = v.strip().lower() not in ("false", "0", "off", "no")
+        elif isinstance(DEFAULTS[key], int):
             v = int(v)
         elif key == "extra":
             v = v.split()
@@ -134,6 +138,18 @@ def load_config():
 
 CFG = load_config()
 URL = f"http://{CFG['host']}:{CFG['port']}"
+
+
+OFF_WORDS = ("false", "0", "off", "no")
+
+
+def local_off():
+    """The user turned the local worker off ("local": false): fully remote, the GPU's memory left free"""
+    return str(CFG["local"]).strip().lower() in OFF_WORDS
+
+
+OFF = (f"the local worker is off (\"local\": false in {CONFIG_FILE}, to keep the GPU's memory free): "
+       f"`py {Path(__file__)} local on` turns it back on")
 
 
 def server_binary():
@@ -356,6 +372,9 @@ def fix_template():
 
 
 def cmd_start(args):
+    if local_off():
+        print(f"not started: {OFF}")
+        return 1
     if healthy():
         print(f"already running at {URL}")
         return 0
@@ -452,6 +471,46 @@ def cmd_stop(args):
     return 0
 
 
+def cmd_local(args):
+    """local off: the config says so (every run goes to the remote server) and the server this worker started is
+    stopped, which frees the GPU's memory. local on: it can be started again. Neither touches anything else."""
+    if args.state is None:
+        print("local worker " + ("off: every run goes to the remote server" if local_off() else "on"))
+        return 0
+    try:
+        own = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig")) if CONFIG_FILE.exists() else {}
+    except ValueError as e:
+        print(f"{CONFIG_FILE} is not valid JSON ({e}): fix it first")
+        return 1
+    if args.state == "off":
+        own["local"] = False
+    else:
+        own.pop("local", None)
+    HOME.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(own, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if args.state == "on":
+        print(f"local worker on: `py {Path(__file__)} start` starts it"
+              + (" (but CRANKER_LOCAL in the environment still says off)"
+                 if os.environ.get("CRANKER_LOCAL", "").strip().lower() in OFF_WORDS else ""))
+        return 0
+    print("local worker off: every run goes to the remote server, from the folders under remote.roots only"
+          + (" (but CRANKER_LOCAL in the environment still says on, for the commands run with it)"
+             if os.environ.get("CRANKER_LOCAL", "").strip().lower() not in ("", *OFF_WORDS) else ""))
+    ours = _read_pid()[1]
+    print(f"server: {_stop()}")
+    if ours is False and healthy():
+        print(f"a server still answers at {URL}, and this worker did not start it: stop it yourself to free the "
+              "memory")
+    r = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
+    if not r["url"] or not r["roots"]:
+        print(f"no remote server to send to yet: with the local worker off nothing runs until one is set "
+              f"({REMOTE_HOW})")
+    v = _vram_line()
+    if v:
+        print(v)
+    return 0
+
+
 def _props_line():
     try:
         p = _get("/props")
@@ -486,6 +545,12 @@ def _remote_line():
 
 def cmd_status(args):
     _remote_line()
+    if local_off():
+        vram = _vram_line()
+        print(f"local worker off: every run goes to the remote server ({OFF})"
+              + (f". A server still answers at {URL}: `local off` again stops it, if this worker started it"
+                 if healthy() else "") + (f". {vram}" if vram else ""))
+        return 0
     if not healthy():
         print(f"not running ({URL}). {_vram_line()}")
         return 1
@@ -1238,6 +1303,8 @@ def server_for(role, files):
     if not role:
         return None
     if role_of(role) == LOCAL:
+        if local_off():
+            raise LocalOff(f"the role {role} is \"local\", and {OFF}")
         return LOCAL
     return remote_server(files, role)
 
@@ -2394,8 +2461,21 @@ def _http_error(e):
 
 
 def _not_running():
-    print(f"server not running at {URL}: py {Path(__file__)} start")
+    print(OFF if local_off() else f"server not running at {URL}: py {Path(__file__)} start")
     return 1
+
+
+class LocalOff(WorkerError):
+    """A run or a role that needs the local worker, which the user turned off"""
+
+
+def go_remote(files):
+    """With the local worker off a run goes where --remote sends it: the user's standing yes, as spill is, and the
+    same rule, the files leave only from remote.roots. Refused with both reasons when it cannot."""
+    try:
+        use_remote(files)
+    except WorkerError as e:
+        raise WorkerError(f"{OFF}. So this run goes to the remote server, and it cannot: {e}")
 
 
 def _same_file(a, b):
@@ -2456,7 +2536,7 @@ def place(t, files):
     if t["_escalate_role"]:
         try:
             t["_escalate"] = server_for(t["_escalate_role"], files)
-        except NotUnderRoots:
+        except (NotUnderRoots, LocalOff):
             if "escalate" in t:
                 raise
             t["_escalate_role"] = None
@@ -2472,10 +2552,16 @@ def cmd_ask(args):
     if args.local and far:
         print(f"--local and --role {args.role}: that role is a model elsewhere ({role_of(args.role)['model']})")
         return 1
+    if local_off():
+        if args.local:
+            print(f"--local: {OFF}")
+            return 1
+        if not args.role:
+            args.remote = True  # as --remote: go_remote below says why when it cannot
     could_spill = not args.remote and not args.local and not args.role and spill_server() is not None
     context = context_files(args.context)
     if args.remote:
-        use_remote([*context, *(args.file or []), args.prompt_file])
+        (go_remote if local_off() else use_remote)([*context, *(args.file or []), args.prompt_file])
     elif not far and not could_spill and not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
@@ -2548,6 +2634,12 @@ def _as_they_end(futs):
 
 
 def cmd_batch(args):
+    off = local_off()
+    if off:
+        if args.local:
+            print(f"--local: {OFF}")
+            return 1
+        args.remote = True  # as --remote: go_remote below says why when it cannot
     could_spill = not args.remote and not args.local and spill_server() is not None
     up = args.remote or healthy()
     roles = bool((CFG.get("remote") or {}).get("roles"))  # a task's role may send it elsewhere: seen below
@@ -2580,9 +2672,9 @@ def cmd_batch(args):
         if t.get("context") and t["context"] is not context:  # a task's own: its folders opened, checked
             t["context"] = context_files(t["context"], f"task {t.get('id', t['out'])}: \"context\"")
         check_out(t["out"], t.get("context"), f"{args.tasks}, task {t.get('id', t['out'])}: its \"out\"")
-    if args.remote:
-        use_remote([args.tasks, args.system_file, args.prompt_prefix,
-                    *(f for t in tasks for f in request_files(t))])
+    if args.remote:  # once the context is known: its files leave too
+        (go_remote if off else use_remote)([args.tasks, args.system_file, args.prompt_prefix,
+                                            *(f for t in tasks for f in request_files(t))])
     if args.prompt_prefix:
         prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
         tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
@@ -2955,6 +3047,9 @@ def agent_turn(wait):
 
 
 def cmd_agent(args):
+    if local_off():
+        print(f"agent runs on the local model only: {OFF}")
+        return 1
     if not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
@@ -3081,6 +3176,8 @@ def main():
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--ignore-power-limit", action="store_true", help="start even above max_power_w")
     sub.add_parser("stop")
+    p = sub.add_parser("local", help="off: stop the local server and send every run to the remote one; on: back")
+    p.add_argument("state", nargs="?", choices=["on", "off"])
     sub.add_parser("status")
     sub.add_parser("config", help="print the settings in effect")
     p = sub.add_parser("ask")
@@ -3142,8 +3239,8 @@ def main():
                    help="only one Claude Code session's requests: the calling one, or the id given (its start)")
     args = ap.parse_args()
     try:
-        return {"start": cmd_start, "stop": cmd_stop, "status": cmd_status, "config": cmd_config, "ask": cmd_ask,
-                "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
+        return {"start": cmd_start, "stop": cmd_stop, "local": cmd_local, "status": cmd_status, "config": cmd_config,
+                "ask": cmd_ask, "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
     except WorkerError as e:  # what the caller got wrong (a task file, a brief, an output's path), in one line
         print(e)
         return 1
