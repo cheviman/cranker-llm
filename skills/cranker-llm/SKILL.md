@@ -118,8 +118,10 @@ role of **another family** (a model reviewing its own draft tends to agree with 
 findings, drops the false ones and decides; the commit stays Claude's, with the user's yes. With a check,
 `--escalate NAME` (`"escalate"` in a line, `remote.escalate` for all) sends the fixes to that role once the first
 answer failed (`remote.escalate_after`, 1: its second try, which still counts as effective), so a bigger model is
-paid only for what the first one could not get right. The line says `MODEL as ROLE`, or `fixes from fix N on by
-MODEL as ROLE (escalated)`; `usage` prices each model apart. Use the roles that are listed and never invent one;
+paid only for what the first one could not get right. A fix that goes elsewhere carries the check's output too:
+`remote.escalate` skips a task whose files may not leave, and a check that prints files from outside `remote.roots`
+is not one to send there. The line says `MODEL as ROLE`, or `fixes from fix N on by MODEL as ROLE (escalated)`;
+`usage` prices each model apart. Use the roles that are listed and never invent one;
 adding a role or changing its model is the user's call: a role's model may bill their credits.
 
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own

@@ -118,6 +118,24 @@ class Roles(unittest.TestCase):
         self.assertNotIn("escalated", out)
         self.assertEqual(len(h.requests(h.away)), 1)
 
+    def test_the_configs_escalate_leaves_alone_a_task_that_may_not_leave(self):
+        # a fix carries the task's files and the check's output: remote.escalate, set for every checked task, made
+        # a local task whose file is outside remote.roots fail whole ("not under remote.roots") instead
+        h = self.home(roles={"big": "big-model"}, escalate="big")
+        outside = h.dir / "outside.c"
+        outside.write_text("int x;\n", encoding="utf-8")
+        ask = ("ask", "-o", "x.txt", "-f", str(outside), "--check", check_for(h, "right"),
+               "-p", "[[say:wrong]] [[then:right]]")
+        rc, out, err = h.worker(*ask, **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("check passed after 1 fix", out)
+        self.assertNotIn("escalated", out)
+        self.assertEqual((len(h.requests()), len(h.requests(h.away))), (2, 0))
+        rc, out, err = h.worker(*ask, "--escalate", "big", **self.KEY)  # named for this task: refused, as a role is
+        self.assertEqual(rc, 1, out)
+        self.assertIn("is not under remote.roots", out)
+        self.assertEqual(len(h.requests(h.away)), 0)
+
     def test_usage_prices_each_model_apart(self):
         h = self.home(price=[1, 2], roles={"review": {"model": "big-model", "price": [10, 20]}})
         rc, out, err = h.worker("ask", "--remote", "-p", "[[say:a]]", **self.KEY)
