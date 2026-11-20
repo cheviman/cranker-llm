@@ -108,7 +108,7 @@ class LoopRunTests(unittest.TestCase):
         h = Home(self)
         check = h.file("check_ok.py", "import sys\nsys.exit(0)\n")
         rc, out, err = h.worker("ask", "-o", "review99.md", "--max-tokens", "6000",
-                                "--check", f'"{sys.executable}" "{check}" {{out}}',
+                                "--check", f'"{sys.executable}" "{check}" {{out}}', "--check-null", "none",
                                 "-p", f"[[say-file:{REVIEW}]] review it")
         self.assertEqual(rc, 2, out + err)
         self.assertEqual(len(h.requests()), 1)

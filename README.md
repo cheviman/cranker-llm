@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.4.1
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.5.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -112,6 +112,14 @@ batch run again burns nothing. The file is checked before any task runs (a line 
 
 ```
 {"id": "f1", "prompt": "Propose a name for this function...", "files": ["src/a.c:100-180"], "out": "names/f1.md"}
+```
+
+What every task needs goes on the command line once: `--context` for the files they all read (the formats, the
+mechanisms, solved cases, the data: see [the context pack](#the-context-pack-what-a-wide-batch-needs)), the rules
+in `--prompt-prefix`, the check in `--check`.
+
+```
+py scripts/worker.py batch designs.jsonl --remote --context build/pack --check "py measure.py {out}"
 ```
 
 **`agent`**: Claude Code itself, headless, running on the local model, with Read, Grep and Glob, and Write and Edit
@@ -153,8 +161,24 @@ Each output ends one of three ways: `check passed`, `check passed after N fixes 
 with the last errors in `<out>.check.txt`, left for Claude, and every failed round's in `<out>.check.N.txt` (only
 the last was kept once, and the first failure of a run, an MSYS2 cmake on the `PATH`, was lost with it); an output
 that passes in the end leaves none of them. `usage` adds them up by project (first time / by the
-worker / for Claude). In a `batch`, `--check`, `--retries`, `--system-file` and `--prompt-prefix` apply to every
-task that doesn't set its own, so the shared rules are written once and not in every line.
+worker / for Claude). In a `batch`, `--check`, `--check-null`, `--check-good`, `--retries`, `--context`,
+`--system-file` and `--prompt-prefix` apply to every task that doesn't set its own, so the shared rules are written
+once and not in every line.
+
+**The check is tried before it is trusted.** A check that passes a wrong output makes the wrong output "right at
+the first try", and nobody looks at it again. On 20-11-2026 one that only applied a patch and compiled passed a
+patch that changed nothing, and one that decompiled "with the patched copy" ran the real code (its script put the
+real folder first in `sys.path`), so the worker failed three times against code that never had its patch. So
+before any request, the worker runs the check on an output that changes nothing, which it must fail: an empty one
+by default, or `--check-null FILE` (`"check_null"` in a line), the real null for that task (the file as it is now,
+an empty patch). With `--check-good FILE` (`"check_good"`) it also runs it on a known-good output, which it must
+pass. Either goes wrong and the run stops with exit 1 and the check's output: nothing is sent. A check that only
+compiles is refused that way (an empty file compiles); `--check-null none` skips the null when an empty answer
+can be right. The probes are written to `<stem>.cranker-probe<suffix>` beside the output (a free name: a file of
+yours is never written over, nor the output itself) and deleted after, so the check finds its includes from there.
+A check with no `{out}` in it reads the output from its own place and can't be tried on a copy, so it is refused
+too, unless `--check-null none` says to run it untried. A batch tries each check once for each folder its outputs
+are in, and its second line says how: `check, tried before any request: fails an empty output (14 tasks)`.
 
 An answer cut by `max_tokens` is unfinished whatever its check says, and the check's errors on it are only about
 the missing end. So a cut answer is asked for again as it was, with 1.5 times the limit (as far as the context
@@ -196,7 +220,33 @@ of every `ask`, `batch` and `agent`. A brief is instructions to the model, like 
 gets `--brief ""`. Keep it to the rules the code must follow:
 language, indentation, headers and markers, what never to do. `--brief FILE` uses another file, and `--brief ""`
 leaves it out. With a four-line brief, the same request for a C function went from spaces and no markers to tabs
-and `//ok, DD-MM-YYYY`, and passed a style check the first time.
+and `//ok, DD-MM-YYYY`, and passed a style check the first time. A run that finds no brief and writes code (an
+output that is not a document) or asks for changes (a patch, a diff, changes to apply) says so on stderr, `no brief:
+...`, with where to write one; `--brief ""` is the way to say none is wanted.
+
+### The context pack: what a wide batch needs
+
+A worker sees its files and its prompt, nothing else. On 20-11-2026 a batch of 14 designs for a decompilation
+(OutRunners, phase 2) went out with four sites of C each and came back unusable: `symbols.txt` lines in formats
+the parser doesn't read, data addresses where instruction addresses go, a structure that doesn't exist, and "no
+change needed in the core" from a model that never saw the core. The model wasn't the cause. The format was in the
+parser, the instruction addresses in the listing, the solved cases in earlier rounds, and the project had no
+brief; none of it was in the requests. A batch of design or change tasks gets a pack, a folder given to every task
+with `--context DIR` (or `"context": [...]` in a line: files, `file:a-b` ranges or folders, whose files go in name
+order):
+
+1. **The formats, taken from the code that reads them**: the parser's line range, not a format retyped from memory.
+2. **The mechanisms the change goes through, with their code ranges**: how the core types a pointer, where a local
+   is declared, so a task can say what the core lacks and where.
+3. **Two to four solved cases, each with its before and after**: what a right answer looks like in this project.
+4. **The data the task needs**: listings, tables, the current lines of the names involved.
+
+And a check that measures the real result (the metric the change must move, on the patched copy), tried with a
+change that does nothing (`--check-null`) and with a known good one (`--check-good`). The pack goes first in every
+request, after the system prompt and the brief, before the task's own files: the same prefix in every task, which a
+server that caches prompts reads once. Its size is on the batch's first line (`context 5 files (41,210 chars) first
+in every request`), and it counts in every request, so it holds ranges, not whole trees. The pack is not what the
+work is about: a task sent again with a pack added is the same piece of work, its next try, in `usage`.
 
 ### What to hand it, and what not
 
@@ -431,10 +481,14 @@ The worker's tokens are measured by **two yardsticks, kept apart**:
   files it is about, so the same file sent again in a narrower range or with another prompt is one more try of it,
   and so is each fix the worker makes after a failed check. Work that took more tries, or was left cut, failing its
   check or with nothing back, is not effective, whatever it consumed. Ten to one means nothing when it took four
-  runs.
+  runs. The files of `--context` are not what a piece of work is about: adding a pack to a task makes its next run
+  one more try of it, not new work.
 
 The scale is on the effective, and `usage` and `local_share.py` show both, with the pieces of work by the try they
-were right at.
+were right at. A piece is only as right as its check, so `usage` also splits the right ones by what they stood on:
+`Of the 40 right: 25 passed a check tried before it ran, 3 a check never tried, 12 had no check (right because
+nothing sent them again)`. They all count as effective; the split says how much of it was proven. The table of
+checked tasks has a `tried` column for the same thing, by project.
 
 ```
 py scripts/local_share.py [--day 2026-11-16]
@@ -589,7 +643,7 @@ answers is scripted in the prompt (`[[say:...]]`, `[[say-file:...]]`, `[[loop:..
 that went wrong, so a test runs the worker on exactly what the model sent. The tests run the
 real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
 of its own, so the real worker, its logs and a server that is running are never touched: `ask`, `batch`, the check
-and its fixes, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
+and its fixes, the check tried before any request, `--context`, the brief's note, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
 agent's relay, `--remote` against a second stand-in that asks for a key and refuses llama.cpp's fields, and the
 setup's download against a server that drops the connection. A couple of minutes on any machine. What they cannot tell is what the model answers: that is
 `bench/bench.py`, on the GPU.
@@ -607,7 +661,7 @@ setup's download against a server that drops the connection. A couple of minutes
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
-| `tests/test_worker.py`, `tests/fake_llama.py` | the tests, and the stand-in for llama-server they run against |
+| `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,

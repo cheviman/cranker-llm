@@ -1,17 +1,21 @@
 """cranker-llm: a llama.cpp server on this machine that Claude Code hands volume work to.
 
     worker.py start | stop | status | config
-    worker.py ask -p "instruction" [-f file[:a-b] ...] [--number] [-o out] [--think] [--print] [--check CMD]
-                  [--brief FILE] [--remote | --local]
-    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD] [--system-file F] [--prompt-prefix F] [--number]
-                  [--remote | --local]
+    worker.py ask -p "instruction" [-f file[:a-b] ...] [--context file|folder ...] [--number] [-o out] [--think]
+                  [--print] [--check CMD [--check-null F|none] [--check-good F]] [--brief FILE] [--remote | --local]
+    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD [--check-null F|none] [--check-good F]]
+                  [--context file|folder ...] [--system-file F] [--prompt-prefix F] [--number] [--remote | --local]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
 
 check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
 and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
-the room, once; cut again, the task needs splitting. brief: .cranker/brief.md in the caller's folder or above it,
-how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md).
+the room, once; cut again, the task needs splitting. Before any request, the check is tried: it must fail an output
+that changes nothing (--check-null, an empty one by default) and pass a known-good one (--check-good); a check that
+cannot tell them apart stops the run. brief: .cranker/brief.md in the caller's folder or above it,
+how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md); a task
+that writes code or changes without one is told so. context (--context): files every task shares (the formats, the
+mechanisms, solved cases, the data), first in every request, before the task's own files.
 out: an answer that is one fenced code block and nothing else is written without its fence (-o, a batch's "out").
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
@@ -19,7 +23,7 @@ summary is printed (--print also prints the answer). From Windows PowerShell 5.1
 split into several arguments: write it to a file and pass --prompt-file. --number gives the model every line with
 its number in the file, for answers that cite lines (a map, a review); not for a rewrite.
 batch: one JSON object per line: {"id", "prompt", "files": [...], "out", "system"?, "think"?, "max_tokens"?,
-"check"?, "retries"?, "number"?}.
+"check"?, "check_null"?, "check_good"?, "retries"?, "number"?, "context"?: [...]}.
 Tasks whose "out" already exists are skipped unless --force, so a batch can resume. One that left its output cut or
 failing its check (out.failed.json beside it) runs again once its line has changed. An "out" is never one of the
 task's own files.
@@ -985,9 +989,18 @@ def pieces_line(recs):
     by = sum(1 for r in pieces.values() if not r["_why"] and r["_tries"] > 1)
     more = sum(1 for r in pieces.values() if r["_why"] and r["_tries"] > most and not _wrong(r))
     wrong = len(pieces) - first - by - more
-    return (f"quality, by piece of work (an output and the files it is about): {len(pieces)} pieces, {first} right at "
+    line = (f"quality, by piece of work (an output and the files it is about): {len(pieces)} pieces, {first} right at "
             f"the first try, {by} by try {most}, {more} took more tries, {wrong} left wrong (cut, looping, failing "
             f"their check, nothing back). Effective is the first two: right by try {most}")
+    # what "right" stood on: a check that passed anything (on 20-11-2026, one that only applied and compiled) makes
+    # a wrong output right at the first try. Counted all the same, and told apart here
+    right = [r for r in pieces.values() if not r["_why"]]
+    if right:
+        tried = sum(1 for r in right if r.get("check") and r.get("proof") in TRIED)
+        untried = sum(1 for r in right if r.get("check")) - tried
+        line += (f". Of the {len(right)} right: {tried} passed a check tried before it ran, {untried} a check never "
+                 f"tried, {len(right) - tried - untried} had no check (right because nothing sent them again)")
+    return line
 
 
 # USD per million tokens (input, output): Anthropic's API list prices on 2026-11-03. Cache reads are $0.20 on both.
@@ -1018,17 +1031,20 @@ def quality_table(since=None, include_tagged=False, session=None):
         return
     rows = {}
     for r in recs:
-        a = rows.setdefault(project_of(r), {"pass": 0, "fixed": 0, "fail": 0, "tries": 0})
+        a = rows.setdefault(project_of(r), {"pass": 0, "fixed": 0, "fail": 0, "tries": 0, "tried": 0})
         a[r["result"]] += 1
         a["tries"] += r["tries"]
-    print(f"\n{'checked tasks (the rework)':<34} {'tasks':>8} {'first time':>11} {'by worker':>10} "
+        a["tried"] += r.get("proof") in TRIED
+    print(f"\n{'checked tasks (the rework)':<34} {'tasks':>8} {'tried':>6} {'first time':>11} {'by worker':>10} "
           f"{'for Claude':>11} {'fixes':>6}")
     for k, a in sorted(rows.items(), key=lambda kv: -sum(kv[1][x] for x in ("pass", "fixed", "fail"))):
         n = a["pass"] + a["fixed"] + a["fail"]
-        print(f"{str(k)[:34]:<34} {n:>8} {a['pass'] / n:>10.0%} {a['fixed'] / n:>10.0%} {a['fail'] / n:>11.0%} "
-              f"{a['tries']:>6}")
-    print("first time: passed its check with no fix. by worker: the worker fixed it from the check's errors. "
-          "for Claude: still\nfailing after its retries. fixes: the worker's extra requests.")
+        print(f"{str(k)[:34]:<34} {n:>8} {a['tried'] / n:>6.0%} {a['pass'] / n:>10.0%} {a['fixed'] / n:>10.0%} "
+              f"{a['fail'] / n:>11.0%} {a['tries']:>6}")
+    print("tried: its check was tried before the run (it failed an output that changes nothing, or passed a good "
+          "one); a check\nnever tried may pass anything. first time: passed its check with no fix. by worker: the "
+          "worker fixed it from the\ncheck's errors. for Claude: still failing after its retries. fixes: the worker's "
+          "extra requests.")
 
 
 def guard_line(since=None):
@@ -1139,6 +1155,11 @@ QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
 LOCAL_HELP = "keep this run on the local worker, even with remote.spill on"
 ROLE_HELP = "a role of remote.roles: the model the user chose for this kind of task (draft, review...)"
 ESCALATE_HELP = "with a check: the role its fixes go to once it failed (default: remote.escalate; '' none)"
+CHECK_NULL_HELP = ("an output that changes nothing, which the check must fail before any request is sent (default: an "
+                   "empty output; 'none': not tried, when an empty answer can be right)")
+CHECK_GOOD_HELP = "a known-good output, which the check must pass before any request is sent"
+CONTEXT_HELP = ("a file (file:a-b) or a folder of files that goes first into every request: the shared context "
+                "(formats, mechanisms, solved cases, data); repeat it for more")
 REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
                "this machine, so only from the folders under remote.roots, and only when the user asks for it")
 
@@ -1704,6 +1725,70 @@ def with_brief(system, brief):
             f"=== END ===")
 
 
+# On 20-11-2026 a wide batch of designs for OutRunners (no brief there, and nothing said so) came back with formats
+# of symbols.txt made up, data addresses where instruction addresses go and a structure that does not exist: the
+# workers guessed what a brief and the shared context would have told them. A task that writes code, or asks for
+# changes, is told when it runs without one.
+CHANGE_WORDS = re.compile(r"\b(patch(es)?|diffs?|changes?|edits?|rewrite|refactor|implement|fix(es)?|apply)\b", re.I)
+
+
+def writes_changes(t):
+    """Whether a task writes code (an output that is not a document) or asks for changes in its prompt"""
+    return bool(t.get("out") and not is_document(t["out"])) or bool(CHANGE_WORDS.search(t.get("prompt") or ""))
+
+
+def repo_root(here=None):
+    here = Path(here or Path.cwd()).resolve()
+    return next((d for d in [here, *here.parents] if (d / ".git").exists()), None)
+
+
+def no_brief_note(tasks, explicit):
+    """The line a run without a brief gets when some of its tasks write code or changes, or None: none when the
+    brief was turned off on purpose (--brief "", CRANKER_BRIEF)"""
+    if explicit is not None or os.environ.get("CRANKER_BRIEF") is not None:
+        return None
+    n = sum(1 for t in tasks if writes_changes(t))
+    if not n:
+        return None
+    who = "this task writes" if len(tasks) == 1 else f"{n} of these tasks write"
+    return (f"no brief: there is no {BRIEF_NAME} here or above, up to the repository's root, and {who} code or "
+            f"changes: the workers will guess the project's formats and rules. Write "
+            f"{(repo_root() or Path.cwd()) / BRIEF_NAME} (the rules the code follows, the formats it reads and writes, "
+            "what must not change), or pass --brief \"\" to run without one")
+
+
+# ----- the shared context: files every task of a batch needs (formats, mechanisms, solved cases, data), given once
+
+def context_files(specs, what="--context"):
+    """The files of --context: a file, file:first-last, or a folder (its files sorted by name, not its subfolders,
+    not hidden ones). Checked before anything runs."""
+    files = []
+    for spec in specs or []:
+        m = FILE_RANGE.match(spec)
+        path = Path(m.group(1) if m else spec)
+        if path.is_dir() and not m:
+            inside = sorted(p for p in path.iterdir() if p.is_file() and not p.name.startswith("."))
+            if not inside:
+                raise WorkerError(f"{what} {spec}: no files in that folder")
+            files += [str(p) for p in inside]
+        elif path.is_file():
+            files.append(spec)
+        else:
+            raise WorkerError(f"{what} {spec}: no such file or folder")
+    return files
+
+
+def request_files(t):
+    """What a task's request reads: its context first (the same in every task, so a server that caches prompts
+    reads it once), then its own files"""
+    context = t.get("context") or []
+    return [*context, *(f for f in t.get("files") or [] if f not in context)]
+
+
+def context_size(files):
+    return sum(len(read_file_spec(f)) for f in files)
+
+
 # ----- the check: a command that says whether an output is right; the worker fixes its own output until it passes
 
 CHECK_TAIL = 6000  # chars of the check's output that go back to the model
@@ -1756,6 +1841,120 @@ def run_check(cmd, out):
     return r.returncode == 0, text or f"exit code {r.returncode}, no output"
 
 
+# A check is tried before it is trusted, as it was not on 20-11-2026: one that only applied a patch and compiled
+# passed a patch that changed nothing, and one that decompiled "with the patched copy" ran the real code (a script
+# put the real folder first in sys.path), so the worker failed three times against code that never had its patch.
+# Before any request, the check runs on an output that changes nothing (the null one: --check-null, an empty output
+# by default), which it must fail, and on a known-good one (--check-good), which it must pass. Either goes wrong and
+# nothing is sent. The proof says what it was tried with: the right work that stood on it is told apart in usage.
+PROOF_SAYS = {"empty": "fails an empty output", "null": "fails the null output",
+              "empty+good": "fails an empty output and passes the good one",
+              "null+good": "fails the null output and passes the good one",
+              "good": "passes the good output (no null output: --check-null none)",
+              "none": "not tried (--check-null none)"}
+TRIED = ("empty", "null", "empty+good", "null+good", "good")
+PROBE_TAIL = 1500  # chars of a weak check's output said when the run is stopped
+
+
+def probe_path(out, n=0):
+    """Where a check is tried: a copy beside the output, so a check that finds its includes or its project from
+    there finds them, and the output itself (a file that may exist) is never written over"""
+    out = Path(out)
+    return out.with_name(f"{out.stem}.cranker-probe{f'-{n}' if n else ''}{out.suffix}")
+
+
+def _probe(check, out, data):
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    for n in range(100):  # a file of that name that is not ours (or one a killed run left) is never written over
+        p = probe_path(out, n)
+        try:
+            with open(p, "xb") as f:
+                f.write(data)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise WorkerError(f"no free name to try the check beside {out}: delete the {probe_path(out)} files there")
+    try:
+        passed, log = run_check(check, p)
+    finally:
+        p.unlink(missing_ok=True)
+    return passed, (log if len(log) <= PROBE_TAIL else "[...]\n" + log[-PROBE_TAIL:]), p
+
+
+def _probe_input(spec, flag):
+    try:
+        return Path(spec).read_bytes()
+    except OSError as e:
+        raise WorkerError(f"{flag} {spec} cannot be read ({e.strerror})")
+
+
+def try_check(check, out, null=None, good=None):
+    """Tries a check before any request goes out for it (see PROOF_SAYS): returns its proof, or raises WorkerError
+    with the check's own output when it cannot tell a right output from a wrong one. null: the output that changes
+    nothing (a file; None: an empty one; 'none' or '': not tried); good: a known-good output (a file), or None."""
+    skip = null is not None and null.strip().lower() in ("", "none")
+    if "{out}" not in check:
+        # it reads the output from its own place: trying it would mean writing over that, so it runs untried only
+        # when that is said
+        if skip and not good:
+            return "none"
+        raise WorkerError("the check does not name {out}, so it cannot be tried on a copy of the output before the "
+                          "run, and nothing was sent. Put {out} where it reads the output, or pass --check-null none "
+                          f"to run it untried.\n$ {check}")
+    parts = []
+    if not skip:
+        data = b"" if null is None else _probe_input(null, "--check-null")
+        passed, log, p = _probe(check, out, data)
+        if passed:
+            what = "an empty output" if null is None else f"the null output {null}"
+            raise WorkerError(f"the check passes {what}, which changes nothing: it cannot tell a right output from a "
+                              "wrong one, so nothing was sent. Make it measure the result (what the change must "
+                              "move, not only that it applies or compiles), or pass --check-null none if an empty "
+                              f"answer can be right.\n$ {check.replace('{out}', str(p))}\n{log}")
+        parts.append("empty" if null is None else "null")
+    if good:
+        passed, log, p = _probe(check, out, _probe_input(good, "--check-good"))
+        if not passed:
+            raise WorkerError(f"the check fails the known-good output {good}: it does not measure what it means to "
+                              "(does it run the copy it should? a path, sys.path, a stale build), so nothing was "
+                              f"sent. It ran on a copy at {p}.\n$ {check.replace('{out}', str(p))}\n{log}")
+        parts.append("good")
+    return "+".join(parts) or "none"
+
+
+def try_checks(tasks):
+    """try_check for the tasks of a run that have a check, once for each check, its null and good outputs and the
+    folder of the output (a check may find another project from another folder), several at a time as the tasks'
+    own checks run. Sets each task's '_proof'."""
+    keys = {}
+    for t in tasks:
+        if t.get("check"):
+            where = os.path.normcase(os.path.abspath(Path(t["out"]).parent))
+            keys.setdefault((t["check"], t.get("check_null"), t.get("check_good"), where), []).append(t)
+    if not keys:
+        return {}
+
+    def one(key):
+        check, null, good, _ = key
+        return try_check(check, keys[key][0]["out"], null, good)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(keys))) as ex:
+        futs = {key: ex.submit(one, key) for key in keys}
+    proofs = {}
+    for key, fut in futs.items():
+        try:
+            proof = fut.result()
+        except WorkerError as e:
+            first = keys[key][0]
+            more = f" (and {len(keys[key]) - 1} more with it)" if len(keys[key]) > 1 else ""
+            raise WorkerError(f"task {first.get('id', first['out'])}{more}: {e}")
+        for t in keys[key]:
+            t["_proof"] = proof
+        proofs[proof] = proofs.get(proof, 0) + len(keys[key])
+    return proofs
+
+
 def log_quality(task_id, out, check, result, tries, **extra):
     rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cwd": os.getcwd(), "id": task_id, "out": str(out),
            "check": check, "result": result, "tries": tries, **extra}
@@ -1799,14 +1998,18 @@ def run_checked(t, cmd, keep_thinking, brief):
     'split' why it stops when even that is cut. t["_server"]: where its role sends it (server_for); t["_escalate"]:
     where its fixes go once it failed remote.escalate_after answers ('escalated' says to which role)."""
     out = Path(t["out"])
-    args = dict(files=t.get("files", []), system=with_brief(t.get("system") or CFG["system"], brief),
+    args = dict(files=request_files(t), system=with_brief(t.get("system") or CFG["system"], brief),
                 think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
                 cmd=cmd, effort=t.get("effort"), number=bool(t.get("number")), log=False, server=t.get("_server"))
-    work = work_id(out, t.get("files"))
+    work = work_id(out, t.get("files"))  # its own files: the shared context is not what the work is about
+    proof = t.get("_proof")
 
     def logged(res, **how):
         """The request's line in usage.jsonl, written once its check has run: it says which piece of work it was
-        and how its output came out, which is what the quality yardstick is counted from (mark_tries)"""
+        and how its output came out, which is what the quality yardstick is counted from (mark_tries), and what
+        its check was tried with (proof)"""
+        if how.get("check") and proof:
+            how["proof"] = proof
         log_usage(**res.pop("usage"), dest=str(out.resolve()), work=work, **how)  # "out" is the tokens written
 
     res = run_task(t["prompt"], **args)
@@ -1900,7 +2103,7 @@ def run_checked(t, cmd, keep_thinking, brief):
     log_quality(t.get("id"), out, check, res["check"], tries,
                 **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
                 **({"split": True} if split else {}), **({"repeat": True} if looped else {}),
-                **({"escalated": escalated[0]} if escalated else {}))
+                **({"escalated": escalated[0]} if escalated else {}), **({"proof": proof} if proof else {}))
     return res
 
 
@@ -2136,12 +2339,13 @@ def notes_file(out):
 
 
 TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number",
-             "role", "escalate")
+             "role", "escalate", "context")
 
 
 def task_sig(t):
     """What a task asks for, as a short hash: a batch runs a failed task again only once this has changed"""
-    asked = json.dumps({k: t.get(k) for k in TASK_KEYS}, sort_keys=True)
+    # "context" only when a task has one: a line written before it existed keeps its signature
+    asked = json.dumps({k: t.get(k) for k in TASK_KEYS if k != "context" or t.get("context")}, sort_keys=True)
     return hashlib.sha256(asked.encode("utf-8")).hexdigest()[:16]
 
 
@@ -2269,8 +2473,9 @@ def cmd_ask(args):
         print(f"--local and --role {args.role}: that role is a model elsewhere ({role_of(args.role)['model']})")
         return 1
     could_spill = not args.remote and not args.local and not args.role and spill_server() is not None
+    context = context_files(args.context)
     if args.remote:
-        use_remote([*(args.file or []), args.prompt_file])
+        use_remote([*context, *(args.file or []), args.prompt_file])
     elif not far and not could_spill and not healthy():
         return _not_running()
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig") if args.prompt_file else args.prompt
@@ -2280,29 +2485,39 @@ def cmd_ask(args):
     if args.check and not args.out:
         print("--check needs -o: the check reads the output from its file ({out})")
         return 1
+    if (args.check_null is not None or args.check_good) and not args.check:
+        print("--check-null and --check-good try a --check: there is none")
+        return 1
     if args.out:
-        check_out(args.out, args.file)
+        check_out(args.out, [*context, *(args.file or [])])
     brief_path, brief = find_brief(args.brief)
     if REMOTE and brief_path:
         may_leave([brief_path], REMOTE["roots"])
     if could_spill:
-        _ON.spill = spill_for([*(args.file or []), args.prompt_file, brief_path])
+        _ON.spill = spill_for([*context, *(args.file or []), args.prompt_file, brief_path])
         _ON.down = not healthy()
         if _ON.down and not _ON.spill:
             return _not_running()
     t = {"prompt": prompt, "files": args.file or [], "system": args.system, "think": args.think,
          "max_tokens": args.max_tokens, "temperature": args.temperature, "effort": args.effort,
          "out": args.out, "check": args.check, "number": args.number, "role": args.role}
+    if context:
+        t["context"] = context
     if args.retries is not None:
         t["retries"] = args.retries
     if args.escalate is not None:
         t["escalate"] = args.escalate
+    note = None if brief_path else no_brief_note([t], args.brief)
+    if note:
+        print(note, file=sys.stderr)
     try:
-        place(t, [*(args.file or []), args.prompt_file, brief_path])
+        place(t, [*context, *(args.file or []), args.prompt_file, brief_path])
+        if args.check:  # before any request: a check that cannot tell right from wrong stops it here
+            t["_proof"] = try_check(args.check, args.out, args.check_null, args.check_good)
         if args.out:
             res = run_checked(t, "ask", args.keep_thinking, brief)
         else:
-            res = run_task(prompt, t["files"], with_brief(args.system or CFG["system"], brief), args.think,
+            res = run_task(prompt, request_files(t), with_brief(args.system or CFG["system"], brief), args.think,
                            args.max_tokens, args.temperature, effort=args.effort, number=args.number,
                            server=t["_server"])
     except WorkerBusy as e:  # not run, as in batch and agent: nothing wrong with the task, the same command again
@@ -2339,15 +2554,19 @@ def cmd_batch(args):
     if not up and not could_spill and not roles:
         return _not_running()
     tasks = load_tasks(args.tasks)
-    if args.remote:
-        use_remote([args.tasks, args.system_file, args.prompt_prefix,
-                    *(f for t in tasks for f in t.get("files") or [])])
     # what every task shares goes once on the command line, not in every line: a task's own value wins
     shared = {}
+    context = context_files(args.context)
+    if context:
+        shared["context"] = context
     if args.system_file:
         shared["system"] = Path(args.system_file).read_text(encoding="utf-8-sig").strip()
     if args.check:
         shared["check"] = args.check
+    if args.check_null is not None:
+        shared["check_null"] = args.check_null
+    if args.check_good:
+        shared["check_good"] = args.check_good
     if args.retries is not None:
         shared["retries"] = args.retries
     if args.number:
@@ -2357,6 +2576,13 @@ def cmd_batch(args):
     if args.escalate is not None:
         shared["escalate"] = args.escalate
     tasks = [{**shared, **{k: v for k, v in t.items() if v is not None}} for t in tasks]
+    for t in tasks:
+        if t.get("context") and t["context"] is not context:  # a task's own: its folders opened, checked
+            t["context"] = context_files(t["context"], f"task {t.get('id', t['out'])}: \"context\"")
+        check_out(t["out"], t.get("context"), f"{args.tasks}, task {t.get('id', t['out'])}: its \"out\"")
+    if args.remote:
+        use_remote([args.tasks, args.system_file, args.prompt_prefix,
+                    *(f for t in tasks for f in request_files(t))])
     if args.prompt_prefix:
         prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
         tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
@@ -2378,21 +2604,33 @@ def cmd_batch(args):
         try:
             if args.local and t.get("role") and role_of(t["role"]) != LOCAL:
                 raise WorkerError(f"--local, and its role {t['role']} is a model elsewhere")
-            place(t, [*common, *(t.get("files") or [])])
+            place(t, [*common, *request_files(t)])
         except WorkerError as e:
             raise WorkerError(f"task {name}: {e}")
     far = next((t["_server"] for t in todo if isinstance(t["_server"], dict)), None)
     # remote.spill: the tasks with no role whose files may all leave can go there when the local worker is full
     spills = {}
     if could_spill:
-        spills = {id(t): spill_for([*common, *(t.get("files") or [])]) for t in todo if t["_server"] is None}
+        spills = {id(t): spill_for([*common, *request_files(t)]) for t in todo if t["_server"] is None}
     there = next((r for r in spills.values() if r), None)
     if not up and not there and not far:
         return _not_running()
+    note = None if brief_path else no_brief_note(todo, args.brief)
+    if note:
+        print(note, file=sys.stderr)
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else "")
+          + (f"; context {len(context)} files ({context_size(context):,} chars) first in every request"
+             if context else "")
           + (f"; {sum(1 for r in spills.values() if r)} of them may go to {there['host']} as well (remote.spill)"
              if there else ""))
+    proofs = try_checks(todo)  # before any request: a check that cannot tell right from wrong stops the batch here
+    if proofs:
+        print(("check" if len(proofs) == 1 else "checks") + ", tried before any request: "
+              + "; ".join(PROOF_SAYS[p] + (f" ({n} task{'s' if n != 1 else ''})" if len(proofs) > 1 or n > 1
+                                           else "") for p, n in proofs.items())
+              + ("" if any("good" in p for p in proofs) or not any(p in TRIED for p in proofs) else
+                 ". --check-good FILE also tries a known-good output, which it must pass"))
     named = {}
     for t in todo:
         if t.get("role"):
@@ -2862,6 +3100,9 @@ def main():
     p.add_argument("--print", action="store_true", help="also print the answer when writing -o")
     p.add_argument("--keep-thinking", action="store_true", help="save the thinking next to -o")
     p.add_argument("--check", help="a command that passes (exit 0) when the output is right; {out} is its path")
+    p.add_argument("--check-null", help=CHECK_NULL_HELP)
+    p.add_argument("--check-good", help=CHECK_GOOD_HELP)
+    p.add_argument("--context", action="append", help=CONTEXT_HELP)
     p.add_argument("--retries", type=int, help="how many times the worker fixes its output for the check")
     p.add_argument("--role", help=ROLE_HELP)
     p.add_argument("--escalate", help=ESCALATE_HELP)
@@ -2872,6 +3113,10 @@ def main():
     p.add_argument("--force", action="store_true")
     p.add_argument("--keep-thinking", action="store_true")
     p.add_argument("--check", help="the check for every task without its own; {out} is the task's output")
+    p.add_argument("--check-null", help=CHECK_NULL_HELP + " (for every task without its own \"check_null\")")
+    p.add_argument("--check-good", help=CHECK_GOOD_HELP + " (for every task without its own \"check_good\")")
+    p.add_argument("--context", action="append",
+                   help=CONTEXT_HELP + " (for every task without its own \"context\")")
     p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
     p.add_argument("--role", help=ROLE_HELP + " (for every task without its own \"role\")")
     p.add_argument("--escalate", help=ESCALATE_HELP)
