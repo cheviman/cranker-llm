@@ -181,7 +181,9 @@ into the repo without a mechanical check, and text a person will read as is.
 The worker is local, and by default nothing leaves the machine. `ask --remote` and `batch --remote` send one run to
 another server instead: any OpenAI-compatible endpoint, such as a hosted model, or your own GPU reached from a
 machine that has none. It is never a default and never a fallback. It takes the flag, and it is refused unless the
-caller's folder and every file of the run are under one of `remote.roots`, which is empty until you list folders:
+caller's folder and every file the worker reads into the request are under one of `remote.roots`, which is empty
+until you list folders. That is the `-f` files, and also the prompt, system and prefix files, a batch's task file
+and the brief; a link inside a listed folder that points out of it counts as where it points:
 
 ```json
 "remote": {"url": "https://api.example.com/v1", "model": "qwen3.8-27b", "roots": ["D:/projects/public"],
