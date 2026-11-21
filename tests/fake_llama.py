@@ -18,6 +18,8 @@ What a chat request gets back is scripted in its first user message:
     [[think-text:T]]   all thinking, T, and no answer, cut at max_tokens; a recovery request (the thinking handed
                        back) gets the answer instead
     [[recover-room:N]] a recovery request with max_tokens under N thinks all of it away: no answer, cut
+    [[rounds:A||B||C]] the answer the first, second, third... time this prompt is asked (the last one after that);
+                       a round that is "!cut" comes back empty, cut at max_tokens
 
 A token is a word. A chat request with "stream": true is answered as llama-server and OpenAI do, as server-sent
 events: a word an event, the counts in the last one. --load S answers /health with 503 for the first S seconds, as
@@ -186,9 +188,17 @@ def main():
                     answer = Path(said["say-file"]).read_text(encoding="utf-8")
                 if "then" in said and len(messages) > 2:
                     answer = said["then"]
+                cut_round = False
+                if "rounds" in said:
+                    parts = said["rounds"].split("||")
+                    with lock:
+                        asked[first] = asked.get(first, 0) + 1
+                        answer = parts[min(asked[first], len(parts)) - 1]
+                    cut_round = answer == "!cut"
+                    answer = "" if cut_round else answer
                 if "empty-think" in said:
                     answer, reasoning = ("", "half a thought") if thinking else ("recovered", "")
-                finish = "length" if "cut" in said else "stop"
+                finish = "length" if "cut" in said or cut_round else "stop"
                 usage = None
                 recovery = "CUT OFF BEFORE YOU ANSWERED" in text_of(messages[-1].get("content")) if messages else False
                 all_of_it = {"prompt_tokens": n_prompt, "completion_tokens": body.get("max_tokens") or 4096,

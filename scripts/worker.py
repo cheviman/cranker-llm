@@ -12,7 +12,8 @@
 
 check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
 and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
-the room, once; cut again, the task needs splitting. Before any request, the check is tried: it must fail an output
+the room, once; cut again, the task needs splitting. A task that ends failing leaves in out the best of its rounds,
+not the last, and each round's draft beside it (<stem>.rN<suffix>). Before any request, the check is tried: it must fail an output
 that changes nothing (--check-null, an empty one by default), fail every known-bad one (--check-bad) and pass a
 known-good one (--check-good); a check that cannot tell them apart stops the run. A check that runs past
 check_timeout is stopped with every process it started. brief: .cranker/brief.md in the caller's folder or above it,
@@ -1262,6 +1263,15 @@ def think_budget(max_tokens):
 #   tokens of it.
 LOWER = {"xhigh": "medium", "medium": "low"}
 RECOVER_CHARS = 120000  # about 30,000 tokens
+# On 21-11-2026 a plain map (ask --brief "" -f issues.txt, 26 issues, 15,086 tokens in) came back empty from deepseek
+# three times, max_tokens 6000, 16000 and 12000 with --effort low: all of it thinking, none of it sent. A plain
+# request is not asked to think, but the remote's "plain" fields made it (reasoning_effort medium), --effort did not
+# reach the remote without --think (it went to the template's kwargs only when thinking), the lowering above was for
+# --think requests only, and the recovery of one whose thinking did come was plain too, so it thought its room away
+# as well (a map of worker.py, the same day). Now --effort reaches a plain request there (over its plain fields),
+# "none" is an effort of its own (no thinking at all: deepseek, measured, sends none), a plain request that came back
+# all thinking with none of it sent is asked again once with "none", and a recovery there asks for "none".
+EFFORT_NONE = "none"
 
 
 # ----- a server elsewhere (--remote): any OpenAI-compatible endpoint, for a run the caller asks to send there
@@ -1285,7 +1295,8 @@ REMOTE_DEFAULTS = {
     "escalate": None,                 # the role a checked task's fixes go to once it failed (--escalate)
     "escalate_after": 1,              # how many failed answers before that: 1, its first fix (its second try)
 }
-EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low"}  # OpenAI's names for Qwen's efforts
+EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low", "none": "none"}  # OpenAI's names for Qwen's
+EFFORT_HERE = {"high": "xhigh", "xhigh": "xhigh", "medium": "medium", "low": "low", "none": "none"}  # ... and back
 # in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
 QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
 LOCAL_HELP = "keep this run on the local worker, even with remote.spill on"
@@ -1477,6 +1488,8 @@ def _chat_remote(body, r=None):
         out.update(r["think"] if r["think"] is not None else {"reasoning_effort": effort})
     else:
         out.update(r["plain"])
+        if asked.get("reasoning_effort"):  # --effort on a plain request: the plain fields may think (EFFORT_NONE)
+            out["reasoning_effort"] = EFFORT_ELSEWHERE[asked["reasoning_effort"]]
     if r.get("stream", True):  # OpenAI's own fields: the usage comes in the stream's last event
         out.update(stream=True, stream_options={"include_usage": True})
     req = urllib.request.Request(r["url"].rstrip("/") + "/chat/completions", data=json.dumps(out).encode("utf-8"),
@@ -1634,6 +1647,9 @@ def _there(body, there):
 
 def _chat_local(body, spill=False):
     t0 = time.time()
+    kwargs = body.get("chat_template_kwargs") or {}
+    if not kwargs.get("enable_thinking") and "reasoning_effort" in kwargs:  # a plain request's is for a remote's
+        body = {**body, "chat_template_kwargs": {k: v for k, v in kwargs.items() if k != "reasoning_effort"}}
     r = post_with_room("/v1/chat/completions", body, spill)
     choice = r["choices"][0]
     msg = choice["message"]
@@ -1913,6 +1929,56 @@ def reach_note(todo, ran_before, reach):
             "measured first? A script over the artifact that counts what each change could move, and what no change "
             "can (on 20-11-2026 three batches of 25, 14 and 14 went out against a measure mostly out of reach). If "
             "it was, pass --reach FILE (that measure) and this is not said again")
+
+
+# On 21-11-2026, saturn-fullset #119: main.c asked for whole came back empty after ~40,000 tokens of reasoning, and
+# layer2d.py asked for whole came back cut at line 957, while the narrow tasks of the same issue (one function, one
+# part of a file) were right at the first try. A task whose out is a code file and one of whose own files is that
+# file whole (the same name, or the same stem with a mark: layer2d.new.py, layer2d_new.py), of WHOLE_LINES lines or
+# more, asks for a whole large file again: it is told before anything is sent, with the split to make.
+WHOLE_LINES = 400
+WHOLE_SHOWN = 4
+
+
+def whole_files(t):
+    """(the file, its lines, about how many tokens it is) when a task asks for a large code file whole again"""
+    out = t.get("out")
+    if not out or is_document(out):
+        return None
+    name, stem, suffix = Path(out).name.lower(), Path(out).stem.lower(), Path(out).suffix.lower()
+    for spec in t.get("files") or []:  # its own files: the shared context is not what it writes
+        if spec_path(spec) != spec:
+            continue  # a range or a name: already narrow
+        f = Path(spec)
+        if f.suffix.lower() != suffix or not (f.name.lower() == name or
+                                              any(stem.startswith(f.stem.lower() + c) for c in "._-")):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = len(text.splitlines())
+        if lines >= WHOLE_LINES:
+            return spec, lines, len(text) // 4
+    return None
+
+
+def whole_file_note(tasks):
+    """The line a run gets when some of its tasks ask for a large code file whole, or None"""
+    found = [(t, w) for t in tasks if (w := whole_files(t))]
+    if not found:
+        return None
+    each = []
+    for t, (spec, lines, tokens) in found[:WHOLE_SHOWN]:
+        room = t.get("max_tokens") or (CFG["max_tokens_thinking"] if t.get("think") else CFG["max_tokens"])
+        each.append((f"{t['id']}: " if t.get("id") else "") + f"{Path(t['out']).name} from {spec}, {lines} lines (~{tokens} tokens to "
+                    f"write again" + (f", more than its max_tokens {room}" if tokens > room else "") + ")")
+    more = f" and {len(found) - WHOLE_SHOWN} more" if len(found) > WHOLE_SHOWN else ""
+    return (f"whole-file drafts: {'; '.join(each)}{more}. On 21-11-2026 such drafts came back empty after 40,000 tokens "
+            "of reasoning (main.c) or cut at line 957 (layer2d.py), while the narrow tasks of the same issue were right "
+            "at the first try. Split it: one task per function or part, its file given by name (-f FILE::name, "
+            "\"files\": [\"FILE::first..last\"]) and its own out, then put the parts together; or ask for the change "
+            "only (a patch of the part that changes)")
 
 
 # ----- the shared context: files every task of a batch needs (formats, mechanisms, solved cases, data), given once
@@ -2449,8 +2515,9 @@ def run_checked(t, cmd, keep_thinking, brief):
         return res
     retries = t.get("retries", CFG["check_retries"])
     note = out.with_name(out.name + ".check.txt")
-    for old in round_logs(out):
+    for old in [*round_logs(out), *round_drafts(out)]:
         old.unlink(missing_ok=True)
+    rounds = []  # every answer's draft and how its check judged it: the best of them is the one left in out
     tries = fixes = 0
     totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
     previous = None
@@ -2466,6 +2533,12 @@ def run_checked(t, cmd, keep_thinking, brief):
         logged(res, check="pass" if passed else "fail")  # the check's own word: a cut answer's line says "cut" too
         if not passed or cut or looped:  # every round that failed keeps its output, not only the last one
             write_atomic(round_log(out, tries + 1), f"$ {check}\n{log}\n")
+        draft = out.read_text(encoding="utf-8")
+        write_atomic(round_draft(out, tries + 1), draft)  # and its draft beside it, until the task passes
+        rounds.append({"n": tries + 1, "content": res["content"], "finish": res["finish"], "log": log,
+                       "draft": draft, "passed": passed,  # and what its line would say of it, if it is kept
+                       "said": {k: res.get(k) for k in ("limit", "think_tokens", "all_thinking", "recovered",
+                                                        "lowered", "repeat")}})
         # a loop is not fixed by handing it back (its tokens as the fix's history), nor by more room
         if looped or (passed and not cut) or tries >= retries:
             break
@@ -2488,8 +2561,10 @@ def run_checked(t, cmd, keep_thinking, brief):
             same = res["content"].strip() == previous
             previous = res["content"].strip()
             form = FIX_FORM if is_document(out) else FIX_FORM_CODE
-            history = [{"role": "assistant", "content": res["content"]},
-                       {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=log, form=form,
+            # the fix starts from the best draft so far: one after an empty answer had nothing to fix
+            base = best_round(rounds)
+            history = [{"role": "assistant", "content": base["content"]},
+                       {"role": "user", "content": FIX_PROMPT.format(out=out, cmd=check, log=base["log"], form=form,
                                                                      again=SAME_AGAIN if same else "")}]
             if escalate and not escalated and fixes >= after and not same_server(escalate, step["server"]):
                 # the fixes go to the role above: a model that errs in other things, and whose credits go only to
@@ -2506,7 +2581,8 @@ def run_checked(t, cmd, keep_thinking, brief):
                 room = answer_room(t["prompt"], step, history)
                 if room is not None and limit > room:
                     limit, budget = room, max(256, room - res["max_tokens"])
-                step = {**step, "think": True, "effort": step["effort"] or "medium", "max_tokens": limit,
+                step = {**step, "think": True, "max_tokens": limit,
+                        "effort": step["effort"] if step["effort"] not in (None, EFFORT_NONE) else "medium",
                         "think_tokens": budget}
         tries += 1
         res = run_task(t["prompt"], **step, history=history, attempt=tries)
@@ -2519,25 +2595,96 @@ def run_checked(t, cmd, keep_thinking, brief):
     cut = res["finish"] == "length"
     res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
     res.update(tries=tries, raised=raised, split=split, escalated=escalated, score=check_score(log), **own)
-    rounds = round_logs(out)
+    logs = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
-        for old in rounds:  # what passed in the end leaves only itself, as before
+        for old in [*logs, *round_drafts(out)]:  # what passed in the end leaves only itself, as before
             old.unlink(missing_ok=True)
     else:
         head = (repeat_line(res) if looped else cut_line(res) if cut else
                 f"max_tokens was raised {raised[0]} -> {raised[1]} after a cut; the check still fails:" if raised
                 else "")
-        more = (f"\nthe check's output of every round: {', '.join(p.name for p in rounds)}\n" if len(rounds) > 1
+        more = (f"\nthe check's output of every round: {', '.join(p.name for p in logs)}\n" if len(logs) > 1
                 else "")
+        if len(rounds) > 1:
+            best, last = best_round(rounds), rounds[-1]
+            why = better_why(best, last) if best is not last else None
+            if why:  # a worse answer never takes the place of a better one
+                write_atomic(out, best["draft"])
+                log = best["log"]
+                res.update(content=best["content"], finish=best["finish"], score=check_score(log), **best["said"])
+                cut, looped = best["finish"] == "length", best["finish"] == "repeat"
+                head = ((head + "\n" if head else "") + f"that was round {last['n']}; out holds round {best['n']}'s "
+                        f"draft, the best of {len(rounds)} ({why}), and this is its check:")
+            res["kept"] = (best["n"], len(rounds), why)
+            res["drafts"] = round_draft(out, "N").name
+            more += f"each round's draft: {', '.join(round_draft(out, r['n']).name for r in rounds)}\n"
+        else:  # one round: its draft is out itself
+            for old in round_drafts(out):
+                old.unlink(missing_ok=True)
         write_atomic(note, (head + "\n" if head else "") + f"$ {check}\n{log}\n" + more)
     if variant:  # its task's line is written once a variant is kept (keep_variant)
         return res
     log_quality(t.get("id"), out, check, res["check"], tries,
                 **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
                 **({"split": True} if split else {}), **({"repeat": True} if looped else {}),
-                **({"escalated": escalated[0]} if escalated else {}), **({"proof": proof} if proof else {}))
+                **({"escalated": escalated[0]} if escalated else {}), **({"proof": proof} if proof else {}),
+                **({"kept_round": res["kept"][0]} if res.get("kept") and res["kept"][2] else {}))
     return res
+
+
+# On 21-11-2026 a batch drafting saturn-fullset's rules.py (#119) had a second round that was almost right (it failed
+# its check on two faults outside the draft), and the third came back empty and was written over it: the best work of
+# the task was lost, and its line said only that the last one failed. So every round's draft is kept beside the
+# output (<stem>.rN<suffix>, as <out>.check.N.txt keeps its check's output) until the task passes, and a task that
+# ends failing leaves in out the best of its rounds, not the last: one with something in it over an empty one, a whole
+# one over one cut or looping, then the check's "score: N" (higher is better, as variants read it), then the fewest
+# lines of its output that say error or fail, and on a tie the later round. Its fixes start from that one too.
+FAULT = re.compile(r"\b(errors?|fail(ed|ures?|s)?|traceback)\b", re.I)
+
+
+def check_faults(log):
+    """How many lines of a check's output say error or fail: fewer is closer, when it prints no score"""
+    return sum(1 for line in (log or "").splitlines() if FAULT.search(line))
+
+
+def round_rank(r):
+    score = check_score(r["log"])
+    return (bool(r["draft"].strip()), r["finish"] == "stop", r["passed"],
+            score if score is not None else float("-inf"), -check_faults(r["log"]), r["n"])
+
+
+def best_round(rounds):
+    return max(rounds, key=round_rank)
+
+
+def better_why(best, last):
+    """Why a round's draft was kept over the last one, in a few words"""
+    if not last["draft"].strip():
+        return "the last came back empty"
+    if last["finish"] != "stop":
+        return "the last was " + ("going round in a loop" if last["finish"] == "repeat" else "cut")
+    a, b = check_score(best["log"]), check_score(last["log"])
+    if a is not None and (b is None or a > b):
+        return f"its check's score {a:g}" + (f" against {b:g}" if b is not None else "")
+    n = check_faults(best["log"])
+    return f"{n} line{'' if n == 1 else 's'} of errors in its check against {check_faults(last['log'])}"
+
+
+def round_draft(out, n):
+    """The draft of the n-th answer of a task with a check (n from 1), beside its output: rules.r2.py"""
+    out = Path(out)
+    return out.with_name(f"{out.stem}.r{n}{out.suffix}")
+
+
+def round_drafts(out):
+    out = Path(out)
+    pattern = re.compile(re.escape(out.stem) + r"\.r(\d+)" + re.escape(out.suffix))
+    try:
+        found = [(int(m.group(1)), p) for p in out.parent.iterdir() if (m := pattern.fullmatch(p.name))]
+    except OSError:
+        return []
+    return [p for _, p in sorted(found)]
 
 
 def same_server(a, b):
@@ -2581,13 +2728,15 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     think_tokens: its thinking budget, when not think_budget(max_tokens): the room a cut answer gains goes to the
     answer, not to more thinking. The result carries the limits it ran with (max_tokens, think_tokens) and 'limit',
     the max_tokens of the request its answer came from (the recovery's, once recovered)."""
+    if effort == EFFORT_NONE:  # no thinking at all, on a server elsewhere whose plain fields think too
+        think = False
     if max_tokens is None:
         max_tokens = CFG["max_tokens_thinking"] if think else CFG["max_tokens"]
     sampling = dict(CFG["sampling"]["thinking" if think else "plain"])
     if temperature is not None:
         sampling["temperature"] = temperature
     kwargs = {"enable_thinking": bool(think)}
-    if think and effort:
+    if effort:  # a plain request's reaches a server elsewhere only (_chat_remote), over its plain fields
         kwargs["reasoning_effort"] = effort
     messages = build_messages(prompt, files, system, history, number)
     body = {"model": CFG["alias"], "messages": messages, "max_tokens": max_tokens, "chat_template_kwargs": kwargs,
@@ -2612,12 +2761,18 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
                    **({"answer_tokens": again["answer_tokens"]} if "answer_tokens" in again else {}))
         res.update(how)
 
-    lower = LOWER.get(effort or "xhigh")
-    if (where and think and lower and res["finish"] == "length" and not res["content"].strip()
-            and not res["thinking"].strip()):
+    hidden = where and res["finish"] == "length" and not res["content"].strip() and not res["thinking"].strip()
+    if hidden and think and LOWER.get(effort or "xhigh"):
         # all thinking and none of it sent (see LOWER): asked again, thinking less, with the same room
+        lower = LOWER[effort or "xhigh"]
         then(_chat({**body, "chat_template_kwargs": {**kwargs, "reasoning_effort": lower}}, server),
              lowered=(effort or "xhigh", lower))
+    elif hidden and not think:
+        # a plain request that thought its room away (EFFORT_NONE): asked again not thinking at all, the same room
+        ran = effort or EFFORT_HERE.get((where.get("plain") or {}).get("reasoning_effort"), "its default")
+        if ran != EFFORT_NONE:
+            then(_chat({**body, "chat_template_kwargs": {**kwargs, "reasoning_effort": EFFORT_NONE}}, server),
+                 lowered=(ran, EFFORT_NONE))
     if not res["content"].strip() and res["thinking"].strip() and res["finish"] != "repeat":
         # still no answer (a server that ignores the budget, or one elsewhere that thinks without being asked to):
         # the thinking goes back as text and the model concludes from it without thinking; the summary says so, to
@@ -2626,7 +2781,8 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         if len(thought) > RECOVER_CHARS:
             thought = "[... its start left out ...]\n" + thought[-RECOVER_CHARS:]
         room = max(CFG["max_tokens"], max_tokens) if where else CFG["max_tokens"]
-        then(_chat({"model": CFG["alias"], "max_tokens": room, "chat_template_kwargs": {"enable_thinking": False},
+        then(_chat({"model": CFG["alias"], "max_tokens": room,
+                    "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": EFFORT_NONE},
                     "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
                                                   + RECOVER.format(thinking=thought)}],
                     **STREAM, **CFG["sampling"]["plain"]}, server),
@@ -2680,7 +2836,8 @@ def cut_line(res):
         lowered = res.get("lowered")
         return (s + " with nothing written: all of it went to thinking"
                 + (f", even with the effort lowered {lowered[0]} -> {lowered[1]}" if lowered else "")
-                + ". More room buys more thinking: a narrower task, or less of it (--effort low, no --think)")
+                + ". More room buys more thinking: a narrower task, or less of it (--effort low, no --think; "
+                  "--effort none: not at all)")
     if res.get("think_tokens") and not res.get("recovered"):
         s += f" ({res['think_tokens']} of it a thinking budget)"
     if res.get("split"):
@@ -2721,6 +2878,10 @@ def summary(res, out):
     if res.get("escalated"):
         role, model, n = res["escalated"]
         s += f", fixes from fix {n} on by {model} as {role} (escalated)"
+    if res.get("kept"):
+        n, of, why = res["kept"]
+        s += ((f", out holds round {n}'s draft, the best of {of} ({why})" if why else "")
+              + f", each round's draft beside it ({res['drafts']})")
     if res.get("notes"):
         s += f", the text around the code kept apart in {res['notes']}"
     if res.get("blocks"):
@@ -3163,6 +3324,9 @@ def cmd_ask(args):
     note = None if brief_path else no_brief_note([t], args.brief)
     if note:
         print(note, file=sys.stderr)
+    note = whole_file_note([t])
+    if note:
+        print(note, file=sys.stderr)
     try:
         place(t, [*context, *(args.file or []), args.prompt_file, brief_path])
         if args.check:  # before any request: a check that cannot tell right from wrong stops it here
@@ -3305,6 +3469,9 @@ def cmd_batch(args):
     if args.reach and not Path(args.reach).is_file():
         raise WorkerError(f"--reach {args.reach}: no such file (the measure of what the changes can reach)")
     note = reach_note(todo, len(todo) < len(tasks) or bool(unfinished or empty), args.reach)
+    if note:
+        print(note, file=sys.stderr)
+    note = whole_file_note(todo)
     if note:
         print(note, file=sys.stderr)
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same) - len(taken)} already done, {len(todo)} to run"
@@ -3452,7 +3619,7 @@ def cmd_batch(args):
     if any(checks.values()):
         print(f"checks: {checks['pass']} passed the first time, {checks['fixed']} fixed by the worker, "
               f"{checks['fail']} still failing (their errors in <out>.check.txt, every round's in "
-              "<out>.check.N.txt)")
+              "<out>.check.N.txt; out holds the best round's draft, and each round's is beside it, <stem>.rN<suffix>)")
     if raised or split:
         print(f"cuts: {raised} answers cut by max_tokens asked for again with more (x{RAISE:g}, as far as the "
               "context holds it)" + (f"; {split} need splitting, cut even so or with no room to raise "
@@ -3832,7 +3999,9 @@ def main():
     p.add_argument("-o", "--out")
     p.add_argument("--system")
     p.add_argument("--think", action="store_true", help="let the model think first (slower, better on hard tasks)")
-    p.add_argument("--effort", choices=EFFORTS, help="with --think: how much it thinks (Qwen3.8's default: xhigh)")
+    p.add_argument("--effort", choices=(*EFFORTS, EFFORT_NONE),
+                   help="with --think: how much it thinks (Qwen3.8's default: xhigh); without it, on a server "
+                        "elsewhere, over its plain fields; none: not at all")
     p.add_argument("--max-tokens", type=int)
     p.add_argument("--temperature", type=float)
     p.add_argument("--print", action="store_true", help="also print the answer when writing -o")
