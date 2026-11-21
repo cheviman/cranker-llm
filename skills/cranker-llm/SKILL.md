@@ -89,7 +89,13 @@ asked, with the room of the request (not 4,096) and the end of the reasoning; an
 with none of it sent (deepseek at high effort sends it in one block at the end) is asked again once thinking one
 effort less (`effort lowered xhigh -> medium` in its line), never with more `--max-tokens`, which buys more thinking.
 `cut by max_tokens N with nothing written: all of it went to thinking` means even that failed: a narrower task, or
-`--effort low`, not a bigger limit.
+`--effort low`, not a bigger limit. A plain request there (no `--think`) thinks too when its `plain` fields say so
+(21-11-2026: a 26-issue map came back empty three times, `--effort low` included, which did not reach the server
+then): `--effort` now reaches it, `--effort none` is no thinking at all, a plain answer that was all thinking is asked
+again once with `none` (`effort lowered medium -> none`), and a recovery there asks for `none`. Measured on that
+map: `--effort low` 80 s, 13,860 tokens out (12,000 of them thinking, then recovered), 26 rows, the dependencies
+right; `--effort none` 9 s, 1,644 out, 26 rows, but every issue mentioned listed as a dependency, not only those
+needed first. `none` for a map that copies what is there; `low` with room for one that judges.
 
 **2. `batch`: many tasks in parallel** (8 slots: ~118 tok/s in all on a 3090, against ~30 for one request). One JSON
 object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?, "check"?,
@@ -196,7 +202,10 @@ that, and both go with every task that writes something:
   could have changed: a draft test's cleanup once deleted the project's `main.c`, and every later round failed on the
   missing file instead of on its own errors. Every round that fails keeps its check's output in
   `<out>.check.N.txt` (N from 1), not only the last: an early round may show a fault of the machine the later ones
-  hide. An answer that is one fenced block and nothing else (`` ```c ... ``` ``) is written without its fence, so a
+  hide. Its draft stays beside it too (`<stem>.rN<suffix>`), and a task that ends failing leaves in `out` **the best
+  round, not the last** (something over empty, whole over cut, the higher `score: N`, the fewest error lines); its
+  line says `out holds round 2's draft, the best of 3 (...)` (21-11-2026: an empty third round was written over a
+  near-miss). Start from that draft; the others are beside it. An answer that is one fenced block and nothing else (`` ```c ... ``` ``) is written without its fence, so a
   check doesn't need to strip it. For a code file (any `out` but a document: `.md`, `.txt`, `.rst`, `.log`, none;
   `CMakeLists.txt` and `Makefile` are code), an answer with exactly one fenced block and text before or after it has
   the block written to `out` and the text to `<out>.notes.md`; its line ends `the text around the code kept apart
@@ -332,6 +341,12 @@ worker for its draft): how much of the measure each kind of change can reach, an
 what is reachable, narrowest first. A batch that runs 8 or more tasks that write changes for the first time says
 `wide batch of changes: ...` on stderr; `--reach FILE` (that measure) says it was done, and the batch names it in its
 first line.
+
+**Never a whole large file in one task.** On 21-11-2026 (saturn-fullset #119) `main.c` asked for whole came back
+empty after ~40K tokens of reasoning and `layer2d.py` cut at line 957, while every narrow task (one function, one part
+of a file) was right at the first try. A task whose `out` is a code file and whose own files hold that file whole,
+400 lines or more, prints `whole-file drafts: ...` on stderr before sending: split it, one task per function or part
+(`-f FILE::name`), each with its own `out`, then put them together; or ask for a patch of the part that changes.
 
 **Consumed is not effective.** Everything the worker reads and writes is consumed and counts as that, every run of
 it. Effective is another yardstick: the work that was right by the first or second try. A run that gave nothing

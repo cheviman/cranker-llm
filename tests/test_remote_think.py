@@ -76,5 +76,58 @@ class RemoteThinking(unittest.TestCase):
         self.assertIn("START", (h.work / "a.md.thinking.md").read_text(encoding="utf-8"))  # kept whole beside it
 
 
+class PlainThinking(RemoteThinking):
+    """1.8.0's: a plain ask that the remote's plain fields made think (21-11-2026: a map of 26 issues came back empty
+    three times, max_tokens 6000, 16000 and 12000 with --effort low, all of it thinking and none of it sent)"""
+
+    def test_effort_reaches_a_plain_request_there_over_its_plain_fields(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "--effort", "low", "-o", "a.md", "-p", "[[say:the map]]",
+                                **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([r["reasoning_effort"] for r in h.requests(h.away)], ["low"])
+
+    def test_a_plain_answer_that_was_all_thinking_is_asked_again_not_thinking(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "--max-tokens", "6000", "-o", "map.md",
+                                "-p", "[[hidden-think:medium]][[say:the map]]", **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual((h.work / "map.md").read_text(encoding="utf-8"), "the map")
+        sent = h.requests(h.away)
+        self.assertEqual([r["reasoning_effort"] for r in sent], ["medium", "none"])
+        self.assertEqual([r["max_tokens"] for r in sent], [6000, 6000])
+        self.assertIn("effort lowered medium -> none", out)
+        self.assertEqual(h.log("usage.jsonl")[-1]["lowered"], "none")
+
+    def test_so_is_one_with_effort_low(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "--max-tokens", "12000", "--effort", "low", "-o", "map.md",
+                                "-p", "[[hidden-think:low,medium]][[say:the map]]", **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([r["reasoning_effort"] for r in h.requests(h.away)], ["low", "none"])
+        self.assertIn("effort lowered low -> none", out)
+
+    def test_effort_none_does_not_think_at_all(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "--think", "--effort", "none", "-o", "a.md",
+                                "-p", "[[hidden-think:medium,high]][[say:the map]]", **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([r["reasoning_effort"] for r in h.requests(h.away)], ["none"])
+
+    def test_its_recovery_there_does_not_think(self):
+        h = self.home()
+        rc, out, err = h.worker("ask", "--remote", "--max-tokens", "4096", "-o", "a.md",
+                                "-p", "[[think-text:it is 42]]", **self.KEY)
+        self.assertEqual(rc, 0, out + err)
+        first, again = h.requests(h.away)
+        self.assertEqual((first["reasoning_effort"], again["reasoning_effort"]), ("medium", "none"))
+
+    def test_a_plain_request_here_gets_no_effort(self):
+        h = Home(self)
+        rc, out, err = h.worker("ask", "--effort", "low", "-o", "a.md", "-p", "[[say:ok]]")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(h.requests()[-1]["chat_template_kwargs"], {"enable_thinking": False})
+
+
 if __name__ == "__main__":
     unittest.main()

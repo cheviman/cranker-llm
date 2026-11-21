@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.7.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.8.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -186,7 +186,14 @@ py scripts/worker.py batch fixes.jsonl --check "py build_chunk.py {out}" --promp
 Each output ends one of three ways: `check passed`, `check passed after N fixes by the worker`, or `CHECK FAILED`
 with the last errors in `<out>.check.txt`, left for Claude, and every failed round's in `<out>.check.N.txt` (only
 the last was kept once, and the first failure of a run, an MSYS2 cmake on the `PATH`, was lost with it); an output
-that passes in the end leaves none of them. `usage` adds them up by project (first time / by the
+that passes in the end leaves none of them. **Every round's draft is kept too**, beside the output
+(`<stem>.rN<suffix>`: `rules.r2.py`), and a task that ends failing leaves in `out` the best of its rounds, not the
+last: one with something in it over an empty one, a whole one over one cut or looping, then the check's `score: N`
+(as variants read it), then the fewest lines of the check's output that say error or fail, and on a tie the later
+round; its fixes start from that one too. On 21-11-2026 a batch drafting saturn-fullset's `rules.py` had a second
+round that was almost right (it failed on two faults outside the draft) and a third that came back empty and was
+written over it. The line says `out holds round 2's draft, the best of 3 (the last came back empty)`, and the
+`.check.txt` holds that round's errors. `usage` adds them up by project (first time / by the
 worker / for Claude). In a `batch`, `--check`, `--check-null`, `--check-good`, `--check-bad`, `--retries`, `--context`,
 `--system-file` and `--prompt-prefix` apply to every task that doesn't set its own, so the shared rules are written
 once and not in every line.
@@ -308,6 +315,14 @@ tasks that write changes (a code output, or a prompt that asks for a patch, a di
 on stderr, `wide batch of changes: ...`; `--reach FILE`, the measure, says it was done, and the batch's first line
 names it.
 
+**A whole large file is asked for in parts.** On 21-11-2026 (saturn-fullset #119) `main.c` asked for whole came back
+empty after ~40,000 tokens of reasoning and `layer2d.py` asked for whole came back cut at line 957, while the narrow
+tasks of the same issue (one function, one part of a file) were right at the first try. A task whose output is a
+code file and one of whose own files is that file whole (the same name, or the same stem with a mark:
+`layer2d.new.py`) of 400 lines or more says so on stderr before anything is sent, `whole-file drafts: ...`, with
+its size against `max_tokens` and the split to make: one task per function or part (`-f FILE::name`), each with
+its own output, or a patch of the part that changes.
+
 ### What to hand it, and what not
 
 | Hand it | Measured (Qwen3.8-27B Q4_K_XL, RTX 3090) |
@@ -356,6 +371,16 @@ and the brief; a link inside a listed folder that points out of it counts as whe
   was all thinking with none of it sent is asked for again once with one effort less (`effort lowered xhigh ->
   medium` in its line), never with more room; and if that is all thinking too, its line says `with nothing written:
   all of it went to thinking` and what to change.
+- **A plain request thinks there too.** On 21-11-2026 a map of 26 issues (15,086 tokens in) came back empty from
+  deepseek three times, with `--max-tokens` 6000, 16000 and 12000 `--effort low`: all of it thinking, none sent.
+  `--effort` reached the server only with `--think`, the `plain` fields (`reasoning_effort: medium`) made it think
+  anyway, the lowering was for `--think` requests only, and a recovery (also plain) thought its room away as well.
+  Now `--effort` reaches a plain request there, over its `plain` fields; `--effort none` is no thinking at all
+  (deepseek sends none); a plain answer that was all thinking with none of it sent is asked for again once with
+  `none` and the same room (`effort lowered medium -> none`); and a recovery there asks for `none`. The same map
+  again with 1.8.0: `--effort low`, 12,000 tokens of thinking and then recovered, 80 s, 26 rows of 26 with the
+  dependencies right; `--effort none`, 9 s and 1,644 tokens out, 26 rows, but every issue mentioned listed as a
+  dependency instead of only those needed first. `none` suits a map that copies; one that judges wants `low`.
 - **Its limits** take the place of the shared context: a batch sends `parallel` requests at once (2), and a
   request the server limits (HTTP 429) waits as long as its `Retry-After` says, up to `wait` seconds (300), and
   then ends as `not run`.
@@ -733,7 +758,7 @@ py -m unittest discover -s tests
 
 `tests/fake_llama.py` takes llama-server's command line and answers its endpoints with no model and no GPU; what it
 answers is scripted in the prompt (`[[say:...]]`, `[[say-file:...]]`, `[[loop:...]]`, `[[cut]]`, `[[sleep:3]]`,
-`[[fail:500:...]]`, `[[hidden-think:high]]`, `[[think-text:...]]`), streamed a word an event when the request asks
+`[[fail:500:...]]`, `[[hidden-think:high]]`, `[[think-text:...]]`, `[[rounds:A||B||C]]`), streamed a word an event when the request asks
 for it. `tests/fixtures/` keeps real answers
 that went wrong, so a test runs the worker on exactly what the model sent. The tests run the
 real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
@@ -756,7 +781,8 @@ setup's download against a server that drops the connection. A couple of minutes
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
-| `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first; 1.7.0's `test_check_bad.py`, `test_named.py`, `test_resume.py`, `test_variants.py`, `test_remote_think.py`, `test_reach.py`), and the stand-in for llama-server they run against |
+| `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first; 1.7.0's `test_check_bad.py`, `test_named.py`, `test_resume.py`, `test_variants.py`, `test_remote_think.py`, `test_reach.py`; 1.8.0's `test_best_round.py`, and more in
+`test_remote_think.py` and `test_reach.py`), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `local`, `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
