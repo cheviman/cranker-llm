@@ -82,14 +82,35 @@ thinking; the summary then says **`RECOVERED ... (check it)`**, and that answer 
 than its default `xhigh`. Maps, summaries and searches: no `--think`. If it must think: `--max-tokens 20000
 --keep-thinking`, and expect 10-15 minutes.
 
+A **server elsewhere** takes no thinking budget, so nothing closes its thinking before `--max-tokens`, and its
+`plain` fields may think too (`reasoning_effort: medium`). On 20-11-2026 three OutRunners tasks came back empty
+after 64,000 to 200,000 tokens of it. Now: an empty answer with thinking is recovered whether or not `--think` was
+asked, with the room of the request (not 4,096) and the end of the reasoning; and an answer that was all thinking
+with none of it sent (deepseek at high effort sends it in one block at the end) is asked again once thinking one
+effort less (`effort lowered xhigh -> medium` in its line), never with more `--max-tokens`, which buys more thinking.
+`cut by max_tokens N with nothing written: all of it went to thinking` means even that failed: a narrower task, or
+`--effort low`, not a bigger limit.
+
 **2. `batch`: many tasks in parallel** (8 slots: ~118 tok/s in all on a 3090, against ~30 for one request). One JSON
 object per line: `{"id", "prompt", "files": [...], "out", "max_tokens"?, "think"?, "system"?, "check"?,
-"check_null"?, "check_good"?, "retries"?, "number"?, "context"?: [...]}`. Tasks whose `out`
-exists are skipped, so a batch can be stopped and resumed; `--force` redoes them. A task that left its `out` cut or
-failing its check is not done: change its line (more `max_tokens`, `think`, a narrower prompt) and run the same
-batch again, and only the changed ones run; unchanged, they are skipped and listed, so running the batch again
-after a `not run` burns nothing. The file is checked before any task runs, and an `out` is never one of the task's
-own `files`: write beside the source and move it over once it is checked.
+"check_null"?, "check_good"?, "check_bad"?, "retries"?, "number"?, "context"?: [...], "variants"?: [...]}`. Tasks
+whose `out` exists are skipped, so a batch can be stopped and resumed; `--force` redoes them. A task that left its
+`out` cut or failing its check is not done: change its line (more `max_tokens`, `think`, a narrower prompt) and run
+the same batch again, and only the changed ones run; unchanged, they are skipped and listed, so running the batch
+again after a `not run` burns nothing. **A stopped batch is safe to run again**: every file is written whole or not
+at all, and each task's `out` carries `<out>.running.json` until the task has ended and been recorded, so the next
+run redoes (and lists) what a stopped one left half done, and an empty `out` with no failure mark; one that another
+batch still running holds is left to it. The file is checked before any task runs, and an `out` is never one of the
+task's own `files`: write beside the source and move it over once it is checked.
+
+**`"variants"`**, instead of sending a task three times and picking the best by hand: `"variants": [{"role":
+"draft"}, {"role": "review", "effort": "medium"}]` runs the task once per variant, side by side (each changes only
+`prompt`, `system`, `role`, `effort`, `think`, `max_tokens`, `temperature`, `escalate`, `retries`), each into
+`<out stem>.vN<suffix>` with its own fixes, and writes to `out` the one that passed its check with the best score:
+the check's last line `score: N` (higher is better; print the measure negated when lower is), or the first that
+passed when none prints one. It needs a check. The line names the one kept and how each ended. In `usage` the task
+is one piece of work: the kept variant's runs are its tries, and the others are consumed, not effective (`were
+variants not kept`): variants are for a task worth paying for several times, not a way to raise the scale.
 ```
 py W batch tasks.jsonl
 ```
@@ -191,6 +212,15 @@ that, and both go with every task that writes something:
   empty answer can be right. The probes run on `<stem>.cranker-probe<suffix>` beside the `out` (deleted after), so
   a check that counts its runs or logs what it saw sees them too. A check with no `{out}` in it can't be tried on a
   copy and is refused too: put `{out}` in it, or run it untried with `--check-null none`.
+- **A known-bad output is tried too**: `--check-bad FILE` (repeatable; `"check_bad"`, a file or a list), which the
+  check must fail. Failing the null is not enough: on 20/21-11-2026 three OutRunners checks failed it and still
+  passed wrong work (one compared folders that differed, the output lacked `src/sound`; one compiled with `gcc -w`,
+  which hides a pointer put in an integer; one measured and compiled a patch that then broke the game). Keep the
+  output that got through, and pass it as a bad one from then on. **A check of changes runs the result**: a test or
+  a scenario of the program, on the patched copy (its own `sys.path`, the same folders on both sides, warnings that
+  matter as errors), not only "it applies, compiles and measures". OutRunners' `build/p2r4/check_group.py` is the
+  model: it applies the blocks to a copy, decompiles, measures, compiles with pointer/integer errors on, and runs a
+  scenario under a lock.
 - **What all the tasks share is written once**: `batch --prompt-prefix rules.txt` or `--system-file`,
   `--context` (the files, next section), and `--check` (with `--check-null`/`--check-good`) for all of them; a
   line's own value wins. The line then holds only what is its own.
@@ -209,11 +239,16 @@ model was not the cause: the format was in the parser, the instruction addresses
 in earlier rounds, and none of it was in the request. So before a batch of design or change tasks (more than a
 handful, or any that writes code or a plan to apply), build a **context pack**, a folder that goes to every task
 with `--context DIR` (or `"context": [...]` in a line; files, `file:a-b` ranges and folders, which give their files
-in name order):
+in name order). **Ranges of code by name, not by line**: `file.py::name`, `file.py::Class.method`, `file.c::name`
+(C/C++ functions, `struct`/`enum` blocks, `Foo::bar`) or `file.py::first..last` (from one to the end of the other)
+are found when each request is put together, with the comments right above them; a `file:a-b` written at the start
+was stale by the next step on 21-11-2026 (the step before had added lines) and left out the very function that step
+was about. A name that is not in the file stops the run before anything is sent, with the names close to it. The
+same works in `-f` and a line's `"files"`:
 
-1. **The formats, from the code that reads them**: the parser's line range (in OutRunners,
-   `tools/core/disassemble.py:232-548`, its `load_names`), never a format retyped from memory in the prompt. What
-   the reader accepts is the format.
+1. **The formats, from the code that reads them**: the parser by name (in OutRunners,
+   `tools/core/disassemble.py::load_names`), never a format retyped from memory in the prompt. What the reader
+   accepts is the format.
 2. **The mechanisms the change goes through, with their code ranges**: how the core types a pointer, where a
    local is declared, what decides a register. The task may then say what the core lacks, with the line.
 3. **2 to 4 solved cases, each with its before and after** (a diff of an earlier round, or the two versions):
@@ -265,6 +300,9 @@ the pool overflows, the server does not refuse the new request: it fails **every
 - Small things Claude does itself: a file under ~300 lines, a grep, a short diff cost less to read than to send.
 - **What the worker answers is a draft, not a finding**: every file:line and every fact used is checked in the code
   before telling the user or touching the repo.
+- **One session per round.** A long session costs more on every turn (all it holds is read again), and by the third
+  hour of the OutRunners session of 20/21-11-2026 each turn carried hours of logs. When a round is done (its results
+  checked, its notes written to a file), the next round starts in a new session from those notes.
 
 ## When a task fails or comes back wrong
 
@@ -281,6 +319,19 @@ is how a session ends with Claude doing everything and the scale at zero. In thi
    silence, and don't wait an hour for it: a run that makes no progress is stopped and looked at.
 4. **One failure is that task with those parameters.** Don't conclude, tell the user or write to memory that "the
    worker can't do X" from one run: say what was tried, with what, and what was not tried.
+5. **When a careful try changes nothing, debug: that is Claude's.** A rule Claude gives the worker ("type it as a
+   pointer and the use goes away") is a hypothesis until it is seen working. If a well-specified task, or a variant
+   with more thinking, moves nothing, the cause is not in the prompt: find it by running the code on one case,
+   printing what it does, reading where it decides. Sending more tasks on the same hypothesis spends the batch
+   again; in OutRunners three batches went that way before a five-minute script showed what could not move.
+
+**Before a batch of changes, measure the reach.** On 20/21-11-2026 three batches of designs and patches (25, 14 and
+14 tasks) went out against a measure that was mostly out of reach; a script over the artifact that counted what each
+change could move said so afterwards, in five minutes. Before a wide batch of changes, write that script (or ask the
+worker for its draft): how much of the measure each kind of change can reach, and what none can. Send tasks only for
+what is reachable, narrowest first. A batch that runs 8 or more tasks that write changes for the first time says
+`wide batch of changes: ...` on stderr; `--reach FILE` (that measure) says it was done, and the batch names it in its
+first line.
 
 **Consumed is not effective.** Everything the worker reads and writes is consumed and counts as that, every run of
 it. Effective is another yardstick: the work that was right by the first or second try. A run that gave nothing
@@ -339,7 +390,10 @@ counts by project. Tests and benchmarks go with `CRANKER_USAGE_TAG=bench` so the
 - `server not running`: `py W start`. If it does not start: `logs/server.stdout.log` in the config's home.
 - `cut by max_tokens N`: raise `--max-tokens`, or ask it to think less. With a check, the worker already asked for
   it again with 1.5 times the room; `needs splitting` means even that was cut: fewer files or functions per task,
-  or line ranges, not a bigger limit.
+  or line ranges, not a bigger limit. `... with nothing written: all of it went to thinking` (a server elsewhere):
+  not more room, less thinking (`--effort low`, no `--think`) or a narrower task.
+- `the check took more than N s, and was stopped`: the check (and every process it started) ran past
+  `check_timeout`; a check that hangs is a fault of the check, or of the output it runs (an endless loop).
 - `REPEATING: the answer went round in a loop (...)` (`LOOP` in a batch): the worker reads every answer as it is
   written (local and `--remote`), and one that writes the same lines over and over, numbers aside (`file:N: fine.`
   for every N), or the same passages word for word, is stopped there, as not effective, and a check does not hand it

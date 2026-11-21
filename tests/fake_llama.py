@@ -13,6 +13,11 @@ What a chat request gets back is scripted in its first user message:
     [[empty-think]]    with thinking on: all thinking and no answer; with it off: the answer "recovered"
     [[busy:N]]         HTTP 429 with Retry-After: 0 the first N times this prompt is asked, as a hosted server does
     [[die]]            the server exits without answering
+    [[hidden-think:E]] a server elsewhere asked with a reasoning_effort in E (a comma list): all thinking, none of
+                       it sent, cut at max_tokens (deepseek at high effort sends its thinking in one block at the end)
+    [[think-text:T]]   all thinking, T, and no answer, cut at max_tokens; a recovery request (the thinking handed
+                       back) gets the answer instead
+    [[recover-room:N]] a recovery request with max_tokens under N thinks all of it away: no answer, cut
 
 A token is a word. A chat request with "stream": true is answered as llama-server and OpenAI do, as server-sent
 events: a word an event, the counts in the last one. --load S answers /health with 503 for the first S seconds, as
@@ -80,7 +85,7 @@ def main():
             self.end_headers()
             self.wfile.write(body)
 
-        def stream(self, words, thoughts, finish, n_prompt):
+        def stream(self, words, thoughts, finish, n_prompt, usage=None):
             """The answer as server-sent events, a word an event, until its end or until the client leaves"""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -100,7 +105,8 @@ def main():
                     event({"choices": [{"index": 0, "delta": {"content": word}, "finish_reason": None}]})
                     sent += 1
                 event({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
-                event({"choices": [], "usage": {"prompt_tokens": n_prompt, "completion_tokens": sent + len(thoughts)},
+                event({"choices": [], "usage": usage or {"prompt_tokens": n_prompt,
+                                                         "completion_tokens": sent + len(thoughts)},
                        "timings": {"prompt_per_second": 1000.0, "predicted_per_second": 30.0}})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -183,12 +189,25 @@ def main():
                 if "empty-think" in said:
                     answer, reasoning = ("", "half a thought") if thinking else ("recovered", "")
                 finish = "length" if "cut" in said else "stop"
+                usage = None
+                recovery = "CUT OFF BEFORE YOU ANSWERED" in text_of(messages[-1].get("content")) if messages else False
+                all_of_it = {"prompt_tokens": n_prompt, "completion_tokens": body.get("max_tokens") or 4096,
+                             "completion_tokens_details": {"reasoning_tokens": body.get("max_tokens") or 4096}}
+                if "hidden-think" in said and body.get("reasoning_effort") in said["hidden-think"].split(","):
+                    answer, reasoning, finish, usage = "", "", "length", all_of_it
+                if "think-text" in said:
+                    if not recovery:
+                        answer, reasoning, finish = "", said["think-text"], "length"
+                    elif (body.get("max_tokens") or 0) < int(said.get("recover-room") or 0):
+                        answer, reasoning, finish, usage = "", "", "length", all_of_it
+                    else:
+                        answer = "recovered"
                 if body.get("stream") and path == "/v1/chat/completions":
                     if "loop" in said:
                         words, finish = looping(said["loop"], body.get("max_tokens") or 4096), "length"
                     else:
                         words = re.findall(r"\s*\S+\s*", answer)
-                    return self.stream(words, re.findall(r"\S+\s*", reasoning), finish, n_prompt)
+                    return self.stream(words, re.findall(r"\S+\s*", reasoning), finish, n_prompt, usage)
                 n_out = len((answer + " " + reasoning).split())
                 if path == "/v1/messages":
                     return self.send_json({

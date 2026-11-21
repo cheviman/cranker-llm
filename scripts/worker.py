@@ -1,32 +1,41 @@
 """cranker-llm: a llama.cpp server on this machine that Claude Code hands volume work to.
 
     worker.py start | stop | status | config
-    worker.py ask -p "instruction" [-f file[:a-b] ...] [--context file|folder ...] [--number] [-o out] [--think]
-                  [--print] [--check CMD [--check-null F|none] [--check-good F]] [--brief FILE] [--remote | --local]
-    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD [--check-null F|none] [--check-good F]]
-                  [--context file|folder ...] [--system-file F] [--prompt-prefix F] [--number] [--remote | --local]
+    worker.py ask -p "instruction" [-f file[:a-b|::name|::a..b] ...] [--context file|folder ...] [--number]
+                  [-o out] [--think] [--print] [--check CMD [--check-null F|none] [--check-good F] [--check-bad F]]
+                  [--brief FILE] [--remote | --local]
+    worker.py batch tasks.jsonl [--jobs N] [--force] [--check CMD [--check-null F|none] [--check-good F]
+                  [--check-bad F]] [--context file|folder ...] [--system-file F] [--prompt-prefix F] [--number]
+                  [--reach F] [--remote | --local]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
 
 check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
 and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
 the room, once; cut again, the task needs splitting. Before any request, the check is tried: it must fail an output
-that changes nothing (--check-null, an empty one by default) and pass a known-good one (--check-good); a check that
-cannot tell them apart stops the run. brief: .cranker/brief.md in the caller's folder or above it,
+that changes nothing (--check-null, an empty one by default), fail every known-bad one (--check-bad) and pass a
+known-good one (--check-good); a check that cannot tell them apart stops the run. A check that runs past
+check_timeout is stopped with every process it started. brief: .cranker/brief.md in the caller's folder or above it,
 how the user works in that project, goes into every request's system prompt (the worker loads no CLAUDE.md); a task
 that writes code or changes without one is told so. context (--context): files every task shares (the formats, the
-mechanisms, solved cases, the data), first in every request, before the task's own files.
-out: an answer that is one fenced code block and nothing else is written without its fence (-o, a batch's "out").
+mechanisms, solved cases, the data), first in every request, before the task's own files. A file spec is a file,
+file:first-last, or a range by name found when the request is put together: file.py::name (def, class,
+Class.method, an assignment), file.c::name (a C/C++ function, Foo::bar, a struct/union/enum), file::a..b.
+out: an answer that is one fenced code block and nothing else is written without its fence (-o, a batch's "out"),
+and every file is written whole or not at all.
 
 ask: the files go to the model, not through the caller's context; the answer is written to -o and only a one-line
 summary is printed (--print also prints the answer). From Windows PowerShell 5.1 a prompt with double quotes in it is
 split into several arguments: write it to a file and pass --prompt-file. --number gives the model every line with
 its number in the file, for answers that cite lines (a map, a review); not for a rewrite.
 batch: one JSON object per line: {"id", "prompt", "files": [...], "out", "system"?, "think"?, "max_tokens"?,
-"check"?, "check_null"?, "check_good"?, "retries"?, "number"?, "context"?: [...]}.
+"check"?, "check_null"?, "check_good"?, "check_bad"?, "retries"?, "number"?, "context"?: [...], "variants"?: [...]}.
 Tasks whose "out" already exists are skipped unless --force, so a batch can resume. One that left its output cut or
-failing its check (out.failed.json beside it) runs again once its line has changed. An "out" is never one of the
-task's own files.
+failing its check (out.failed.json beside it) runs again once its line has changed; one a stopped batch left
+(out.running.json, from a process that is gone) or an empty one runs again. An "out" is never one of the task's own
+files. "variants": [{"role": ...}, {"effort": ...}] runs the task once per variant (out.v1...) and keeps the one that
+passed its check with the best "score: N" the check printed. A wide batch of changes asks whether its reach was
+measured, unless --reach FILE.
 
 Exit codes of ask, batch and agent: 0 done and right; 2 an output that is not right (cut, its check still failing,
 an agent stopped) or a task that was not run because the worker was taken (the last lines say which, and what to do);
@@ -911,6 +920,8 @@ def cmd_usage(args):
     mark_tries(every)  # over the whole log: a task sent again today is one more try of yesterday's
     recs = []
     for r in every:
+        if r.get("cmd") == "variants":  # which variant was kept: no request, only what mark_tries reads
+            continue
         if args.since and r["ts"][:10] < args.since:
             continue
         if r.get("tag") and not args.all:
@@ -993,8 +1004,7 @@ def cmd_usage(args):
 def work_id(out, files):
     """The piece of work a request is: its output and the files it is about, without their line ranges, so that the
     same file sent again in a narrower range, or with another prompt, is the same work done again"""
-    paths = sorted(os.path.normcase(os.path.abspath(m.group(1) if (m := FILE_RANGE.match(f)) else f))
-                   for f in files or [])
+    paths = sorted(os.path.normcase(os.path.abspath(spec_path(f))) for f in files or [])
     return hashlib.sha256(json.dumps([os.path.normcase(os.path.abspath(out)), paths]).encode("utf-8")).hexdigest()[:12]
 
 
@@ -1015,20 +1025,49 @@ def _wrong(r):
     return None
 
 
+NOT_KEPT = "were variants not kept"
+
+
+def piece_runs(runs):
+    """A piece of work's runs as (its tries, the runs spent beside them). Variants ("variant": k) run side by side,
+    and once one is kept (the "variants" line keep_variant writes after them, "chosen": k) only its runs are the
+    piece's tries: the others were consumed, and are not effective. With none kept, or before the line (a batch that
+    was stopped), they all count as tries. scripts/local_share.py has the same."""
+    tries, beside, pending = [], [], {}
+    for r in runs:
+        if r.get("cmd") == "variants":
+            for k, rs in sorted(pending.items()):
+                (tries if r.get("chosen") in (None, k) else beside).extend(rs)
+            pending = {}
+        elif r.get("variant"):
+            pending.setdefault(r["variant"], []).append(r)
+        else:
+            tries.append(r)
+    for k, rs in sorted(pending.items()):
+        tries.extend(rs)
+    return tries, beside
+
+
 def mark_tries(rows):
     """Two yardsticks, kept apart. Consumption: every run's tokens are spent and counted, and a task run four times
     is four runs. Quality: a piece of work (work_id: an output and its files) is effective when its output was right
     by the first or second try (tries_asked); one that took more, or was left wrong, is not, whatever it consumed.
-    Marks each run with its piece's tries and with why it is not effective (None when it is)."""
+    Marks each run with its piece's tries and with why it is not effective (None when it is); the variants not kept
+    of a task (piece_runs) with NOT_KEPT, and "_beside"."""
     most = tries_asked()
     pieces = {}
     for r in rows:
         if r.get("work"):
             pieces.setdefault(r["work"], []).append(r)
     for runs in pieces.values():
-        why = _wrong(runs[-1]) or (f"were of work that took more than {most} tries" if len(runs) > most else None)
-        for r in runs:
-            r["_tries"], r["_why"] = len(runs), why
+        tries, beside = piece_runs(runs)
+        if not tries:
+            continue
+        why = _wrong(tries[-1]) or (f"were of work that took more than {most} tries" if len(tries) > most else None)
+        for r in tries:
+            r["_tries"], r["_why"] = len(tries), why
+        for r in beside:
+            r["_tries"], r["_why"], r["_beside"] = len(tries), NOT_KEPT, True
 
 
 def not_effective(r):
@@ -1046,8 +1085,8 @@ def pieces_line(recs):
     most = tries_asked()
     pieces = {}
     for r in recs:
-        if r.get("work"):
-            pieces[r["work"]] = r  # its last run among these
+        if r.get("work") and not r.get("_beside"):
+            pieces[r["work"]] = r  # its last try among these
     if not pieces:
         return None
     first = sum(1 for r in pieces.values() if not r["_why"] and r["_tries"] == 1)
@@ -1061,7 +1100,7 @@ def pieces_line(recs):
     # a wrong output right at the first try. Counted all the same, and told apart here
     right = [r for r in pieces.values() if not r["_why"]]
     if right:
-        tried = sum(1 for r in right if r.get("check") and r.get("proof") in TRIED)
+        tried = sum(1 for r in right if r.get("check") and proof_tried(r.get("proof")))
         untried = sum(1 for r in right if r.get("check")) - tried
         line += (f". Of the {len(right)} right: {tried} passed a check tried before it ran, {untried} a check never "
                  f"tried, {len(right) - tried - untried} had no check (right because nothing sent them again)")
@@ -1099,7 +1138,7 @@ def quality_table(since=None, include_tagged=False, session=None):
         a = rows.setdefault(project_of(r), {"pass": 0, "fixed": 0, "fail": 0, "tries": 0, "tried": 0})
         a[r["result"]] += 1
         a["tries"] += r["tries"]
-        a["tried"] += r.get("proof") in TRIED
+        a["tried"] += proof_tried(r.get("proof"))
     print(f"\n{'checked tasks (the rework)':<34} {'tasks':>8} {'tried':>6} {'first time':>11} {'by worker':>10} "
           f"{'for Claude':>11} {'fixes':>6}")
     for k, a in sorted(rows.items(), key=lambda kv: -sum(kv[1][x] for x in ("pass", "fixed", "fail"))):
@@ -1156,6 +1195,20 @@ def cost_table(recs, key):
 # ----------------------------------------------------------------------------------------------------- ask, batch
 
 FILE_RANGE = re.compile(r"^(.*):(\d+)-(\d+)$")
+# file.py::name, file.py::Class.method, file.c::Foo::bar, file.py::first..last: a range by what it holds, found when
+# the request is put together. On 21-11-2026 a context range written by line numbers (file:a-b) was stale by the
+# next step, which had added lines above it, and left out the very function that step was about
+FILE_NAMED = re.compile(r"^(.+?)::(.+)$")
+
+
+def spec_path(spec):
+    """The file of a file spec: file, file:a-b, file::name"""
+    spec = str(spec)
+    if m := FILE_RANGE.match(spec):
+        return m.group(1)
+    if (m := FILE_NAMED.match(spec)) and not os.path.exists(spec):
+        return m.group(1)
+    return spec
 
 
 NUMBERED = "every line starts with its number in the file and a tab, which are not part of the file"
@@ -1166,9 +1219,13 @@ def read_file_spec(spec, number=False):
     lines by eye and gets them wrong over a few hundred; with the number there it copies it. Not for a rewrite: the
     numbers would come back in the code."""
     m = FILE_RANGE.match(spec)
-    path, a, b = (m.group(1), int(m.group(2)), int(m.group(3))) if m else (spec, None, None)
+    path, a, b = (m.group(1), int(m.group(2)), int(m.group(3))) if m else (spec_path(spec), None, None)
     text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
     label = path if a is None else f"{path} (lines {a}-{b})"
+    if path != spec and not m:  # file::name, found in the file as it is now
+        name = spec[len(path) + 2:]
+        a, b = resolve_named(path, text, name)
+        label = f"{path} ({name}, lines {a}-{b})"
     if a is not None or number:
         lines = text.splitlines()[(a or 1) - 1:b]
         if number:
@@ -1191,6 +1248,20 @@ RECOVER = ("\n\n=== YOUR REASONING ON THIS, CUT OFF BEFORE YOU ANSWERED ===\n{th
 
 def think_budget(max_tokens):
     return max(256, max_tokens - min(ANSWER_ROOM, max_tokens // 3))
+
+
+# A server elsewhere takes no thinking budget (llama.cpp's reasoning_budget_tokens is not OpenAI's, and the one
+# tried, "reasoning": {"max_tokens"}, is refused with HTTP 400), so nothing closes its thinking before max_tokens.
+# On 20-11-2026 three OutRunners tasks came back empty after 64,000 to 200,000 tokens of it, with no RECOVERED:
+# - deepseek at high effort sends its thinking in one block at the end, so a cut one sends nothing, and there was
+#   nothing to conclude from; the retry for a cut then raised max_tokens x1.5, which bought more thinking (64,000,
+#   then 96,000, all of it thinking). Such an answer is asked for again thinking one effort less (LOWER) instead;
+# - where the thinking did come, the recovery asked for its answer with max_tokens 4096 and no thinking, and the
+#   remote's "plain" fields think all the same (reasoning_effort medium): it thought the 4096 away. A recovery there
+#   has the room of the request it recovers, and the reasoning handed back is its end (RECOVER_CHARS), not 200,000
+#   tokens of it.
+LOWER = {"xhigh": "medium", "medium": "low"}
+RECOVER_CHARS = 120000  # about 30,000 tokens
 
 
 # ----- a server elsewhere (--remote): any OpenAI-compatible endpoint, for a run the caller asks to send there
@@ -1223,6 +1294,8 @@ ESCALATE_HELP = "with a check: the role its fixes go to once it failed (default:
 CHECK_NULL_HELP = ("an output that changes nothing, which the check must fail before any request is sent (default: an "
                    "empty output; 'none': not tried, when an empty answer can be right)")
 CHECK_GOOD_HELP = "a known-good output, which the check must pass before any request is sent"
+CHECK_BAD_HELP = ("a known-bad output (one that broke what the check should catch), which the check must fail before "
+                  "any request is sent; repeat it for more")
 CONTEXT_HELP = ("a file (file:a-b) or a folder of files that goes first into every request: the shared context "
                 "(formats, mechanisms, solved cases, data); repeat it for more")
 REMOTE_HELP = ("send this run to the server under \"remote\" in the config instead of the local one: the files leave "
@@ -1247,7 +1320,7 @@ def may_leave(paths, roots):
     go out too."""
     roots = [_where(p) for p in roots]
     for p in paths:
-        p = m.group(1) if (m := FILE_RANGE.match(str(p))) else p
+        p = spec_path(p)
         if not any(_where(p) == root or _where(p).startswith(root.rstrip(os.sep) + os.sep) for root in roots):
             raise NotUnderRoots(f"--remote: {p} is not under remote.roots. Files leave this machine only from the "
                                 f"folders the user listed there ({REMOTE_HOW})")
@@ -1824,6 +1897,24 @@ def no_brief_note(tasks, explicit):
             "what must not change), or pass --brief \"\" to run without one")
 
 
+# On 20/21-11-2026 three batches of designs and patches (25, 14 and 14 tasks) went out against a measure that turned
+# out to be mostly out of reach; a script that measured what was reachable on the artifact said so afterwards, in
+# five minutes. A wide batch of changes that is run for the first time is asked whether that was measured.
+REACH_WIDE = 8
+
+
+def reach_note(todo, ran_before, reach):
+    """The line a wide batch of changes gets on its first run (none of its tasks done or failed before), or None:
+    none with --reach FILE, the measure of what the changes can reach"""
+    n = sum(1 for t in todo if writes_changes(t))
+    if reach or ran_before or n < REACH_WIDE:
+        return None
+    return (f"wide batch of changes: {n} tasks that write changes, on their first run. Was what they can reach "
+            "measured first? A script over the artifact that counts what each change could move, and what no change "
+            "can (on 20-11-2026 three batches of 25, 14 and 14 went out against a measure mostly out of reach). If "
+            "it was, pass --reach FILE (that measure) and this is not said again")
+
+
 # ----- the shared context: files every task of a batch needs (formats, mechanisms, solved cases, data), given once
 
 def context_files(specs, what="--context"):
@@ -1831,9 +1922,8 @@ def context_files(specs, what="--context"):
     not hidden ones). Checked before anything runs."""
     files = []
     for spec in specs or []:
-        m = FILE_RANGE.match(spec)
-        path = Path(m.group(1) if m else spec)
-        if path.is_dir() and not m:
+        path = Path(spec_path(spec))
+        if path.is_dir() and spec_path(spec) == spec:  # a folder, not a range in one
             inside = sorted(p for p in path.iterdir() if p.is_file() and not p.name.startswith("."))
             if not inside:
                 raise WorkerError(f"{what} {spec}: no files in that folder")
@@ -1842,7 +1932,217 @@ def context_files(specs, what="--context"):
             files.append(spec)
         else:
             raise WorkerError(f"{what} {spec}: no such file or folder")
+    named_now(files, what)
     return files
+
+
+def named_now(specs, what):
+    """Ranges by name (file::name) are found when each request is put together, so a step that added lines above
+    one does not leave it stale; here they are only looked for, so a name that is not there stops the run before
+    anything is sent"""
+    for spec in specs or []:
+        path = spec_path(spec)
+        if path != spec and not FILE_RANGE.match(spec):
+            try:
+                text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+            except OSError as e:
+                raise WorkerError(f"{what} {spec}: {path} cannot be read ({e.strerror})")
+            try:
+                resolve_named(path, text, spec[len(path) + 2:])
+            except WorkerError as e:
+                raise WorkerError(f"{what} {spec}: {e}")
+
+
+def resolve_named(path, text, name):
+    """(first, last) of a range by name in a file's text (named_range), or WorkerError saying why not"""
+    try:
+        return named_range(path, text, name)
+    except ValueError as e:
+        raise WorkerError(str(e))
+
+
+# Drafted by the worker (deepseek, 21-11-2026) from a spec and a check, as two narrow tasks after the whole of it, in
+# one task, had come back three times as thinking alone; tests/test_named.py is that check.
+PYTHON_SUFFIXES = {".py", ".pyw"}
+C_SUFFIXES = {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".inl", ".ino"}
+
+
+def _comments_above(lines, first, comment):
+    """The first line of a definition moved up over the comment lines right above it (no blank line between)"""
+    while first > 1 and lines[first - 2].strip() and comment(lines[first - 2].strip()):
+        first -= 1
+    return first
+
+
+def python_defs(text):
+    """Every def, async def and class (qualname "Alpha.run", "Beta.run.inner") and module-level assignment of one
+    name, in source order: (qualname, first line, last line), the decorators and the comments right above included"""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        raise ValueError(f"not valid Python (line {e.lineno}: {e.msg})")
+    lines = text.splitlines()
+    found = []
+
+    def walk(node, stack):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                found.append((".".join(stack + [child.name]), child))
+                walk(child, stack + [child.name])
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    for child in tree.body:
+        if isinstance(child, ast.Assign) and len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
+            found.append((child.targets[0].id, child))
+        elif isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+            found.append((child.target.id, child))
+    out = []
+    for q, node in found:
+        first = min([d.lineno for d in getattr(node, "decorator_list", None) or []] + [node.lineno])
+        out.append((q, _comments_above(lines, first, lambda s: s.startswith("#")), node.end_lineno))
+    return sorted(out, key=lambda d: d[1])
+
+
+def _c_blank(text):
+    """A C/C++ text of the same length with its comments, string and char literals and preprocessor lines (with
+    their continuations) turned to spaces, newlines kept: what is left is code, so its braces can be counted"""
+    out, n, i, at_line_start = list(text), len(text), 0, True
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            at_line_start = True
+            i += 1
+        elif c in " \t\r\v\f":
+            i += 1
+        elif at_line_start and c == "#":
+            while i < n:
+                j = i
+                while j < n and text[j] != "\n":
+                    out[j] = " "
+                    j += 1
+                k = j - 1
+                while k >= i and text[k] in " \t\r\v\f":
+                    k -= 1
+                i = j + 1 if j < n else j  # the newline itself is kept
+                if not (k >= 0 and text[k] == "\\"):
+                    break
+        elif c == "/" and text[i + 1:i + 2] in ("*", "/"):
+            close = "*/" if text[i + 1] == "*" else "\n"
+            end = text.find(close, i + 2)
+            end = n if end == -1 else end + (2 if close == "*/" else 0)
+            for j in range(i, end):
+                if text[j] != "\n":
+                    out[j] = " "
+            i, at_line_start = end, False
+        elif c in "\"'":  # to its closing quote, or to the end of its line (an apostrophe that opens none)
+            out[i] = " "
+            i += 1
+            while i < n and text[i] not in (c, "\n"):
+                if text[i] == "\\":  # an escape, a backslash-newline too
+                    out[i] = " "
+                    i += 1
+                if i < n and text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n and text[i] == c:
+                out[i] = " "
+                i += 1
+            at_line_start = False
+        else:
+            i, at_line_start = i + 1, False
+    return "".join(out)
+
+
+def c_defs(text):
+    """The top-level definitions of a C or C++ text (inside namespace and extern "C" blocks too): functions (named
+    with their class, "Foo::bar") and struct, union, enum and class blocks (by tag, or by a typedef's name), in source
+    order: (name, first line, last line), the comments right above included"""
+    import bisect
+    clean = _c_blank(text)
+    lines = text.splitlines()
+    breaks = [i for i, ch in enumerate(text) if ch == "\n"]
+    line_of = lambda i: bisect.bisect_left(breaks, i) + 1  # noqa: E731
+    comment = lambda s: s.startswith(("//", "/*", "*")) or s.endswith("*/")  # noqa: E731
+    n, res, i, start = len(clean), [], 0, 0
+    while i < n:
+        c = clean[i]
+        if c in ";}":  # a statement ends, or a namespace's block
+            start = i = i + 1
+            continue
+        if c != "{":
+            i += 1
+            continue
+        header = clean[start:i]
+        if re.search(r"\bnamespace\b[\w\s:]*$", header) or re.search(r"\bextern\s*$", header):
+            start = i = i + 1  # its inside counts as top level
+            continue
+        j, depth = i, 0
+        while j < n:
+            depth += {"{": 1, "}": -1}.get(clean[j], 0)
+            if depth == 0:
+                break
+            j += 1
+        name, end = None, j
+        paren = header.find("(")
+        if paren != -1 and "=" not in header[:paren]:  # a function: name(...) ... { (default arguments allowed)
+            m = re.search(r"(~?[A-Za-z_]\w*(?:\s*::\s*~?[A-Za-z_]\w*)*)\s*$", header[:paren])
+            name = re.sub(r"\s+", "", m.group(1)) if m else None
+        else:
+            k = clean.find(";", j)
+            end = k if k != -1 else j
+            m = re.search(r"\b(struct|union|enum|class)\b\s*([A-Za-z_]\w*)?[^;]*$", header)
+            if m and "=" not in header:  # not an initializer of one (static struct foo t[] = {...};)
+                if header.split()[0] == "typedef" or m.group(2) is None:
+                    ids = re.findall(r"[A-Za-z_]\w*", clean[j + 1:end])
+                    name = ids[-1] if ids else None
+                else:
+                    name = m.group(2)
+        if name:
+            first = start + len(header) - len(header.lstrip())
+            res.append((name, _comments_above(lines, line_of(first), comment), line_of(end)))
+        start = i = end + 1
+    return res
+
+
+def named_range(path, text, name):
+    """(first, last) lines of `name` in the file `path` whose text is `text`: a qualname ("Alpha.run", "Foo::bar") or
+    its last part when only one definition has it, or "a..b", from the first line of a to the last of b. ValueError,
+    with the names close to it, when it is not there or is ambiguous."""
+    import difflib
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in PYTHON_SUFFIXES:
+        try:
+            defs = python_defs(text)
+        except ValueError as e:
+            raise ValueError(f"{path}: {e}, so {name} cannot be found in it")
+        sep = "."
+    elif suffix in C_SUFFIXES:
+        defs, sep = c_defs(text), "::"
+    else:
+        raise ValueError(f"{path}::{name}: a range by name works in Python and C/C++ files only; give "
+                         f"{path}:first-last instead")
+
+    def lookup(n):
+        found = [d for d in defs if d[0] == n] or [d for d in defs if d[0].split(sep)[-1] == n]
+        if not found:
+            close = difflib.get_close_matches(n, [d[0] for d in defs], n=5)
+            raise ValueError(f"{path}::{n}: no definition of that name in {path}"
+                             + (f" (close: {', '.join(close)})" if close else ""))
+        if len(found) > 1:
+            raise ValueError(f"{path}::{n} is ambiguous: " + ", ".join(f"{q} (line {f})" for q, f, _ in found)
+                             + "; name it whole, as Class.method")
+        return found[0][1], found[0][2]
+
+    if ".." in name:
+        a, b = name.split("..", 1)
+        (fa, _), (fb, lb) = lookup(a), lookup(b)
+        if fb < fa:
+            raise ValueError(f"{path}::{name}: {b} comes before {a} in the file")
+        return fa, lb
+    return lookup(name)
 
 
 def request_files(t):
@@ -1898,14 +2198,33 @@ def run_check(cmd, out):
     """Runs the check with {out} replaced by the output's path, in the caller's folder. (passed, its output)."""
     line = cmd.replace("{out}", str(out))
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}  # a Python check prints in UTF-8
+    # its whole tree is ended at check_timeout: subprocess.run ends only the shell, and on 21-11-2026 the check it
+    # had started (py, and the python under it) went on hanging with the pipes open, and the run waited for it
+    # without end
+    p = subprocess.Popen(line, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                         **({} if WINDOWS else {"start_new_session": True}))
     try:
-        r = subprocess.run(line, shell=True, capture_output=True, env=env, timeout=CFG["check_timeout"])
+        stdout, stderr = p.communicate(timeout=CFG["check_timeout"])
     except subprocess.TimeoutExpired:
-        return False, f"the check took more than {CFG['check_timeout']} s"
-    text = (_decode(r.stdout) + _decode(r.stderr)).strip()
+        kill_tree(p)
+        try:
+            p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        return False, f"the check took more than {CFG['check_timeout']} s, and was stopped"
+    text = (_decode(stdout) + _decode(stderr)).strip()
     if len(text) > CHECK_TAIL:
         text = "[...]\n" + text[-CHECK_TAIL:]
-    return r.returncode == 0, text or f"exit code {r.returncode}, no output"
+    return p.returncode == 0, text or f"exit code {p.returncode}, no output"
+
+
+SCORE = re.compile(r"^\s*score\s*[:=]\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$", re.I | re.M)
+
+
+def check_score(log):
+    """The score a check printed, its last line "score: N" (higher is better), or None"""
+    found = SCORE.findall(log or "")
+    return float(found[-1]) if found else None
 
 
 # A check is tried before it is trusted, as it was not on 20-11-2026: one that only applied a patch and compiled
@@ -1914,13 +2233,28 @@ def run_check(cmd, out):
 # Before any request, the check runs on an output that changes nothing (the null one: --check-null, an empty output
 # by default), which it must fail, and on a known-good one (--check-good), which it must pass. Either goes wrong and
 # nothing is sent. The proof says what it was tried with: the right work that stood on it is told apart in usage.
-PROOF_SAYS = {"empty": "fails an empty output", "null": "fails the null output",
-              "empty+good": "fails an empty output and passes the good one",
-              "null+good": "fails the null output and passes the good one",
-              "good": "passes the good output (no null output: --check-null none)",
-              "none": "not tried (--check-null none)"}
-TRIED = ("empty", "null", "empty+good", "null+good", "good")
+# The null output is not enough (20/21-11-2026, OutRunners): three checks that failed it still passed wrong work,
+# one comparing folders that differed (the output lacked src/sound), one compiling with gcc -w, which hides a pointer
+# put in an integer, and one that measured and compiled a patch that then broke the game. A wrong output that is
+# known (the one that got through) is tried as well: --check-bad, which the check must fail.
+PROOF_PARTS = {"empty": "fails an empty output", "null": "fails the null output",
+               "bad": "fails the known-bad output", "good": "passes the good one"}
 PROBE_TAIL = 1500  # chars of a weak check's output said when the run is stopped
+
+
+def proof_says(proof, bad=1):
+    """What a check's proof (try_check's: "null+bad+good", "none"...) says it was tried with, in words"""
+    if not proof or proof == "none":
+        return "not tried (--check-null none)"
+    parts = proof.split("+")
+    said = [PROOF_PARTS[p] + ("s" if p == "bad" and bad > 1 else "") for p in parts if p in PROOF_PARTS]
+    s = ", ".join(said[:-1]) + (" and " if len(said) > 1 else "") + said[-1]
+    return s + ("" if {"empty", "null"} & set(parts) else " (no null output: --check-null none)")
+
+
+def proof_tried(proof):
+    """Whether a proof says the check was tried before it ran (anything but none)"""
+    return bool(proof) and proof != "none"
 
 
 def probe_path(out, n=0):
@@ -1956,15 +2290,24 @@ def _probe_input(spec, flag):
         raise WorkerError(f"{flag} {spec} cannot be read ({e.strerror})")
 
 
-def try_check(check, out, null=None, good=None):
-    """Tries a check before any request goes out for it (see PROOF_SAYS): returns its proof, or raises WorkerError
+def bad_outputs(value):
+    """--check-bad / "check_bad": a file or a list of them, as a list"""
+    if not value:
+        return []
+    return [value] if isinstance(value, str) else [v for v in value if v]
+
+
+def try_check(check, out, null=None, good=None, bad=()):
+    """Tries a check before any request goes out for it (see PROOF_PARTS): returns its proof, or raises WorkerError
     with the check's own output when it cannot tell a right output from a wrong one. null: the output that changes
-    nothing (a file; None: an empty one; 'none' or '': not tried); good: a known-good output (a file), or None."""
+    nothing (a file; None: an empty one; 'none' or '': not tried); good: a known-good output (a file), or None; bad:
+    known-bad outputs (files), each of which it must fail."""
     skip = null is not None and null.strip().lower() in ("", "none")
+    bad = bad_outputs(bad)
     if "{out}" not in check:
         # it reads the output from its own place: trying it would mean writing over that, so it runs untried only
         # when that is said
-        if skip and not good:
+        if skip and not good and not bad:
             return "none"
         raise WorkerError("the check does not name {out}, so it cannot be tried on a copy of the output before the "
                           "run, and nothing was sent. Put {out} where it reads the output, or pass --check-null none "
@@ -1980,6 +2323,16 @@ def try_check(check, out, null=None, good=None):
                               "move, not only that it applies or compiles), or pass --check-null none if an empty "
                               f"answer can be right.\n$ {check.replace('{out}', str(p))}\n{log}")
         parts.append("empty" if null is None else "null")
+    for one in bad:
+        passed, log, p = _probe(check, out, _probe_input(one, "--check-bad"))
+        if passed:
+            raise WorkerError(f"the check passes the known-bad output {one}: it does not catch what is wrong with "
+                              "it, so nothing was sent. A check of changes has to run the result (a test, a scenario "
+                              "of the program), not only apply, measure or compile it; and it has to run the copy "
+                              f"the output made (sys.path, the folders it compares). It ran on a copy at {p}.\n"
+                              f"$ {check.replace('{out}', str(p))}\n{log}")
+    if bad:
+        parts.append("bad")
     if good:
         passed, log, p = _probe(check, out, _probe_input(good, "--check-good"))
         if not passed:
@@ -1998,13 +2351,14 @@ def try_checks(tasks):
     for t in tasks:
         if t.get("check"):
             where = os.path.normcase(os.path.abspath(Path(t["out"]).parent))
-            keys.setdefault((t["check"], t.get("check_null"), t.get("check_good"), where), []).append(t)
+            bad = tuple(bad_outputs(t.get("check_bad")))
+            keys.setdefault((t["check"], t.get("check_null"), t.get("check_good"), bad, where), []).append(t)
     if not keys:
         return {}
 
     def one(key):
-        check, null, good, _ = key
-        return try_check(check, keys[key][0]["out"], null, good)
+        check, null, good, bad, _ = key
+        return try_check(check, keys[key][0]["out"], null, good, bad)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(keys))) as ex:
         futs = {key: ex.submit(one, key) for key in keys}
@@ -2068,8 +2422,10 @@ def run_checked(t, cmd, keep_thinking, brief):
     args = dict(files=request_files(t), system=with_brief(t.get("system") or CFG["system"], brief),
                 think=t.get("think", False), max_tokens=t.get("max_tokens"), temperature=t.get("temperature"),
                 cmd=cmd, effort=t.get("effort"), number=bool(t.get("number")), log=False, server=t.get("_server"))
-    work = work_id(out, t.get("files"))  # its own files: the shared context is not what the work is about
+    # its own files: the shared context is not what the work is about. A variant is its task's work (_work_out)
+    work = work_id(t.get("_work_out") or out, t.get("files"))
     proof = t.get("_proof")
+    variant = t.get("_variant")
 
     def logged(res, **how):
         """The request's line in usage.jsonl, written once its check has run: it says which piece of work it was
@@ -2077,6 +2433,8 @@ def run_checked(t, cmd, keep_thinking, brief):
         its check was tried with (proof)"""
         if how.get("check") and proof:
             how["proof"] = proof
+        if variant:
+            how["variant"] = variant
         log_usage(**res.pop("usage"), dest=str(out.resolve()), work=work, **how)  # "out" is the tokens written
 
     res = run_task(t["prompt"], **args)
@@ -2097,6 +2455,8 @@ def run_checked(t, cmd, keep_thinking, brief):
     totals = {k: res[k] for k in ("prompt_tokens", "completion_tokens", "seconds")}
     previous = None
     step, history = dict(args), None  # how the last answer was asked for: a cut one is asked for again the same way
+    if res.get("lowered"):  # its effort was lowered after an answer that was all thinking: its fixes keep that
+        step["effort"] = res["lowered"][1]
     raised = split = escalated = None
     escalate, after = t.get("_escalate"), int((CFG.get("remote") or {}).get("escalate_after") or 1)
     while True:
@@ -2105,11 +2465,13 @@ def run_checked(t, cmd, keep_thinking, brief):
         looped = res["finish"] == "repeat"
         logged(res, check="pass" if passed else "fail")  # the check's own word: a cut answer's line says "cut" too
         if not passed or cut or looped:  # every round that failed keeps its output, not only the last one
-            round_log(out, tries + 1).write_text(f"$ {check}\n{log}\n", encoding="utf-8")
+            write_atomic(round_log(out, tries + 1), f"$ {check}\n{log}\n")
         # a loop is not fixed by handing it back (its tokens as the fix's history), nor by more room
         if looped or (passed and not cut) or tries >= retries:
             break
         if cut:
+            if res.get("all_thinking") and res.get("remote"):
+                break  # more room would buy more thinking (see LOWER): cut_line says what to change instead
             if raised:
                 split = f"after raising it from {raised[0]} for a first cut"
                 break
@@ -2148,13 +2510,15 @@ def run_checked(t, cmd, keep_thinking, brief):
                         "think_tokens": budget}
         tries += 1
         res = run_task(t["prompt"], **step, history=history, attempt=tries)
+        if res.get("lowered"):
+            step = {**step, "effort": res["lowered"][1]}
         for k in totals:
             totals[k] += res[k]
         write_out(out, res, keep_thinking, answer=tries + 1)
     res.update(totals)
     cut = res["finish"] == "length"
     res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
-    res.update(tries=tries, raised=raised, split=split, escalated=escalated, **own)
+    res.update(tries=tries, raised=raised, split=split, escalated=escalated, score=check_score(log), **own)
     rounds = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
@@ -2166,7 +2530,9 @@ def run_checked(t, cmd, keep_thinking, brief):
                 else "")
         more = (f"\nthe check's output of every round: {', '.join(p.name for p in rounds)}\n" if len(rounds) > 1
                 else "")
-        note.write_text((head + "\n" if head else "") + f"$ {check}\n{log}\n" + more, encoding="utf-8")
+        write_atomic(note, (head + "\n" if head else "") + f"$ {check}\n{log}\n" + more)
+    if variant:  # its task's line is written once a variant is kept (keep_variant)
+        return res
     log_quality(t.get("id"), out, check, res["check"], tries,
                 **({"cut": res["limit"]} if cut else {}), **({"raised": list(raised)} if raised else {}),
                 **({"split": True} if split else {}), **({"repeat": True} if looped else {}),
@@ -2235,21 +2601,38 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens,
                remote=where["host"] if where else None, model=where["model"] if where else None,
                role=where.get("role") if where else None)
-    if think and not res["content"].strip() and res["thinking"]:
-        # still no answer (a server that ignores the budget): the thinking goes back as text and the model concludes
-        # from it without thinking; the summary says so, to be checked
-        again = _chat({"model": CFG["alias"], "max_tokens": CFG["max_tokens"],
-                       "chat_template_kwargs": {"enable_thinking": False},
-                       "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
-                                                     + RECOVER.format(thinking=res["thinking"])}],
-                       **STREAM, **CFG["sampling"]["plain"]}, server)
+
+    def then(again, **how):
+        """The answer of a second request in the first one's place, the tokens and time of both counted"""
         again.pop("where", None)
-        res.update(content=again["content"], finish=again["finish"], repeat=again.get("repeat"), recovered=True,
-                   limit=CFG["max_tokens"],
-                   prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
+        res.update(content=again["content"], thinking=again["thinking"] or res["thinking"], finish=again["finish"],
+                   repeat=again.get("repeat"), prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
                    seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"],
                    **({"answer_tokens": again["answer_tokens"]} if "answer_tokens" in again else {}))
+        res.update(how)
+
+    lower = LOWER.get(effort or "xhigh")
+    if (where and think and lower and res["finish"] == "length" and not res["content"].strip()
+            and not res["thinking"].strip()):
+        # all thinking and none of it sent (see LOWER): asked again, thinking less, with the same room
+        then(_chat({**body, "chat_template_kwargs": {**kwargs, "reasoning_effort": lower}}, server),
+             lowered=(effort or "xhigh", lower))
+    if not res["content"].strip() and res["thinking"].strip() and res["finish"] != "repeat":
+        # still no answer (a server that ignores the budget, or one elsewhere that thinks without being asked to):
+        # the thinking goes back as text and the model concludes from it without thinking; the summary says so, to
+        # be checked. Elsewhere "without thinking" may still think (its "plain" fields), so it has the room it had
+        thought = res["thinking"]
+        if len(thought) > RECOVER_CHARS:
+            thought = "[... its start left out ...]\n" + thought[-RECOVER_CHARS:]
+        room = max(CFG["max_tokens"], max_tokens) if where else CFG["max_tokens"]
+        then(_chat({"model": CFG["alias"], "max_tokens": room, "chat_template_kwargs": {"enable_thinking": False},
+                    "messages": [*messages[:-1], {"role": "user", "content": messages[-1]["content"]
+                                                  + RECOVER.format(thinking=thought)}],
+                    **STREAM, **CFG["sampling"]["plain"]}, server),
+             recovered=True, limit=room, thinking=res["thinking"])  # the thinking it was concluded from
+    # cut with nothing written: all of it went to thinking (cut_line says so; run_checked does not raise its room)
+    res["all_thinking"] = res["finish"] == "length" and not res["content"].strip()
     if "answer_tokens" in res:  # a server elsewhere: counted by _chat_remote
         answer = res.pop("answer_tokens")
     else:
@@ -2259,6 +2642,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
                         seconds=res["seconds"], files=len(files), where=where,
                         **({"recovered": True} if res.get("recovered") else {}),
+                        **({"lowered": res["lowered"][1]} if res.get("lowered") else {}),
                         **({"attempt": attempt} if attempt else {}),
                         **({"cut": res["limit"]} if res["finish"] == "length" else
                            {"cut": True, "repeat": True} if res["finish"] == "repeat" else
@@ -2292,6 +2676,11 @@ def cut_line(res):
     """What a cut answer says first (the task's line, and its .check.txt), before any check: a check's errors on an
     unfinished answer are about its missing end"""
     s = f"cut by max_tokens {res['limit']}"
+    if res.get("all_thinking") and res.get("remote"):
+        lowered = res.get("lowered")
+        return (s + " with nothing written: all of it went to thinking"
+                + (f", even with the effort lowered {lowered[0]} -> {lowered[1]}" if lowered else "")
+                + ". More room buys more thinking: a narrower task, or less of it (--effort low, no --think)")
     if res.get("think_tokens") and not res.get("recovered"):
         s += f" ({res['think_tokens']} of it a thinking budget)"
     if res.get("split"):
@@ -2307,6 +2696,9 @@ def summary(res, out):
         s += f", {res['model']} as {res['role']}"
     elif res.get("remote") and not REMOTE:
         s += f", on {res['remote']} (remote.spill)"
+    if res.get("lowered"):
+        s += (f", effort lowered {res['lowered'][0]} -> {res['lowered'][1]}: its first answer was all thinking, and "
+              "the server sent none of it")
     if res.get("recovered"):
         s += ", RECOVERED: its thinking ran out, the answer was concluded from it (check it)"
     lead = ""
@@ -2406,13 +2798,14 @@ def notes_file(out):
 
 
 TASK_KEYS = ("prompt", "files", "system", "think", "effort", "max_tokens", "temperature", "check", "retries", "number",
-             "role", "escalate", "context")
+             "role", "escalate", "context", "variants")
 
 
 def task_sig(t):
     """What a task asks for, as a short hash: a batch runs a failed task again only once this has changed"""
-    # "context" only when a task has one: a line written before it existed keeps its signature
-    asked = json.dumps({k: t.get(k) for k in TASK_KEYS if k != "context" or t.get("context")}, sort_keys=True)
+    # "context" and "variants" only when a task has them: a line written before they existed keeps its signature
+    asked = json.dumps({k: t.get(k) for k in TASK_KEYS if k not in ("context", "variants") or t.get(k)},
+                       sort_keys=True)
     return hashlib.sha256(asked.encode("utf-8")).hexdigest()[:16]
 
 
@@ -2430,9 +2823,77 @@ def failed_before(out):
         return None
 
 
+# A batch stopped from outside (TaskStop, Ctrl+C, a closed terminal) left, on 20-11-2026, outputs that the next batch
+# took for done and skipped: a cut answer written empty, and the first answer of a task stopped while its fix ran,
+# which no mark said was failing (the mark is written when the task ends). So every file is written whole or not at
+# all (write_atomic), and a batch marks each task's output as running (<out>.running.json, with its process) until
+# the task has ended and been recorded. The next batch runs again, and says so, an output whose mark is left by a
+# process that is gone, and an empty one; one whose process still runs is another batch's, and left to it.
+def write_atomic(path, text):
+    """Writes a file whole or not at all: to a temporary file beside it, then renamed over it, so a run killed while
+    it writes leaves the old file or none, never half of one"""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}-{threading.get_ident()}.cranker-tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for n in range(50):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows: a reader (an editor, an antivirus) has it open for a moment
+                if n == 49:
+                    raise
+                time.sleep(0.1)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def running_mark(out):
+    return Path(out).with_name(Path(out).name + ".running.json")
+
+
+def mark_running(out):
+    """Marks an output as being written by this process, until unmark_running"""
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    started = _started(os.getpid())
+    write_atomic(running_mark(out), json.dumps({"pid": os.getpid(), "since": None if started is None else str(started),
+                                                "ts": time.strftime("%Y-%m-%d %H:%M:%S")}))
+
+
+def unmark_running(out):
+    running_mark(out).unlink(missing_ok=True)
+
+
+def left_running(out):
+    """None: no mark. "live": a process that is still running marked it (another batch is on it). "stopped": the
+    process that marked it is gone, so the output may be unfinished (empty, or an answer whose check never ran)"""
+    try:
+        mark = json.loads(running_mark(out).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return "stopped"
+    pid = mark.get("pid") if isinstance(mark, dict) else None
+    if not isinstance(pid, int) or pid == os.getpid():
+        return "stopped"
+    started = _started(pid)
+    return "live" if started is not None and str(started) == mark.get("since") else "stopped"
+
+
+def empty_output(out):
+    """An output with nothing in it (whitespace aside): a cut answer that was all thinking, or a write cut short"""
+    try:
+        size = Path(out).stat().st_size
+        return size == 0 or (size < 4096 and not Path(out).read_text(encoding="utf-8", errors="replace").strip())
+    except OSError:
+        return False
+
+
 def write_out(out, res, keep_thinking, answer=1):
     """Writes an answer to its output: a code file gets the code and its notes file the text around it, each
-    answer's under its own heading (answer: which of the task's answers it is; the first starts the notes again)"""
+    answer's under its own heading (answer: which of the task's answers it is; the first starts the notes again).
+    Every file whole or not at all (write_atomic)."""
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     failed_mark(out).unlink(missing_ok=True)  # a new output: the batch marks it again if this one fails too
@@ -2443,14 +2904,14 @@ def write_out(out, res, keep_thinking, answer=1):
         text, around, blocks = unfence(res["content"]), "", 0
     else:
         text, around, blocks = split_answer(res["content"])
-    out.write_text(text, encoding="utf-8")
+    write_atomic(out, text)
     if around:
-        with open(notes, "a", encoding="utf-8") as f:
-            f.write(f"## answer {answer}\n\n{around}\n\n")
+        before = notes.read_text(encoding="utf-8") if notes.exists() else ""
+        write_atomic(notes, before + f"## answer {answer}\n\n{around}\n\n")
     res["notes"] = str(notes) if notes.exists() else None
     res["blocks"] = blocks if blocks > 1 else None
     if keep_thinking and res["thinking"]:
-        out.with_name(out.name + ".thinking.md").write_text(res["thinking"], encoding="utf-8")
+        write_atomic(out.with_name(out.name + ".thinking.md"), res["thinking"])
 
 
 def _http_error(e):
@@ -2486,8 +2947,7 @@ def check_out(out, files, what="-o"):
     """An output over one of the task's own files is refused: a cut or wrong answer would replace the source (a cut
     one left 'int ma' where a C file was), and a fix after a failed check would read it back as the file."""
     for spec in files or []:
-        m = FILE_RANGE.match(spec)
-        if _same_file(out, m.group(1) if m else spec):
+        if _same_file(out, spec_path(spec)):
             raise WorkerError(f"{what} is one of the task's own files ({out}): a cut or wrong answer would replace "
                               "the source. Write to another file and move it over once it is checked")
 
@@ -2543,6 +3003,112 @@ def place(t, files):
     return t
 
 
+# ----- variants: one task tried several ways at once, the one that passes its check with the best score kept. On
+# 20/21-11-2026 a task was sent three times (draft, review, review at medium effort) and the best one picked by hand.
+VARIANT_KEYS = ("prompt", "system", "role", "effort", "think", "max_tokens", "temperature", "escalate", "retries")
+
+
+def variant_out(out, k):
+    out = Path(out)
+    return str(out.with_name(f"{out.stem}.v{k}{out.suffix}"))
+
+
+def variants_of(t, where):
+    """A task's variants, checked before anything runs: each one the task with its own fields (VARIANT_KEYS), its own
+    output beside the task's (out.v1.md...), and its work the task's"""
+    name = t.get("id", t["out"])
+    vs = t.get("variants")
+    if not isinstance(vs, list) or not vs or not all(isinstance(v, dict) for v in vs):
+        raise WorkerError(f"{where}, task {name}: \"variants\" is a list of objects, each with the fields it changes "
+                          f"({', '.join(VARIANT_KEYS)})")
+    for v in vs:
+        wrong = sorted(set(v) - set(VARIANT_KEYS))
+        if wrong:
+            raise WorkerError(f"{where}, task {name}: a variant cannot set {', '.join(wrong)} (only "
+                              f"{', '.join(VARIANT_KEYS)}): the output, the files and the check are the task's")
+    if not t.get("check"):
+        raise WorkerError(f"{where}, task {name}: \"variants\" needs a check: the variant kept is the one that passes "
+                          "it (with the best \"score: N\" it prints)")
+    base = {k: v for k, v in t.items() if k != "variants"}
+    return [{**base, **v, "out": variant_out(t["out"], k), "_variant": k, "_work_out": t["out"], "_of": t}
+            for k, v in enumerate(vs, 1)]
+
+
+def variant_says(v):
+    """A variant in a few words: what it changes"""
+    said = [f"{k} {json.dumps(v[k]) if not isinstance(v[k], str) else v[k]}" for k in VARIANT_KEYS
+            if k in v and k != "prompt"]
+    return ", ".join(said + (["its own prompt"] if "prompt" in v else [])) or "as the task"
+
+
+def log_choice(work, chosen, n):
+    """The variant kept, in usage.jsonl beside its runs: a line of no tokens that tells mark_tries which runs were
+    the piece of work's tries (the kept one's) and which were spent on the others"""
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "cmd": "variants", "cwd": os.getcwd(), "work": work,
+           "chosen": chosen, "variants": n, "in": 0, "out": 0, "answer": 0, "s": 0}
+    for env, key in (("CRANKER_USAGE_TAG", "tag"), ("CLAUDE_CODE_SESSION_ID", "session")):
+        if os.environ.get(env):
+            rec[key] = os.environ[env]
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with _USAGE_WRITE, open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def keep_variant(t, results):
+    """Once every variant of a task has ended: the one kept is the one that passed its check with the best score
+    (the check's last "score: N"; the first that passed when none prints one), written to the task's output.
+    results: {k: its result, or the error it ended in}. Returns (the kept k or None, the task's line)."""
+    vs = t["variants"]
+    passed = [(k, r) for k, r in sorted(results.items())
+              if isinstance(r, dict) and r.get("check") in ("pass", "fixed") and r["finish"] == "stop"]
+    scored = [(k, r) for k, r in passed if r.get("score") is not None]
+    best = max(scored, key=lambda kr: (kr[1]["score"], -kr[0])) if scored else passed[0] if passed else None
+    out = Path(t["out"])
+
+    def state(k, r):
+        if isinstance(r, WorkerBusy):
+            return "not run (the worker was taken)"
+        if not isinstance(r, dict):
+            return f"error: {r}"
+        if r["finish"] == "repeat":
+            return "LOOP"
+        if r["finish"] != "stop":
+            return "cut"
+        if r.get("check") == "fail":
+            return "CHECK FAILED"
+        return "passed" + (f", score {r['score']:g}" if r.get("score") is not None else "")
+
+    each = "; ".join(f"v{k} ({variant_says(vs[k - 1])}): {state(k, r)}" for k, r in sorted(results.items()))
+    work = work_id(t["out"], t.get("files"))
+    log_choice(work, best[0] if best else None, len(vs))
+    kept = best[0] if best else min((k for k, r in results.items() if isinstance(r, dict)), default=None)
+    if kept is not None and Path(variant_out(out, kept)).exists():
+        write_atomic(out, Path(variant_out(out, kept)).read_text(encoding="utf-8"))
+        notes = notes_file(variant_out(out, kept))  # the text around its code, when it had some
+        if notes.exists():
+            write_atomic(notes_file(out), notes.read_text(encoding="utf-8"))
+        else:
+            notes_file(out).unlink(missing_ok=True)
+    r = best[1] if best else None
+    log_quality(t.get("id"), out, t["check"], r["check"] if r else "fail", r["tries"] if r else 0,
+                variants=len(vs), **({"chosen": best[0]} if best else {}),
+                **({"proof": t["_proof"]} if t.get("_proof") else {}))
+    if best:
+        failed_mark(out).unlink(missing_ok=True)
+        check_note(out).unlink(missing_ok=True)
+        return best[0], (f"variant {best[0]} of {len(vs)} kept ({variant_says(vs[best[0] - 1])}) -> {out}: {each}")
+    write_atomic(check_note(out), f"no variant passed its check ($ {t['check']}): {each}. Each one's output is "
+                                  f"beside it ({Path(variant_out(out, 1)).name}...), with its .check.txt\n")
+    return None, f"no variant passed its check -> {check_note(out)}: {each}"
+
+
+def check_note(out):
+    return Path(out).with_name(Path(out).name + ".check.txt")
+
+
 def cmd_ask(args):
     try:
         far = bool(args.role) and role_of(args.role) != LOCAL
@@ -2571,11 +3137,12 @@ def cmd_ask(args):
     if args.check and not args.out:
         print("--check needs -o: the check reads the output from its file ({out})")
         return 1
-    if (args.check_null is not None or args.check_good) and not args.check:
-        print("--check-null and --check-good try a --check: there is none")
+    if (args.check_null is not None or args.check_good or args.check_bad) and not args.check:
+        print("--check-null, --check-good and --check-bad try a --check: there is none")
         return 1
     if args.out:
         check_out(args.out, [*context, *(args.file or [])])
+    named_now(args.file, "-f")
     brief_path, brief = find_brief(args.brief)
     if REMOTE and brief_path:
         may_leave([brief_path], REMOTE["roots"])
@@ -2599,7 +3166,7 @@ def cmd_ask(args):
     try:
         place(t, [*context, *(args.file or []), args.prompt_file, brief_path])
         if args.check:  # before any request: a check that cannot tell right from wrong stops it here
-            t["_proof"] = try_check(args.check, args.out, args.check_null, args.check_good)
+            t["_proof"] = try_check(args.check, args.out, args.check_null, args.check_good, args.check_bad)
         if args.out:
             res = run_checked(t, "ask", args.keep_thinking, brief)
         else:
@@ -2659,6 +3226,8 @@ def cmd_batch(args):
         shared["check_null"] = args.check_null
     if args.check_good:
         shared["check_good"] = args.check_good
+    if args.check_bad:
+        shared["check_bad"] = args.check_bad
     if args.retries is not None:
         shared["retries"] = args.retries
     if args.number:
@@ -2677,54 +3246,86 @@ def cmd_batch(args):
                                             *(f for t in tasks for f in request_files(t))])
     if args.prompt_prefix:
         prefix = Path(args.prompt_prefix).read_text(encoding="utf-8-sig").strip()
-        tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"]} for t in tasks]
+        tasks = [{**t, "prompt": prefix + "\n\n" + t["prompt"],
+                  **({"variants": [{**v, "prompt": prefix + "\n\n" + v["prompt"]}
+                                   if isinstance(v, dict) and isinstance(v.get("prompt"), str) else v
+                                   for v in t["variants"]]} if isinstance(t.get("variants"), list) else {})}
+                 for t in tasks]
+    for t in tasks:  # checked before anything runs, as the task's own fields are
+        if "variants" in t:
+            t["_subs"] = variants_of(t, args.tasks)
     brief_path, brief = find_brief(args.brief)
     if REMOTE and brief_path:
         may_leave([brief_path], REMOTE["roots"])
     # an output that exists is done, unless the task left it cut or failing its check (failed_mark): that one runs
-    # again once its task has changed, and is left alone, and said, while it has not
-    todo, same = [], []
+    # again once its task has changed, and is left alone, and said, while it has not. One that a stopped batch left
+    # (its running mark, from a process that is gone) or an empty one runs again, and is said; one that another
+    # batch is writing now is left to it
+    todo, same, unfinished, empty, taken = [], [], [], [], []
     for t in tasks:
-        failed = None if args.force or not Path(t["out"]).exists() else failed_before(t["out"])
-        if args.force or not Path(t["out"]).exists() or (failed and failed.get("task") != task_sig(t)):
+        out = Path(t["out"])
+        run = None if args.force else left_running(out)
+        if run == "live":
+            taken.append(t)
+        elif args.force or not out.exists():
+            todo.append(t)
+        elif run == "stopped":
+            unfinished.append(t)
+            todo.append(t)
+        elif (failed := failed_before(out)) and failed.get("task") != task_sig(t):
             todo.append(t)
         elif failed:
             same.append(t)
+        elif empty_output(out):
+            empty.append(t)
+            todo.append(t)
     common = [args.tasks, args.system_file, args.prompt_prefix, brief_path]
-    for t in todo:  # where each role sends its task, refused before anything runs
+    # what runs: the tasks, and in a task with variants each of its variants in its place, side by side
+    units = [u for t in todo for u in (t["_subs"] if "_subs" in t else [t])]
+    for t in units:  # where each role sends its task, refused before anything runs
         name = t.get("id", t["out"])
+        named_now(t.get("files"), f"task {name}: \"files\"")
         try:
             if args.local and t.get("role") and role_of(t["role"]) != LOCAL:
                 raise WorkerError(f"--local, and its role {t['role']} is a model elsewhere")
             place(t, [*common, *request_files(t)])
         except WorkerError as e:
             raise WorkerError(f"task {name}: {e}")
-    far = next((t["_server"] for t in todo if isinstance(t["_server"], dict)), None)
+    far = next((t["_server"] for t in units if isinstance(t["_server"], dict)), None)
     # remote.spill: the tasks with no role whose files may all leave can go there when the local worker is full
     spills = {}
     if could_spill:
-        spills = {id(t): spill_for([*common, *request_files(t)]) for t in todo if t["_server"] is None}
+        spills = {id(t): spill_for([*common, *request_files(t)]) for t in units if t["_server"] is None}
     there = next((r for r in spills.values() if r), None)
     if not up and not there and not far:
         return _not_running()
     note = None if brief_path else no_brief_note(todo, args.brief)
     if note:
         print(note, file=sys.stderr)
-    print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same)} already done, {len(todo)} to run"
+    if args.reach and not Path(args.reach).is_file():
+        raise WorkerError(f"--reach {args.reach}: no such file (the measure of what the changes can reach)")
+    note = reach_note(todo, len(todo) < len(tasks) or bool(unfinished or empty), args.reach)
+    if note:
+        print(note, file=sys.stderr)
+    print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same) - len(taken)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else "")
+          + (f"; reach measured in {args.reach}" if args.reach else "")
           + (f"; context {len(context)} files ({context_size(context):,} chars) first in every request"
              if context else "")
           + (f"; {sum(1 for r in spills.values() if r)} of them may go to {there['host']} as well (remote.spill)"
              if there else ""))
-    proofs = try_checks(todo)  # before any request: a check that cannot tell right from wrong stops the batch here
+    proofs = try_checks(units)  # before any request: a check that cannot tell right from wrong stops the batch here
+    for t in todo:
+        if "_subs" in t:
+            t["_proof"] = t["_subs"][0].get("_proof")
     if proofs:
         print(("check" if len(proofs) == 1 else "checks") + ", tried before any request: "
-              + "; ".join(PROOF_SAYS[p] + (f" ({n} task{'s' if n != 1 else ''})" if len(proofs) > 1 or n > 1
+              + "; ".join(proof_says(p) + (f" ({n} task{'s' if n != 1 else ''})" if len(proofs) > 1 or n > 1
                                            else "") for p, n in proofs.items())
-              + ("" if any("good" in p for p in proofs) or not any(p in TRIED for p in proofs) else
+              + ("" if any("good" in p for p in proofs) or not any(proof_tried(p) for p in proofs) else
                  ". --check-good FILE also tries a known-good output, which it must pass"))
     named = {}
-    for t in todo:
+    for t in units:
         if t.get("role"):
             model = t["_server"]["model"] if isinstance(t["_server"], dict) else LOCAL
             named[(t["role"], model)] = named.get((t["role"], model), 0) + 1
@@ -2735,6 +3336,17 @@ def cmd_batch(args):
     if same:
         print(f"{len(same)} failed before (cut, or failing their check) and their tasks have not changed, so they "
               f"are not run again: {', '.join(str(t.get('id', t['out'])) for t in same)}. Change them, or --force")
+    if unfinished:
+        print(f"{len(unfinished)} were left unfinished by a batch that was stopped (their .running.json, from a "
+              f"process that is gone), so they run again: {', '.join(str(t.get('id', t['out'])) for t in unfinished)}")
+    if empty:
+        print(f"{len(empty)} had an empty output and no mark of a failure, so they run again: "
+              f"{', '.join(str(t.get('id', t['out'])) for t in empty)}")
+    if taken:
+        print(f"{len(taken)} are being run by another batch now (their .running.json, from a process still running), "
+              f"so they are left to it: {', '.join(str(t.get('id', t['out'])) for t in taken)}")
+    for t in todo:  # until each has ended and been recorded: a batch stopped before that runs it again next time
+        mark_running(t["out"])
     t0 = time.time()
     failed = tokens = not_run = kept = ended = raised = split = loops = 0
     checks = {"pass": 0, "fixed": 0, "fail": 0}
@@ -2759,13 +3371,41 @@ def cmd_batch(args):
 
     # here and there at once: the local slots and the remote's requests (remote.parallel, one count for its roles)
     away_width = int((there or far or {}).get("parallel") or 0)
-    width = (int(REMOTE["parallel"]) + (CFG["parallel"] if any(t["_server"] == LOCAL for t in todo) else 0)
+    width = (int(REMOTE["parallel"]) + (CFG["parallel"] if any(t["_server"] == LOCAL for t in units) else 0)
              if REMOTE else CFG["parallel"] + away_width)
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs or width)
     try:
-        futs = {ex.submit(one, t): t for t in todo}
+        futs = {ex.submit(one, t): t for t in units}
         for f in _as_they_end(futs):
             t = futs[f]
+            if t.get("_of") is not None:  # a variant: its task ends with the last of them (keep_variant)
+                parent, name = t["_of"], t["_of"].get("id", t["_of"]["out"])
+                try:
+                    res = f.result()
+                    tokens += res["completion_tokens"] or 0
+                except Exception as e:  # not run (WorkerBusy), an HTTP error, any other: how that variant ended
+                    res = e
+                parent.setdefault("_results", {})[t["_variant"]] = res
+                if len(parent["_results"]) < len(parent["_subs"]):
+                    continue
+                ended += 1
+                if all(isinstance(r, WorkerBusy) for r in parent["_results"].values()):
+                    not_run += 1
+                    print(f"WAIT {name}: none of its variants was run: {res}")
+                    continue
+                k, line = keep_variant(parent, parent["_results"])
+                if k:
+                    checks[parent["_results"][k]["check"]] += 1
+                    print(f"ok  {name}: {line}")
+                else:
+                    failed += 1
+                    checks["fail"] += 1
+                    if Path(parent["out"]).exists():
+                        kept += 1
+                        write_atomic(failed_mark(parent["out"]), json.dumps({"why": "check", "task": task_sig(parent)}))
+                    print(f"BAD {name}: {line}")
+                unmark_running(parent["out"])
+                continue
             ended += 1
             try:
                 res = f.result()
@@ -2778,7 +3418,8 @@ def cmd_batch(args):
                 loops += looped
                 if cut or bad:
                     why = "repeat" if looped else "cut" if cut else "check"
-                    failed_mark(t["out"]).write_text(json.dumps({"why": why, "task": task_sig(t)}), encoding="utf-8")
+                    write_atomic(failed_mark(t["out"]), json.dumps({"why": why, "task": task_sig(t)}))
+                unmark_running(t["out"])
                 if res.get("check"):
                     checks[res["check"]] += 1
                 raised += bool(res.get("raised"))
@@ -2828,7 +3469,7 @@ def cmd_batch(args):
     if not_run:
         print(f"{not_run} tasks were not run: the worker was taken for the whole wait (see their WAIT lines for "
               "who had it). They did not fail: run the same batch again, the finished tasks are skipped")
-    return 0 if failed == 0 and not_run == 0 and not same else 2
+    return 0 if failed == 0 and not_run == 0 and not same and not taken else 2
 
 
 # ------------------------------------------------------------------------------------------------------- agent
@@ -3199,6 +3840,7 @@ def main():
     p.add_argument("--check", help="a command that passes (exit 0) when the output is right; {out} is its path")
     p.add_argument("--check-null", help=CHECK_NULL_HELP)
     p.add_argument("--check-good", help=CHECK_GOOD_HELP)
+    p.add_argument("--check-bad", action="append", help=CHECK_BAD_HELP)
     p.add_argument("--context", action="append", help=CONTEXT_HELP)
     p.add_argument("--retries", type=int, help="how many times the worker fixes its output for the check")
     p.add_argument("--role", help=ROLE_HELP)
@@ -3212,6 +3854,8 @@ def main():
     p.add_argument("--check", help="the check for every task without its own; {out} is the task's output")
     p.add_argument("--check-null", help=CHECK_NULL_HELP + " (for every task without its own \"check_null\")")
     p.add_argument("--check-good", help=CHECK_GOOD_HELP + " (for every task without its own \"check_good\")")
+    p.add_argument("--check-bad", action="append",
+                   help=CHECK_BAD_HELP + " (for every task without its own \"check_bad\": a file or a list)")
     p.add_argument("--context", action="append",
                    help=CONTEXT_HELP + " (for every task without its own \"context\")")
     p.add_argument("--retries", type=int, help="how many times the worker fixes an output for the check")
@@ -3222,6 +3866,8 @@ def main():
     p.add_argument("--remote", action="store_true", help=REMOTE_HELP)
     p.add_argument("--local", action="store_true", help=LOCAL_HELP)
     p.add_argument("--prompt-prefix", help="a file with what every task's prompt starts with (the shared rules)")
+    p.add_argument("--reach", help="the measure of what a wide batch of changes can reach, taken before it (a file): "
+                                   "said in its first line, instead of the note that asks for it")
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")
     p = sub.add_parser("agent", help="Claude Code on the local model, with tools")
     p.add_argument("--brief", help="the project's brief (default: .cranker/brief.md here or above; '' turns it off)")

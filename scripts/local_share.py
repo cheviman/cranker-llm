@@ -123,10 +123,32 @@ def local_rows(day=None, most=2):
         if r.get("work"):
             pieces.setdefault(r["work"], []).append(r)
     for runs in pieces.values():
-        for r in runs:
-            r["_tries"], r["_right"] = len(runs), not wrong(runs[-1])
-            r["_effective"] = r["_right"] and len(runs) <= most
-    return [r for r in rows if not day or r.get("ts", "").startswith(day)]
+        tries, beside = piece_runs(runs)
+        right = bool(tries) and not wrong(tries[-1])
+        for r in tries:
+            r["_tries"], r["_right"] = len(tries), right
+            r["_effective"] = right and len(tries) <= most
+        for r in beside:  # the variants of a task that were not kept: consumed, not effective
+            r["_tries"], r["_right"], r["_effective"], r["_beside"] = len(tries), False, False, True
+    # the line that says which variant was kept is no request
+    return [r for r in rows if r.get("cmd") != "variants" and (not day or r.get("ts", "").startswith(day))]
+
+
+def piece_runs(runs):
+    """As worker.py's: a piece of work's runs as (its tries, the runs spent beside them, on its variants not kept)"""
+    tries, beside, pending = [], [], {}
+    for r in runs:
+        if r.get("cmd") == "variants":
+            for k, rs in sorted(pending.items()):
+                (tries if r.get("chosen") in (None, k) else beside).extend(rs)
+            pending = {}
+        elif r.get("variant"):
+            pending.setdefault(r["variant"], []).append(r)
+        else:
+            tries.append(r)
+    for k, rs in sorted(pending.items()):
+        tries.extend(rs)
+    return tries, beside
 
 
 def wrong(r):
@@ -149,7 +171,7 @@ def work(r):
 
 def quality(rows, most):
     """The pieces of work among these runs, by the try they were right at: (pieces, first, by `most`, more, wrong)"""
-    pieces = {r["work"]: r for r in rows if r.get("work")}.values()
+    pieces = {r["work"]: r for r in rows if r.get("work") and not r.get("_beside")}.values()
     first = sum(1 for r in pieces if r["_effective"] and r["_tries"] == 1)
     by = sum(1 for r in pieces if r["_effective"] and r["_tries"] > 1)
     more = sum(1 for r in pieces if r["_right"] and r["_tries"] > most)
