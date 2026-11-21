@@ -77,7 +77,7 @@ for your yes. Or do it yourself in a terminal (Python 3.10 or newer, standard li
 `py` outside Windows):
 
 ```
-cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.6.0
+cd ~/.claude/plugins/cache/cranker-llm/cranker-llm/1.7.0
 py scripts/setup.py                                           # the models that fit your GPU
 py scripts/setup.py --profile qwen3.8-27b-q4kxl --dry-run     # what it would download
 py scripts/setup.py --profile qwen3.8-27b-q4kxl               # download and configure
@@ -94,9 +94,12 @@ Vulkan build); the setup downloads it only on Windows.
 
 ## Three ways in
 
-**`ask`**: files and an instruction in, the answer to a file. Line ranges work (`-f src/big.c:120-260`), and
-`--number` gives the model every line with its number in front of it, for answers that cite lines (a map, a
-review): without it the model counts them by eye. Not for a rewrite, where the numbers would come back in the code.
+**`ask`**: files and an instruction in, the answer to a file. Line ranges work (`-f src/big.c:120-260`), and so
+do ranges by name, found in the file when the request is put together (`-f core.py::load_names`,
+`core.py::Typer.pointer`, `core.py::first..last`, `big.c::main`, `big.cpp::Foo::bar`: see [the context
+pack](#the-context-pack-what-a-wide-batch-needs)). `--number` gives the model every line with its number in front
+of it, for answers that cite lines (a map, a review): without it the model counts them by eye. Not for a rewrite,
+where the numbers would come back in the code.
 
 ```
 py scripts/worker.py ask -f src/big.c --number -o map.md -p "..."
@@ -113,6 +116,29 @@ batch run again burns nothing. The file is checked before any task runs (a line 
 ```
 {"id": "f1", "prompt": "Propose a name for this function...", "files": ["src/a.c:100-180"], "out": "names/f1.md"}
 ```
+
+**A batch stopped from outside is safe to run again.** On 20-11-2026 one stopped with TaskStop left outputs the
+next run took for done: an answer cut while it was all thinking, written empty, and a first answer whose fix was
+running when it stopped, which nothing marked as failing (the mark was written when a task ended). Now every file
+is written whole or not at all (a temporary file, renamed over it), and each task's output carries
+`<out>.running.json` (the batch's process) from the start of the run until the task has ended and been recorded.
+The next run redoes, and lists, what a stopped one left (`N were left unfinished by a batch that was stopped`) and
+an empty output with no failure mark; one whose batch is still running is left to it.
+
+**Variants: one task tried several ways at once.** Instead of sending a task three times with other roles and
+efforts and picking the best by hand, a line can carry `"variants"`, each changing only `prompt`, `system`, `role`,
+`effort`, `think`, `max_tokens`, `temperature`, `escalate` or `retries`:
+
+```
+{"id": "g7", "prompt": "...", "out": "g7.md", "variants": [{"role": "draft"}, {"role": "review", "effort": "medium"}]}
+```
+
+They run side by side, each into `g7.v1.md`, `g7.v2.md`... with its own fixes, and the one that passed its check
+with the best score is written to `g7.md`: the score is the last line `score: N` the check prints (higher is
+better), and with none, the first that passed is kept. A task with variants needs a check. Its line says which was
+kept and how each one ended; with none passing, `g7.md` holds the first one's output and `g7.md.check.txt` says how
+each failed. In `usage` the task is one piece of work: the kept variant's runs are its tries, the others' are
+consumed and not effective (`were variants not kept`), and `local_share.py` counts them the same way.
 
 What every task needs goes on the command line once: `--context` for the files they all read (the formats, the
 mechanisms, solved cases, the data: see [the context pack](#the-context-pack-what-a-wide-batch-needs)), the rules
@@ -161,7 +187,7 @@ Each output ends one of three ways: `check passed`, `check passed after N fixes 
 with the last errors in `<out>.check.txt`, left for Claude, and every failed round's in `<out>.check.N.txt` (only
 the last was kept once, and the first failure of a run, an MSYS2 cmake on the `PATH`, was lost with it); an output
 that passes in the end leaves none of them. `usage` adds them up by project (first time / by the
-worker / for Claude). In a `batch`, `--check`, `--check-null`, `--check-good`, `--retries`, `--context`,
+worker / for Claude). In a `batch`, `--check`, `--check-null`, `--check-good`, `--check-bad`, `--retries`, `--context`,
 `--system-file` and `--prompt-prefix` apply to every task that doesn't set its own, so the shared rules are written
 once and not in every line.
 
@@ -180,12 +206,30 @@ A check with no `{out}` in it reads the output from its own place and can't be t
 too, unless `--check-null none` says to run it untried. A batch tries each check once for each folder its outputs
 are in, and its second line says how: `check, tried before any request: fails an empty output (14 tasks)`.
 
+**A known-bad output is tried too.** Failing the null is not enough. On 20/21-11-2026 three OutRunners checks that
+failed it still passed wrong work: one compared two folders that differed (the output lacked `src/sound`), one
+compiled with `gcc -w`, which hides a pointer put in an integer, and one measured and compiled a patch that then
+broke the game. `--check-bad FILE` (repeatable; `"check_bad"` in a line, a file or a list) is an output known to be
+wrong, the one that got through, which the check must fail before any request is sent; the proof says so
+(`null+bad+good` in `usage.jsonl`). And a check of changes has to run the result: a test, or a scenario of the
+program, on the patched copy, with its own `sys.path`, the same folders on both sides, and the warnings that matter
+as errors; not only "it applies, it compiles, the number moved". The one that worked in the end applied the blocks to
+a copy, decompiled, measured, compiled with pointer/integer errors on, and ran a scenario under a lock.
+
+**A check that hangs is stopped with everything it started.** `check_timeout` (300 s) used to end only the shell:
+on Windows the `py` and `python` under it went on hanging with the output pipes open, and the run waited for them
+without end (21-11-2026). Now the check's whole tree is ended, and the round says `the check took more than N s, and
+was stopped`.
+
 An answer cut by `max_tokens` is unfinished whatever its check says, and the check's errors on it are only about
 the missing end. So a cut answer is asked for again as it was, with 1.5 times the limit (as far as the context
 holds it beside the prompt; with `--think` the thinking budget stays and the extra goes to the answer), once. The
 task's line and its `.check.txt` start with `cut by max_tokens N`, and say `max_tokens raised N -> M` when the
 retry took it. Cut again, or with no room to raise it, the task stops there: it `needs splitting`. When a plain fix
-moves to thinking, the answer keeps the room it had and the thinking budget comes on top.
+moves to thinking, the answer keeps the room it had and the thinking budget comes on top. An answer from a server
+elsewhere that was all thinking is not asked for again with more room, which would buy more thinking (see
+[thinking elsewhere](#a-server-elsewhere---remote)): its line says `with nothing written: all of it went to
+thinking`.
 
 **An answer that goes round in a loop is stopped while it is written.** The worker reads every answer as it streams
 (local and `--remote`), and stops the request (it closes the connection, and llama-server drops it at once) when
@@ -233,9 +277,15 @@ change needed in the core" from a model that never saw the core. The model wasn'
 parser, the instruction addresses in the listing, the solved cases in earlier rounds, and the project had no
 brief; none of it was in the requests. A batch of design or change tasks gets a pack, a folder given to every task
 with `--context DIR` (or `"context": [...]` in a line: files, `file:a-b` ranges or folders, whose files go in name
-order):
+order), and ranges of code are better given by name than by line: `file.py::name` (a `def`, a `class`,
+`Class.method`, a module-level assignment), `file.c::name` (a C or C++ function, `Foo::bar`, a `struct`, `union` or
+`enum` block), and `file.py::first..last`, from the start of one to the end of the other. A range by name takes the
+decorators and the comment lines right above it, and is found in the file as it is when each request is put
+together. On 21-11-2026 a `file:a-b` range written at the start of a session was stale by its next step (the step
+before had added lines above it) and left out the very function that step was about. A name that is not in the
+file, or one that two definitions have, stops the run before anything is sent, with the names close to it:
 
-1. **The formats, taken from the code that reads them**: the parser's line range, not a format retyped from memory.
+1. **The formats, taken from the code that reads them**: the parser by name, not a format retyped from memory.
 2. **The mechanisms the change goes through, with their code ranges**: how the core types a pointer, where a local
    is declared, so a task can say what the core lacks and where.
 3. **Two to four solved cases, each with its before and after**: what a right answer looks like in this project.
@@ -247,6 +297,16 @@ request, after the system prompt and the brief, before the task's own files: the
 server that caches prompts reads once. Its size is on the batch's first line (`context 5 files (41,210 chars) first
 in every request`), and it counts in every request, so it holds ranges, not whole trees. The pack is not what the
 work is about: a task sent again with a pack added is the same piece of work, its next try, in `usage`.
+
+### Before a batch of changes: what can it reach?
+
+On 20/21-11-2026 three batches of designs and patches (25, 14 and 14 tasks) went out against a measure that was
+mostly out of reach; a script over the artifact that counted what each kind of change could move said so
+afterwards, in five minutes. So before a wide batch of changes, measure the reach: how much of the measure each
+kind of change can move, and what none can, and send tasks only for what is reachable. A batch that runs 8 or more
+tasks that write changes (a code output, or a prompt that asks for a patch, a diff, a fix) for the first time asks
+on stderr, `wide batch of changes: ...`; `--reach FILE`, the measure, says it was done, and the batch's first line
+names it.
 
 ### What to hand it, and what not
 
@@ -284,6 +344,18 @@ and the brief; a link inside a listed folder that points out of it counts as whe
   `{"reasoning_effort": ...}`), `extra` to all. There is no thinking budget there: `--max-tokens` is the only cap.
   It is streamed (`stream`, `stream_options`, OpenAI's too), so an answer that goes round in a loop is stopped
   there as here; `"stream": false` is for a server that refuses them.
+- **Thinking elsewhere has no budget**, and the `plain` fields may think too (a model that refuses
+  `"reasoning_effort": "none"` gets `"medium"`). On 20-11-2026 three OutRunners tasks came back empty after 64,000
+  to 200,000 tokens of it, with no `RECOVERED`. deepseek at high effort sends its thinking in one block at the end,
+  so a cut one sends nothing to conclude from, and the retry for a cut raised `max_tokens` by half, which bought
+  more thinking (64,000, then 96,000, all of it). Where the thinking did come, the recovery asked for the answer
+  with 4,096 tokens and no thinking, and the plain fields thought them away. A cap of its own was tried
+  (`"reasoning": {"max_tokens": N}`) and refused with HTTP 400, and a cap counted from the stream sees nothing of a
+  thinking sent at the end. So: an empty answer with thinking is recovered whether or not `--think` was asked, with
+  the room of the request it recovers and the end of the reasoning (120,000 characters at most); an answer that
+  was all thinking with none of it sent is asked for again once with one effort less (`effort lowered xhigh ->
+  medium` in its line), never with more room; and if that is all thinking too, its line says `with nothing written:
+  all of it went to thinking` and what to change.
 - **Its limits** take the place of the shared context: a batch sends `parallel` requests at once (2), and a
   request the server limits (HTTP 429) waits as long as its `Retry-After` says, up to `wait` seconds (300), and
   then ends as `not run`.
@@ -625,6 +697,13 @@ even before it has used the worker. `remind: false` leaves only the long note. `
   connection closed.
 - **These last four were found without the GPU**, by running the worker against a stand-in for llama-server
   (`tests/fake_llama.py`): see "Tests".
+- **A session of three hours on one round cost more than its work.** On 20/21-11-2026 an OutRunners session sent
+  210 requests to the remote worker: 12.9M tokens consumed, 2.7M effective, and a small result. What made tasks
+  work there was the context pack and a check that runs the game; what cost hours was building them late and wrong,
+  and sending wide batches before measuring their reach. From it: `--check-bad`, ranges by name, the running mark,
+  variants, the remote's thinking, the reach note, and in the skill two rules: when a careful try changes nothing,
+  the cause is found by debugging (the rules Claude gives the worker are hypotheses), and one session per round,
+  since a long session pays for all it holds on every turn.
 - **An LLM loads the GPU's memory harder than a game does.** On the 3090, within 90 s of batches the fan reached
   100 % and the GPU slowed itself down with the core at only 69 C, so the GDDR6X was at its limit. `batch` waits
   while the GPU reports thermal slowdown. Raising the power limit does not help while the memory is that hot: at
@@ -654,11 +733,12 @@ py -m unittest discover -s tests
 
 `tests/fake_llama.py` takes llama-server's command line and answers its endpoints with no model and no GPU; what it
 answers is scripted in the prompt (`[[say:...]]`, `[[say-file:...]]`, `[[loop:...]]`, `[[cut]]`, `[[sleep:3]]`,
-`[[fail:500:...]]`), streamed a word an event when the request asks for it. `tests/fixtures/` keeps real answers
+`[[fail:500:...]]`, `[[hidden-think:high]]`, `[[think-text:...]]`), streamed a word an event when the request asks
+for it. `tests/fixtures/` keeps real answers
 that went wrong, so a test runs the worker on exactly what the model sent. The tests run the
 real `worker.py` and the hooks against it, each in a `CRANKER_HOME` of its own in a temporary folder and on a port
 of its own, so the real worker, its logs and a server that is running are never touched: `ask`, `batch`, the check
-and its fixes, the check tried before any request, `--context`, the brief's note, the thinking budget, the shared context, `start` and `stop`, the read guard, the scale's hook, the
+and its fixes, the check tried before any request (`--check-bad` too), `--context` and ranges by name, the brief's note, the thinking budget and a remote's thinking, a stopped batch run again, variants, the reach note, the shared context, `start` and `stop`, the read guard, the scale's hook, the
 agent's relay, `--remote` against a second stand-in that asks for a key and refuses llama.cpp's fields, and the
 setup's download against a server that drops the connection. A couple of minutes on any machine. What they cannot tell is what the model answers: that is
 `bench/bench.py`, on the GPU.
@@ -676,7 +756,7 @@ setup's download against a server that drops the connection. A couple of minutes
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
-| `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first), and the stand-in for llama-server they run against |
+| `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first; 1.7.0's `test_check_bad.py`, `test_named.py`, `test_resume.py`, `test_variants.py`, `test_remote_think.py`, `test_reach.py`), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `local`, `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
