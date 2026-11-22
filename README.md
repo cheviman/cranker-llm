@@ -386,6 +386,17 @@ and the brief; a link inside a listed folder that points out of it counts as whe
   then ends as `not run`.
 - **`usage` tells them apart**: `ask (remote)`, with what they cost at `price` (USD per million, in and out).
   They count for the scale like the local ones. `status` shows the server, the folders and whether the key is set.
+- **What it costs, and a daily cap**: `"prices": {"gpt-6-luna": [0.1, 0.5, 0.01]}` is each model's list price, USD
+  per million tokens in, out and read from the server's cache (the third is optional), and every request there writes
+  its `usd` in `usage.jsonl`, the cached part at its own price. `"daily": 6.0` is what the server may spend a day,
+  counted from 00:00 UTC, when a plan's daily allowance resets: once today's requests add up to it, a role's request
+  (and its escalated fixes) goes to the local worker, spill stops, and `--remote` is not sent. A server that answers
+  that its quota is used up (`free_limit_reached`, `credit`...) does the same for the rest of the day. `status` says
+  `today $X of $Y`, and a batch says before it runs what its tasks for a server elsewhere read, at the list price,
+  against what is left. On 22-11-2026 a Pro plan's free models (700 credits a day, $7) went in 23 minutes on a naming
+  batch of 712 tasks with the same 130,000 chars of context each; the config priced every model at 0, so nothing here
+  said so. Put the context that is the same in every task first (a batch's `context` is): a server that caches
+  prompts reads it again at a tenth of the price.
 - **Not the agent**: `agent` is local only.
 
 **Spill: there when here is busy.** With `"spill": true` in the `"remote"` block, a request that would wait for the
@@ -404,7 +415,11 @@ file of the run are under `remote.roots`. `--remote` is still how a run goes the
   took 106 s, as long as the slowest of the five that stayed.
 - **A failure there** (a quota, its limits, a refused key, the network) turns spill off for the rest of the run, and
   the requests wait for the local worker as ever.
-- **`--local`** keeps a run here, and a file outside `remote.roots` never goes.
+- **`--local`** keeps every request of a run here (first answers, a cut one asked again, check fixes, recovery): a
+  task waits for room instead of spilling, `remote.escalate` is left out (the run says so), and a line's own `role`
+  or `escalate` that is a model elsewhere is refused before anything is sent. A file outside `remote.roots` never
+  goes. On 22-11-2026 `batch --local` escalated the fixes of 4 of 81 reviews to the drafter's own model, and their
+  lines called it `(remote.spill)`; an escalated fix now says only `(escalated)`.
 - **They say so**: a summary that went there says `on HOST (remote.spill)`; `batch`'s first line
   ends `; N of them may go to HOST as well (remote.spill)`, and its `done:` line `; K of them on HOST
   (remote.spill)`. `status` says `spill on`, and `usage` counts them as remote.

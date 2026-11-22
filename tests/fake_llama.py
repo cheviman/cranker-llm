@@ -18,6 +18,8 @@ What a chat request gets back is scripted in its first user message:
     [[think-text:T]]   all thinking, T, and no answer, cut at max_tokens; a recovery request (the thinking handed
                        back) gets the answer instead
     [[recover-room:N]] a recovery request with max_tokens under N thinks all of it away: no answer, cut
+    [[fail-there:CODE:TEXT]] the same, only from a server with --key (the one elsewhere); the local one answers
+    [[cached:N]]       its usage says N of the prompt's tokens were read from the server's cache
     [[rounds:A||B||C]] the answer the first, second, third... time this prompt is asked (the last one after that);
                        a round that is "!cut" comes back empty, cut at max_tokens
 
@@ -87,7 +89,7 @@ def main():
             self.end_headers()
             self.wfile.write(body)
 
-        def stream(self, words, thoughts, finish, n_prompt, usage=None):
+        def stream(self, words, thoughts, finish, n_prompt, usage=None, cached=0):
             """The answer as server-sent events, a word an event, until its end or until the client leaves"""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -108,7 +110,9 @@ def main():
                     sent += 1
                 event({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
                 event({"choices": [], "usage": usage or {"prompt_tokens": n_prompt,
-                                                         "completion_tokens": sent + len(thoughts)},
+                                                         "completion_tokens": sent + len(thoughts),
+                                                         **({"prompt_tokens_details": {"cached_tokens": cached}}
+                                                            if cached else {})},
                        "timings": {"prompt_per_second": 1000.0, "predicted_per_second": 30.0}})
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -180,6 +184,9 @@ def main():
                 if "die" in said:
                     os._exit(1)
                 time.sleep(float(said.get("sleep") or 0))
+                if "fail-there" in said and args.key:  # only as the server elsewhere: the local one answers
+                    code, _, message = said["fail-there"].partition(":")
+                    return self.send_json({"error": {"message": message, "code": int(code)}}, int(code))
                 if "fail" in said:
                     code, _, message = said["fail"].partition(":")
                     return self.send_json({"error": {"message": message, "code": int(code)}}, int(code))
@@ -217,7 +224,8 @@ def main():
                         words, finish = looping(said["loop"], body.get("max_tokens") or 4096), "length"
                     else:
                         words = re.findall(r"\s*\S+\s*", answer)
-                    return self.stream(words, re.findall(r"\S+\s*", reasoning), finish, n_prompt, usage)
+                    return self.stream(words, re.findall(r"\S+\s*", reasoning), finish, n_prompt, usage,
+                                       int(said.get("cached") or 0))
                 n_out = len((answer + " " + reasoning).split())
                 if path == "/v1/messages":
                     return self.send_json({
