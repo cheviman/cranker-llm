@@ -549,8 +549,11 @@ def _remote_line():
     roles = (f"; roles: {roles}" + (f"; escalate: {r['escalate']} after {r['escalate_after']} failed answer"
                                     + ("s" if r["escalate_after"] != 1 else "") if r["escalate"] else "")
              if roles else "")
-    print(f"remote (--remote): {r['model']} at {urlsplit(r['url']).hostname}; {key}; files may leave from: {roots}"
-          + spill + roles)
+    host = urlsplit(r["url"]).hostname
+    daily = (f"; today ${spent_today(host):,.2f} of ${r['daily']:,.2f} (remote.daily, resets at {_resets()})"
+             if r.get("daily") else "")
+    print(f"remote (--remote): {r['model']} at {host}; {key}; files may leave from: {roots}"
+          + spill + roles + daily)
 
 
 def cmd_status(args):
@@ -876,6 +879,7 @@ def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
         rec["remote"] = where["host"]  # not this machine's model: usage tells them apart, with what it cost
         if where.get("role"):
             rec["role"] = where["role"]
+        rec["usd"] = round(usd_of(rec["model"], rec["in"], rec["out"], extra.get("cached")), 6)
     tag = os.environ.get("CRANKER_USAGE_TAG")
     if tag:
         rec["tag"] = tag
@@ -891,14 +895,99 @@ def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
 
 
 def remote_prices():
-    """USD per million tokens (in, out) by model: remote.price for the server's own model, a role's "price" for its
-    model. The usage of a model with no price set counts as free"""
+    """USD per million tokens (in, out, and cached in when the server says it apart) by model: remote.prices,
+    remote.price for the server's own model, a role's "price" for its model. The usage of a model with no price set
+    counts as free"""
     conf = {**REMOTE_DEFAULTS, **(CFG.get("remote") or {})}
-    prices = {conf["model"]: conf["price"]} if conf.get("model") and conf.get("price") else {}
+    prices = {m: v for m, v in (conf.get("prices") or {}).items() if v}
+    if conf.get("model") and conf.get("price") and any(conf["price"]):
+        prices[conf["model"]] = conf["price"]
     for v in (conf.get("roles") or {}).values():
         if isinstance(v, dict) and v.get("model") and v.get("price"):
             prices[v["model"]] = v["price"]
     return prices
+
+
+def usd_of(model, tokens_in, tokens_out, cached=0, prices=None):
+    """What a request cost at the list price in the config: the cached part of what it read at its own price"""
+    p = (remote_prices() if prices is None else prices).get(model)
+    if not p:
+        return 0.0
+    cached = min(cached or 0, tokens_in or 0)
+    return (((tokens_in or 0) - cached) * p[0] + cached * (p[2] if len(p) > 2 else p[0])
+            + (tokens_out or 0) * p[1]) / 1e6
+
+
+# ----- remote.daily: what the server elsewhere has spent since its day began (00:00 UTC, when a plan's daily
+# allowance is reset). On 22-11-2026 the free models' allowance of a Pro plan (700 credits, $7) went in 23 minutes,
+# on a naming batch of 712 tasks with the same 130,000 chars of context each, and on 21-11 ~150M tokens had taken the
+# plan's 4,000 credits with them: the config priced every model at 0, so nothing here said what any of it cost.
+_DAY = {"start": None, "pos": 0, "usd": {}, "over": None}
+_DAY_LOCK = threading.Lock()
+
+
+def day_start():
+    """The last 00:00 UTC, in seconds"""
+    now = time.time()
+    return now - now % 86400
+
+
+def spent_today(host):
+    """USD the server elsewhere at host has cost since 00:00 UTC, by usage.jsonl (every process's requests): its
+    "usd", or for a line written before that was kept, its tokens at the price in the config. Read on from where
+    the last call stopped"""
+    with _DAY_LOCK:
+        start = day_start()
+        if _DAY["start"] != start:
+            _DAY.update(start=start, pos=0, usd={}, over=None)
+        since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
+        try:
+            with open(USAGE_LOG, "rb") as f:
+                f.seek(_DAY["pos"])
+                data = f.read()
+        except OSError:
+            data = b""
+        end = data.rfind(b"\n") + 1
+        _DAY["pos"] += end
+        prices = None
+        for line in data[:end].splitlines():
+            if b'"remote"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not rec.get("remote") or str(rec.get("ts", "")) < since:
+                continue
+            usd = rec.get("usd")
+            if usd is None:
+                prices = remote_prices() if prices is None else prices
+                usd = usd_of(rec.get("model"), rec.get("in"), rec.get("out"), rec.get("cached"), prices)
+            _DAY["usd"][rec["remote"]] = _DAY["usd"].get(rec["remote"], 0.0) + usd
+        return _DAY["usd"].get(host, 0.0)
+
+
+def _resets():
+    return time.strftime("%H:%M", time.localtime(day_start() + 86400))
+
+
+def day_over(r):
+    """Why the server elsewhere takes no more requests today, or None: remote.daily is spent, or it said its quota
+    is (day_spent)"""
+    spent = spent_today(r["host"])
+    if _DAY["over"]:
+        return _DAY["over"]
+    if r.get("daily") and spent >= r["daily"]:
+        return (f"remote.daily: ${spent:,.2f} of ${r['daily']:,.2f} spent since 00:00 UTC (it resets at {_resets()} "
+                "here)")
+    return None
+
+
+def day_spent(why):
+    """The server said its quota is used up: no more requests there until its day begins again"""
+    with _DAY_LOCK:
+        _DAY["over"] = _DAY["over"] or f"{why} (until {_resets()} here)"
+        return _DAY["over"]
 
 
 def cmd_usage(args):
@@ -980,8 +1069,11 @@ def cmd_usage(args):
     away = [r for r in recs if r.get("remote")]
     if away:
         prices = remote_prices()
-        cost = sum(r["in"] * prices.get(r["model"], (0, 0))[0] + r["out"] * prices.get(r["model"], (0, 0))[1]
-                   for r in away) / 1e6
+
+        def usd(r):
+            return r["usd"] if r.get("usd") is not None else usd_of(r["model"], r["in"], r["out"], r.get("cached"),
+                                                                    prices)
+        cost = sum(usd(r) for r in away)
         models = sorted({r["model"] for r in away})
         one = prices.get(models[0]) if len(models) == 1 else None
         print(f"\nremote: {len(away)} of these requests went to a server elsewhere "
@@ -994,9 +1086,11 @@ def cmd_usage(args):
             roles = sorted({r["role"] for r in rows if r.get("role")})
             i, o = sum(r["in"] for r in rows), sum(r["out"] for r in rows)
             price = prices.get(model)
-            print(f"  {model}" + (f" (as {', '.join(roles)})" if roles else "") + f": {len(rows)} requests, {i:,} in, "
-                  f"{o:,} out, " + (f"${(i * price[0] + o * price[1]) / 1e6:,.2f} at ${price[0]:g} / ${price[1]:g}"
-                                    if price else "no price in the config (remote.price, or the role's \"price\")"))
+            cached = sum(r.get("cached") or 0 for r in rows)
+            print(f"  {model}" + (f" (as {', '.join(roles)})" if roles else "") + f": {len(rows)} requests, {i:,} in"
+                  + (f" ({cached:,} of them cached)" if cached else "") + f", {o:,} out, "
+                  + (f"${sum(usd(r) for r in rows):,.2f} at ${price[0]:g} / ${price[1]:g}"
+                     if price else "no price in the config (remote.prices, remote.price, or the role's \"price\")"))
     if any(r["cmd"] == "agent" for r in recs):
         print("\nagent: 'in' counts Claude Code's own prompt on every turn, so its 'kept off Claude' is an upper bound")
     return 0
@@ -1277,6 +1371,10 @@ EFFORT_NONE = "none"
 # ----- a server elsewhere (--remote): any OpenAI-compatible endpoint, for a run the caller asks to send there
 
 REMOTE = None  # set by use_remote: this run's requests go to the "remote" server of the config, not the local one
+# --local: every request of this run goes to the local worker, and _chat refuses one about to go elsewhere. On
+# 22-11-2026 `batch --local` sent the check fixes of 4 of 81 reviews to the drafter's own model (remote.escalate),
+# and a review is there to come from another family; --local is also how a client's code stays on this machine
+LOCAL_ONLY = False
 REMOTE_DEFAULTS = {
     "url": "",                        # its base URL, up to /v1
     "model": "",                      # the model's name there
@@ -1287,7 +1385,9 @@ REMOTE_DEFAULTS = {
     "extra": {},                      # fields for every request
     "plain": {},                      # fields for a request that should not think, e.g. {"reasoning_effort": "none"}
     "think": None,                    # fields for one that thinks; None: {"reasoning_effort": the effort}
-    "price": [0, 0],                  # USD per million tokens, in and out, for usage
+    "price": [0, 0],                  # USD per million tokens, in and out (and cached in), for usage
+    "prices": {},                     # the same by model: {"gpt-6-luna": [0.1, 0.5, 0.01]}, the server's list price
+    "daily": None,                    # USD a day (from 00:00 UTC) it may spend; spent, the work goes to the local one
     "spill": False,                   # with the local worker full, a request that may leave goes there by itself
     "stream": True,                   # the answer as it is written, so a loop is stopped (LoopWatch); False: a
                                       # server that refuses stream or stream_options
@@ -1299,7 +1399,9 @@ EFFORT_ELSEWHERE = {"xhigh": "high", "medium": "medium", "low": "low", "none": "
 EFFORT_HERE = {"high": "xhigh", "xhigh": "xhigh", "medium": "medium", "low": "low", "none": "none"}  # ... and back
 # in a limited request's error: the plan's quota or the account, which no wait of a few minutes gets past
 QUOTA_WORDS = ("quota", "limit_reached", "card_required", "billing", "credit")
-LOCAL_HELP = "keep this run on the local worker, even with remote.spill on"
+LOCAL_HELP = ("keep every request of this run on the local worker: with it full a task waits for room (no "
+              "remote.spill), its fixes are not escalated elsewhere (remote.escalate), and a role or escalate "
+              "elsewhere is refused")
 ROLE_HELP = "a role of remote.roles: the model the user chose for this kind of task (draft, review...)"
 ESCALATE_HELP = "with a check: the role its fixes go to once it failed (default: remote.escalate; '' none)"
 CHECK_NULL_HELP = ("an output that changes nothing, which the check must fail before any request is sent (default: an "
@@ -1428,6 +1530,10 @@ def use_remote(files):
 
 # ----- remote.spill: with the local worker full, a request that may leave goes to the server elsewhere by itself
 
+class QuotaSpent(WorkerError):
+    """The server elsewhere said its quota (or the account's credit) is used up: waiting does not help"""
+
+
 class LocalFull(WorkerError):
     """The local worker has no room for the request now: post_with_room(spill=True) says so instead of waiting"""
 
@@ -1520,7 +1626,7 @@ def _chat_remote(body, r=None):
                 after = 10.0
             spent = any(w in text.lower() for w in QUOTA_WORDS)  # a quota that is used up is not waited for
             if e.code not in (429, 502, 503, 504) or after > 120 or spent:
-                raise WorkerError(f"HTTP {e.code} from {r['host']}: {text}"
+                raise (QuotaSpent if spent else WorkerError)(f"HTTP {e.code} from {r['host']}: {text}"
                                   + (". That is a quota or the account, not a busy moment: waiting does not help"
                                      if spent else ""))
             if time.time() - t0 + after > r["wait"]:
@@ -1550,6 +1656,8 @@ def _chat_remote(body, r=None):
         "where": r, "repeat": d.get("repeat"),
         "content": content, "thinking": thinking, "finish": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens") or 0, "completion_tokens": written, "seconds": seconds,
+        # what the server read from its cache, at its own price (a batch's context is first in every request)
+        "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
         "prompt_tps": None, "gen_tps": written / seconds if seconds else None,
         # the answer without its thinking, as the server counts it, or else by its length: there is no /tokenize
         "answer_tokens": (max(0, written - thought) if thought is not None
@@ -1571,12 +1679,30 @@ def _remote_slots(r):
 def _chat(body, server=None):
     """One request, to the local worker, or elsewhere: to a role's server (server: LOCAL, or the remote one with the
     role's model), with --remote, or with remote.spill when the local worker is full and this thread's task may leave
-    (_ON.spill). The result's "where" is the server elsewhere, or None."""
+    (_ON.spill). The result's "where" is the server elsewhere, or None. With --local (LOCAL_ONLY) every request is
+    the local worker's, waiting for room as ever: the first answer, a cut one asked again, a fix, a recovery."""
+    if LOCAL_ONLY:
+        if isinstance(server, dict) or REMOTE:  # place() refuses these before anything runs: this is the last word
+            raise WorkerError(f"--local, and this request was about to go to "
+                              f"{(server if isinstance(server, dict) else REMOTE)['model']} elsewhere: not sent")
+        return _chat_local(body)
     if server == LOCAL:
         return _chat_local(body)
     if server or REMOTE:
-        with _remote_slots(server or REMOTE):
-            return _chat_remote(body, server)
+        r = server or REMOTE
+        why = day_over(r)
+        if why is None:
+            try:
+                with _remote_slots(r):
+                    return _chat_remote(body, server)
+            except QuotaSpent as e:
+                why = day_spent(str(e))
+        if not isinstance(server, dict):  # --remote: the user asked for that server, and this machine is not it
+            raise WorkerError(f"not sent to {r['host']}: {why}")
+        if local_off():
+            raise WorkerError(f"not sent to {r['host']}: {why}; and {OFF}")
+        _to_local_note(r, why)
+        return _chat_local(body)
     there = getattr(_ON, "spill", None)
     if there is None:
         return _chat_local(body)
@@ -1631,13 +1757,32 @@ _SHARE = {"here": 0}  # this process's spill requests running on the local worke
 _SHARE_LOCK = threading.Lock()
 
 
+_TO_LOCAL = set()  # the servers whose day is over, said once each
+
+
+def _to_local_note(r, why):
+    with _DAY_LOCK:
+        if r["host"] in _TO_LOCAL:
+            return
+        _TO_LOCAL.add(r["host"])
+    print(f"{r['host']} takes no more requests today ({why}): the roles' requests go to the local worker",
+          file=sys.stderr, flush=True)
+
+
 def _there(body, there):
     """The request on the server elsewhere if it has a free slot (remote.parallel): its result, or None when it has
     none, or when it failed, which turns spill off for the rest of the run (a quota, its limits, the network)"""
+    why = day_over(there)
+    if why:
+        _spill_off(why)
+        return None
     if not SPILL["slots"].acquire(blocking=False):
         return None
     try:
         return _chat_remote(body, there)
+    except QuotaSpent as e:
+        _spill_off(day_spent(f"{there['host']}: {e}"))
+        return None
     except (WorkerError, OSError, http.client.HTTPException, ValueError) as e:
         _spill_off(f"{there['host']}: {e}")
         return None
@@ -2222,6 +2367,41 @@ def context_size(files):
     return sum(len(read_file_spec(f)) for f in files)
 
 
+def remote_cost_note(units):
+    """Before a batch: what its tasks for a server elsewhere (their roles) read, at the list price in the config, and
+    what remote.daily has left today; None when no task goes there. What they write is not known yet, so it is the
+    least they cost. On 22-11-2026 712 naming tasks with the same 130,000 chars of context each took the day's $7 of
+    free models in 23 minutes, and nothing said so before they ran"""
+    sizes, by = {}, {}
+    for t in units:
+        r = t.get("_server")
+        if not isinstance(r, dict):
+            continue
+        chars = len(t.get("prompt") or "")
+        for f in request_files(t):
+            if f not in sizes:
+                sizes[f] = len(read_file_spec(f))
+            chars += sizes[f]
+        row = by.setdefault(r["model"], [0, 0, r])
+        row[0] += 1
+        row[1] += chars // 4  # tokens, about: a server elsewhere has no /tokenize
+    if not by:
+        return None
+    prices = remote_prices()
+    usd = sum(usd_of(m, toks, 0, 0, prices) for m, (_, toks, _) in by.items())
+    r = next(iter(by.values()))[2]
+    parts = ", ".join(f"{n} to {m} (~{toks:,} tokens in)" for m, (n, toks, _) in by.items())
+    unpriced = [m for m in by if not prices.get(m)]
+    line = (f"elsewhere: {parts}: at least ${usd:,.2f} at the list price, before what they write"
+            + (f"; no price for {', '.join(unpriced)} (remote.prices), counted as free" if unpriced else ""))
+    if r.get("daily"):
+        left = r["daily"] - spent_today(r["host"])
+        line += (f". remote.daily has ${max(0.0, left):,.2f} of ${r['daily']:,.2f} left today"
+                 + (": the tasks past it go to the local worker (a context that is the same in every task, first "
+                    "in each request, is read from the server's cache at a lower price)" if usd > left else ""))
+    return line
+
+
 # ----- the check: a command that says whether an output is right; the worker fixes its own output until it passes
 
 CHECK_TAIL = 6000  # chars of the check's output that go back to the model
@@ -2525,6 +2705,7 @@ def run_checked(t, cmd, keep_thinking, brief):
     if res.get("lowered"):  # its effort was lowered after an answer that was all thinking: its fixes keep that
         step["effort"] = res["lowered"][1]
     raised = split = escalated = None
+    spilled = res.get("spilled")  # where remote.spill sent any of its answers, said in its line
     escalate, after = t.get("_escalate"), int((CFG.get("remote") or {}).get("escalate_after") or 1)
     while True:
         passed, log = run_check(check, out)
@@ -2586,6 +2767,7 @@ def run_checked(t, cmd, keep_thinking, brief):
                         "think_tokens": budget}
         tries += 1
         res = run_task(t["prompt"], **step, history=history, attempt=tries)
+        spilled = spilled or res.get("spilled")
         if res.get("lowered"):
             step = {**step, "effort": res["lowered"][1]}
         for k in totals:
@@ -2594,7 +2776,8 @@ def run_checked(t, cmd, keep_thinking, brief):
     res.update(totals)
     cut = res["finish"] == "length"
     res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
-    res.update(tries=tries, raised=raised, split=split, escalated=escalated, score=check_score(log), **own)
+    res.update(tries=tries, raised=raised, split=split, escalated=escalated, score=check_score(log), spilled=spilled,
+               **own)
     logs = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
@@ -2749,7 +2932,10 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     where = res.pop("where", None)
     res.update(max_tokens=max_tokens, think_tokens=think_tokens if think else 0, limit=max_tokens,
                remote=where["host"] if where else None, model=where["model"] if where else None,
-               role=where.get("role") if where else None)
+               role=where.get("role") if where else None,
+               # sent elsewhere by remote.spill: no role's server and no --remote. An escalated fix is not one: on
+               # 22-11-2026 its line said "(remote.spill)" and the escalation was taken for a spill
+               spilled=where["host"] if where and server is None and not REMOTE else None)
 
     def then(again, **how):
         """The answer of a second request in the first one's place, the tokens and time of both counted"""
@@ -2757,6 +2943,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
         res.update(content=again["content"], thinking=again["thinking"] or res["thinking"], finish=again["finish"],
                    repeat=again.get("repeat"), prompt_tokens=res["prompt_tokens"] + again["prompt_tokens"],
                    completion_tokens=res["completion_tokens"] + again["completion_tokens"],
+                   cached_tokens=res.get("cached_tokens", 0) + again.get("cached_tokens", 0),
                    seconds=res["seconds"] + again["seconds"], gen_tps=again["gen_tps"],
                    **({"answer_tokens": again["answer_tokens"]} if "answer_tokens" in again else {}))
         res.update(how)
@@ -2797,6 +2984,7 @@ def run_task(prompt, files=(), system=None, think=False, max_tokens=None, temper
     # with "repeat" for one stopped going round in a loop
     res["usage"] = dict(cmd=cmd, tokens_in=res["prompt_tokens"], tokens_out=res["completion_tokens"], answer=answer,
                         seconds=res["seconds"], files=len(files), where=where,
+                        **({"cached": res["cached_tokens"]} if res.get("cached_tokens") else {}),
                         **({"recovered": True} if res.get("recovered") else {}),
                         **({"lowered": res["lowered"][1]} if res.get("lowered") else {}),
                         **({"attempt": attempt} if attempt else {}),
@@ -2851,8 +3039,8 @@ def summary(res, out):
          f"out {res['completion_tokens']} tok ({res['gen_tps'] or 0:.1f} tok/s), {res['seconds']:.1f} s")
     if res.get("role"):
         s += f", {res['model']} as {res['role']}"
-    elif res.get("remote") and not REMOTE:
-        s += f", on {res['remote']} (remote.spill)"
+    elif res.get("spilled"):
+        s += f", on {res['spilled']} (remote.spill)"
     if res.get("lowered"):
         s += (f", effort lowered {res['lowered'][0]} -> {res['lowered'][1]}: its first answer was all thinking, and "
               "the server sent none of it")
@@ -3145,15 +3333,32 @@ def escalation_of(t):
     return name if name and t.get("check") else None
 
 
-def place(t, files):
+def unescalated_note(tasks):
+    """--local: what place() left out of remote.escalate, said once for the run"""
+    roles = sorted({t["_unescalated"] for t in tasks if t.get("_unescalated")})
+    if roles:
+        return (f"--local: remote.escalate ({', '.join(roles)}) is not used, a failed check's fixes stay on the local "
+                "worker")
+    return None
+
+
+def place(t, files, local=False):
     """Resolves where a task's role sends it, and its escalation's, before anything runs: a role that is not
     listed, or files that may not leave for it (remote.roots), refuse the task with why. remote.escalate is for
     every checked task, and a task whose files may not leave keeps its fixes where it runs: an escalation sends its
     files, and the check's output with its errors, to the role's model. One the task names (--escalate, its
-    "escalate") is refused instead, as a role is."""
+    "escalate") is refused instead, as a role is. local (--local): a role or an escalate the task names that is a
+    model elsewhere is refused, and remote.escalate's is not used (t["_unescalated"]: its role, said by the run)."""
+    if local and t.get("role") and role_of(t["role"]) != LOCAL:
+        raise WorkerError(f"--local, and its role {t['role']} is a model elsewhere")
     t["_server"] = server_for(t.get("role"), files)
     t["_escalate_role"] = escalation_of(t)  # the task's own, or remote.escalate's
     t["_escalate"] = None
+    if local and t["_escalate_role"] and role_of(t["_escalate_role"]) != LOCAL:
+        if "escalate" in t:
+            raise WorkerError(f"--local, and its escalate {t['_escalate_role']} is a model elsewhere")
+        t["_unescalated"] = t["_escalate_role"]
+        t["_escalate_role"] = None
     if t["_escalate_role"]:
         try:
             t["_escalate"] = server_for(t["_escalate_role"], files)
@@ -3270,7 +3475,21 @@ def check_note(out):
     return Path(out).with_name(Path(out).name + ".check.txt")
 
 
+def local_only(args):
+    """--local for the whole run (LOCAL_ONLY); with --remote as well it is refused: one says the opposite of the
+    other. None, or why it is refused."""
+    global LOCAL_ONLY
+    if args.local and args.remote:
+        return "--local and --remote: the one keeps the run here, the other sends it elsewhere. Pick one"
+    LOCAL_ONLY = bool(args.local)
+    return None
+
+
 def cmd_ask(args):
+    refused = local_only(args)
+    if refused:
+        print(refused)
+        return 1
     try:
         far = bool(args.role) and role_of(args.role) != LOCAL
     except WorkerError as e:
@@ -3328,7 +3547,10 @@ def cmd_ask(args):
     if note:
         print(note, file=sys.stderr)
     try:
-        place(t, [*context, *(args.file or []), args.prompt_file, brief_path])
+        place(t, [*context, *(args.file or []), args.prompt_file, brief_path], args.local)
+        note = unescalated_note([t])
+        if note:
+            print(note, file=sys.stderr)
         if args.check:  # before any request: a check that cannot tell right from wrong stops it here
             t["_proof"] = try_check(args.check, args.out, args.check_null, args.check_good, args.check_bad)
         if args.out:
@@ -3365,6 +3587,10 @@ def _as_they_end(futs):
 
 
 def cmd_batch(args):
+    refused = local_only(args)
+    if refused:
+        print(refused)
+        return 1
     off = local_off()
     if off:
         if args.local:
@@ -3450,9 +3676,7 @@ def cmd_batch(args):
         name = t.get("id", t["out"])
         named_now(t.get("files"), f"task {name}: \"files\"")
         try:
-            if args.local and t.get("role") and role_of(t["role"]) != LOCAL:
-                raise WorkerError(f"--local, and its role {t['role']} is a model elsewhere")
-            place(t, [*common, *request_files(t)])
+            place(t, [*common, *request_files(t)], args.local)
         except WorkerError as e:
             raise WorkerError(f"task {name}: {e}")
     far = next((t["_server"] for t in units if isinstance(t["_server"], dict)), None)
@@ -3474,6 +3698,9 @@ def cmd_batch(args):
     note = whole_file_note(todo)
     if note:
         print(note, file=sys.stderr)
+    note = remote_cost_note(units)
+    if note:
+        print(note, file=sys.stderr)
     print(f"{len(tasks)} tasks, {len(tasks) - len(todo) - len(same) - len(taken)} already done, {len(todo)} to run"
           + (f"; brief {brief_path}" if brief else "")
           + (f"; reach measured in {args.reach}" if args.reach else "")
@@ -3481,6 +3708,9 @@ def cmd_batch(args):
              if context else "")
           + (f"; {sum(1 for r in spills.values() if r)} of them may go to {there['host']} as well (remote.spill)"
              if there else ""))
+    note = unescalated_note(units)
+    if note:
+        print(note)
     proofs = try_checks(units)  # before any request: a check that cannot tell right from wrong stops the batch here
     for t in todo:
         if "_subs" in t:
@@ -3591,7 +3821,7 @@ def cmd_batch(args):
                     checks[res["check"]] += 1
                 raised += bool(res.get("raised"))
                 split += bool(res.get("split"))
-                away += bool(res.get("remote") and not REMOTE)
+                away += bool(res.get("spilled"))
                 tag = "LOOP " if looped else "CUT " if cut else "BAD " if bad else "ok  "
                 print(f"{tag}{t.get('id', t['out'])}: {summary(res, t['out'] if bad or cut else None)}")
             except WorkerBusy as e:  # never sent: not a failure of the task, and nothing to change in it

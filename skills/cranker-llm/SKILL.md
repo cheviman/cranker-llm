@@ -137,8 +137,11 @@ stream a loop there runs to `--max-tokens`.
 the local worker full (an agent has it, no room in the context, or the server is down) goes to the remote by itself
 when all its files are under `remote.roots`, and a batch runs on both at once (while the local worker runs one of
 its tasks, the next go there as far as `remote.parallel` allows). Nothing to pass for it: send work as always, and
-do not hold back a batch because the local worker is busy. `--local` keeps a run here (a client's code that sits
-under a listed folder). Turning spill on, or listing a folder, is the user's call, never yours.
+do not hold back a batch because the local worker is busy. `--local` on `ask` and `batch` keeps every request of
+the run here (a client's code that sits under a listed folder, or a review that has to come from the local model):
+with the local worker full a task waits for room, a failed check's fixes are not escalated (`remote.escalate` is
+left out, and the run says so), and a `role` or `escalate` of a line that is a model elsewhere refuses the batch
+before anything is sent. Turning spill on, or listing a folder, is the user's call, never yours.
 
 **`remote.roles`** is the user's choice of a model for each kind of task (`status` lists them):
 `--role NAME` on `ask`, `"role"` in a batch line (`batch --role NAME` for the lines without one) sends that task to
@@ -150,9 +153,15 @@ findings, drops the false ones and decides; the commit stays Claude's, with the 
 answer failed (`remote.escalate_after`, 1: its second try, which still counts as effective), so a bigger model is
 paid only for what the first one could not get right. A fix that goes elsewhere carries the check's output too:
 `remote.escalate` skips a task whose files may not leave, and a check that prints files from outside `remote.roots`
-is not one to send there. The line says `MODEL as ROLE`, or `fixes from fix N on by MODEL as ROLE (escalated)`;
+is not one to send there. The line says `MODEL as ROLE`, or `fixes from fix N on by MODEL as ROLE (escalated)`
+(`on HOST (remote.spill)` is said only of an answer that spill sent there, not of an escalated fix);
 `usage` prices each model apart. Use the roles that are listed and never invent one;
 adding a role or changing its model is the user's call: a role's model may bill their credits.
+A role's free models are not unlimited: `remote.daily` caps what the server elsewhere spends a day (from 00:00 UTC,
+at `remote.prices`), and past it, or once the server says its quota is used up, the roles' requests run on the local
+worker and `--remote` is refused. `status` says `today $X of $Y`; read the line a batch prints before it runs
+(`elsewhere: N to MODEL ... at least $X`) and shrink a batch that takes the whole day (a smaller context, fewer tasks,
+or `--local`) before you send it.
 
 **3. `agent`: Claude Code itself on the local model**, with Read, Grep and Glob (and Write/Edit only inside its own
 folder). For searching many files and putting an answer together. It loads none of the user's settings (no hooks,
