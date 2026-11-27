@@ -1534,6 +1534,15 @@ class QuotaSpent(WorkerError):
     """The server elsewhere said its quota (or the account's credit) is used up: waiting does not help"""
 
 
+class RemoteRefused(WorkerError):
+    """The server elsewhere refused this request (HTTP 400, 413, 422): the request, not the account or a busy moment.
+    A role's or an escalated fix's is then the local worker's (_chat). On 27-11-2026 two tasks ended in FAIL that
+    way, with "provider rejected the request: invalid request error" and the local worker there to answer them."""
+
+
+REFUSED = (400, 413, 422)
+
+
 class LocalFull(WorkerError):
     """The local worker has no room for the request now: post_with_room(spill=True) says so instead of waiting"""
 
@@ -1625,6 +1634,8 @@ def _chat_remote(body, r=None):
             except ValueError:
                 after = 10.0
             spent = any(w in text.lower() for w in QUOTA_WORDS)  # a quota that is used up is not waited for
+            if e.code in REFUSED and not spent:
+                raise RemoteRefused(f"HTTP {e.code} from {r['host']}: {text}")
             if e.code not in (429, 502, 503, 504) or after > 120 or spent:
                 raise (QuotaSpent if spent else WorkerError)(f"HTTP {e.code} from {r['host']}: {text}"
                                   + (". That is a quota or the account, not a busy moment: waiting does not help"
@@ -1697,6 +1708,19 @@ def _chat(body, server=None):
                     return _chat_remote(body, server)
             except QuotaSpent as e:
                 why = day_spent(str(e))
+            except RemoteRefused as e:
+                # a role's request, or an escalated fix: the local worker answers it, and the task goes on. With
+                # --remote the user asked for that server, and with the local worker off there is no other
+                if not isinstance(server, dict) or local_off():
+                    raise
+                print(f"{r['host']} refused this request, the local worker answers it: {e}", file=sys.stderr,
+                      flush=True)
+                try:
+                    return {**_chat_local(body), "refused": r["host"]}
+                except WorkerBusy:
+                    raise
+                except WorkerError as here:
+                    raise WorkerError(f"{e}; and the local worker could not take it in its place: {here}")
         if not isinstance(server, dict):  # --remote: the user asked for that server, and this machine is not it
             raise WorkerError(f"not sent to {r['host']}: {why}")
         if local_off():
@@ -1710,7 +1734,12 @@ def _chat(body, server=None):
     noted = False
     while True:
         if SPILL["off"]:
-            return _chat_local(body)  # a failure there: here, waiting as ever
+            try:
+                return _chat_local(body)  # a failure there: here, waiting as ever
+            except WorkerBusy:
+                raise
+            except WorkerError as e:  # nowhere to run it: the line says the two reasons, not only the local one
+                raise WorkerError(f"{e}. And it could not go to {there['host']} (remote.spill): {SPILL['off']}")
         if getattr(_ON, "down", False):
             full = "the local server is not running"
         else:
@@ -2706,6 +2735,8 @@ def run_checked(t, cmd, keep_thinking, brief):
         step["effort"] = res["lowered"][1]
     raised = split = escalated = None
     spilled = res.get("spilled")  # where remote.spill sent any of its answers, said in its line
+    refused = res.get("refused")  # the server elsewhere that refused any of its requests (_chat): answered here
+    by_role = 0  # the answers the escalation's role gave: one it refused is the local worker's
     escalate, after = t.get("_escalate"), int((CFG.get("remote") or {}).get("escalate_after") or 1)
     while True:
         passed, log = run_check(check, out)
@@ -2768,6 +2799,17 @@ def run_checked(t, cmd, keep_thinking, brief):
         tries += 1
         res = run_task(t["prompt"], **step, history=history, attempt=tries)
         spilled = spilled or res.get("spilled")
+        if res.get("refused"):
+            refused = res["refused"]
+            if escalated and escalate is not None and step["server"] is escalate:
+                # the role above refused a fix: the next ones stay where the task runs, not sent there to be refused
+                # again, and a task none of whose answers it gave is not said to be escalated
+                step = {**step, "server": args["server"]}
+                if not by_role:
+                    escalated = None
+                escalate = None
+        elif escalated and escalate is not None and step["server"] is escalate:
+            by_role += 1
         if res.get("lowered"):
             step = {**step, "effort": res["lowered"][1]}
         for k in totals:
@@ -2777,7 +2819,7 @@ def run_checked(t, cmd, keep_thinking, brief):
     cut = res["finish"] == "length"
     res["check"] = ("pass" if tries == 0 else "fixed") if passed and not cut and not looped else "fail"
     res.update(tries=tries, raised=raised, split=split, escalated=escalated, score=check_score(log), spilled=spilled,
-               **own)
+               refused=refused, **own)
     logs = round_logs(out)
     if res["check"] != "fail":
         note.unlink(missing_ok=True)
@@ -3041,6 +3083,8 @@ def summary(res, out):
         s += f", {res['model']} as {res['role']}"
     elif res.get("spilled"):
         s += f", on {res['spilled']} (remote.spill)"
+    if res.get("refused"):
+        s += f", {res['refused']} refused a request, answered by the local worker"
     if res.get("lowered"):
         s += (f", effort lowered {res['lowered'][0]} -> {res['lowered'][1]}: its first answer was all thinking, and "
               "the server sent none of it")
