@@ -9,6 +9,7 @@
                   [--reach F] [--remote | --local]
     worker.py agent --dir folder [--dir folder ...] -p "task" [-o out] [--write folder]
     worker.py usage [--since YYYY-MM-DD] [--all]
+    worker.py runs [--days 7 | --since YYYY-MM-DD] [--all] [--session [ID]]
 
 check: a command that exits 0 when an output is right ({out} is its path); the worker hands the model its own output
 and the errors until it passes or check_retries run out. An answer cut by max_tokens is asked for again with 1.5 times
@@ -1336,11 +1337,10 @@ def cost_table(recs, key):
           + ", ".join(f"{m} ${i:.2f} in / ${o:.2f} out" for m, (i, o) in PRICES.items()) + ".")
 
 
-def runs_table(since=None, include_tagged=False, session=None):
-    """runs.jsonl by day: the runs, what they read and wrote, and what that would have cost on Claude at the price
-    of each run's day (log_run)"""
+def read_runs(since=None, include_tagged=False, session=None):
+    """runs.jsonl's lines (log_run), since a day, of one session"""
     if not RUNS_LOG.exists():
-        return
+        return []
     runs = []
     for line in RUNS_LOG.read_text(encoding="utf-8").splitlines():
         try:
@@ -1352,6 +1352,32 @@ def runs_table(since=None, include_tagged=False, session=None):
         if session and not str(r.get("session", "")).startswith(session):
             continue
         runs.append(r)
+    return runs
+
+
+def cmd_runs(args):
+    """What each run read and wrote, and what that would have cost on Claude, by day: the last --days, or since
+    --since. The table of usage, alone"""
+    session = args.session
+    if session == "":
+        print("--session: not called from a Claude Code session (CLAUDE_CODE_SESSION_ID is not set): give its id")
+        return 1
+    since = args.since or time.strftime("%Y-%m-%d", time.localtime(time.time() - (max(args.days, 1) - 1) * 86400))
+    runs = read_runs(since, args.all, session)
+    only = f" by session {session[:8]}" if session else ""
+    if not runs:
+        print(f"no runs logged{only} since {since} ({RUNS_LOG})" + ("" if args.all else "; --all adds the benchmarks"))
+        return 0
+    print(f"{RUNS_LOG}: {len(runs)} runs{only} from {runs[0]['ts']} to {runs[-1]['ts']}"
+          + ("" if args.all else " (benchmarks left out: --all)"))
+    runs_table(runs=runs)
+    return 0
+
+
+def runs_table(since=None, include_tagged=False, session=None, runs=None):
+    """runs.jsonl by day: the runs, what they read and wrote, and what that would have cost on Claude at the price
+    of each run's day (log_run)"""
+    runs = read_runs(since, include_tagged, session) if runs is None else runs
     if not runs:
         return
     models = list(dict.fromkeys(m for r in runs for m in r.get("claude_usd", {})))
@@ -1376,7 +1402,7 @@ def runs_table(since=None, include_tagged=False, session=None):
     print("read: every token the worker read (files, prompts, its context); written: every token it wrote, its "
           "thinking too.\nUSD: the same tokens on Claude at the API list price on the day of each run, read at "
           "the input price and\nwritten at the output price, whatever came of the run: what it consumed, not what "
-          "it saved (that is the\ntable above). " + ("remote USD: what the server elsewhere cost. " if remote else "")
+          "it saved (that is\nusage's \"USD saved\"). " + ("remote USD: what the server elsewhere cost. " if remote else "")
           + f"One line per run in {RUNS_LOG}.")
 
 
@@ -4420,11 +4446,18 @@ def main():
     p.add_argument("--all", action="store_true", help="also the runs tagged with CRANKER_USAGE_TAG")
     p.add_argument("--session", nargs="?", const=os.environ.get("CLAUDE_CODE_SESSION_ID") or "",
                    help="only one Claude Code session's requests: the calling one, or the id given (its start)")
+    p = sub.add_parser("runs", help="what each run read and wrote, at Claude's price, by day: the last 7 days")
+    p.add_argument("--since", help="YYYY-MM-DD (default: the last --days)")
+    p.add_argument("--days", type=int, default=7, help="the days up to today (default 7)")
+    p.add_argument("--all", action="store_true", help="also the runs tagged with CRANKER_USAGE_TAG")
+    p.add_argument("--session", nargs="?", const=os.environ.get("CLAUDE_CODE_SESSION_ID") or "",
+                   help="only one Claude Code session's runs: the calling one, or the id given (its start)")
     args = ap.parse_args()
     rc = None
     try:
         rc = {"start": cmd_start, "stop": cmd_stop, "local": cmd_local, "status": cmd_status, "config": cmd_config,
-              "ask": cmd_ask, "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
+              "ask": cmd_ask, "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage,
+              "runs": cmd_runs}[args.cmd](args)
     except WorkerError as e:  # what the caller got wrong (a task file, a brief, an output's path), in one line
         print(e)
         rc = 1

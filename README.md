@@ -90,7 +90,8 @@ Already have the model or llama-server? `--model-path` checks your file's SHA-25
 `--llama-server` uses your binary. On Linux and macOS, install llama.cpp b12421 or newer yourself (a CUDA, Metal or
 Vulkan build); the setup downloads it only on Windows.
 
-`/worker-status` says whether it is running and what it saved today; `/worker-usage` gives the whole bill.
+`/worker-status` says whether it is running and what it saved today; `/worker-usage` gives the whole bill;
+`/worker-runs` what its runs read and wrote in the last 7 days, at Claude's price.
 
 ## Three ways in
 
@@ -619,7 +620,8 @@ runs (runs.jsonl) at Claude price    runs requests         read     written   Op
 ```
 
 This is what the runs consumed, whatever came of them; the table "USD saved" above is what was kept off Claude.
-To measure a week, `usage --since` its first day.
+The table alone, for the last 7 days: `worker.py runs` (`--days N`, `--since` a day, `--session`), or
+`/worker-runs [YYYY-MM-DD]` in Claude Code.
 
 ## The scale
 
@@ -817,10 +819,10 @@ setup's download against a server that drops the connection. A couple of minutes
 |---|---|
 | `.claude-plugin/` | plugin and marketplace manifests |
 | `skills/cranker-llm/SKILL.md` | when and how Claude uses the worker, and how it checks what comes back |
-| `commands/` | `/worker-status`, `/worker-usage` |
+| `commands/` | `/worker-status`, `/worker-usage`, `/worker-runs` |
 | `hooks/hooks.json`, `scripts/read_guard.py` | the read guard (off until `read_guard.roots` lists folders) |
 | `hooks/hooks.json`, `scripts/local_share.py` | the scale: the day's report, and the note to sessions below it |
-| `scripts/worker.py` | start, stop, local, status, config, ask, batch, agent, usage |
+| `scripts/worker.py` | start, stop, local, status, config, ask, batch, agent, usage, runs |
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
