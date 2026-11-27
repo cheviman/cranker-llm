@@ -886,9 +886,57 @@ def log_usage(cmd, tokens_in, tokens_out, answer, seconds, where=None, **extra):
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")  # the calling Claude Code session (scripts/local_share.py)
     if session:
         rec["session"] = session
+    with _USAGE_WRITE:  # the run's totals, for its line in runs.jsonl (log_run)
+        _RUN["cwd"] = _RUN["cwd"] or rec["cwd"]
+        _RUN["requests"] += 1
+        for k in ("in", "out", "answer"):
+            _RUN[k] += rec[k]
+        if where:
+            away = _RUN["remote"] = _RUN["remote"] or {"requests": 0, "in": 0, "out": 0, "usd": 0.0}
+            away["requests"] += 1
+            away["in"] += rec["in"]
+            away["out"] += rec["out"]
+            away["usd"] += rec["usd"]
     try:
         LOGS.mkdir(parents=True, exist_ok=True)
         with _USAGE_WRITE, open(USAGE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+# ----- runs.jsonl: one line per run (a process of ask, batch or agent that sent any request), written as it ends:
+# what it read and wrote in all, and what the same tokens would have cost on Claude, at the list prices in PRICES
+# on that day. The price is kept in the line, so that a week that was measured stays as it was when prices change.
+RUNS_LOG = LOGS / "runs.jsonl"
+_RUN = {"t0": time.time(), "cwd": None, "requests": 0, "in": 0, "out": 0, "answer": 0, "remote": None, "done": False}
+
+
+def log_run(cmd, rc=None):
+    """The run's line in runs.jsonl, once, when it sent anything. 'claude_usd': what it read at Claude's input price
+    and what it wrote at the output price, by model; 'remote', what of it went to a server elsewhere and what that
+    cost there"""
+    with _USAGE_WRITE:
+        if _RUN["done"] or not _RUN["requests"]:
+            return
+        _RUN["done"] = True
+        run = json.loads(json.dumps(_RUN))
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "start": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                                         time.localtime(run["t0"])),
+           "cmd": cmd, "cwd": run["cwd"], "s": round(time.time() - run["t0"], 1), "requests": run["requests"],
+           "in": run["in"], "out": run["out"], "answer": run["answer"],
+           "claude_usd": {m: round((run["in"] * p[0] + run["out"] * p[1]) / 1e6, 6) for m, p in PRICES.items()},
+           "prices": {m: list(p) for m, p in PRICES.items()}}
+    if isinstance(rc, int):
+        rec["rc"] = rc
+    if run["remote"]:
+        rec["remote"] = {**run["remote"], "usd": round(run["remote"]["usd"], 6)}
+    for k, env in (("tag", "CRANKER_USAGE_TAG"), ("session", "CLAUDE_CODE_SESSION_ID")):
+        if os.environ.get(env):
+            rec[k] = os.environ[env]
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        with _USAGE_WRITE, open(RUNS_LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except OSError:
         pass
@@ -1049,6 +1097,7 @@ def cmd_usage(args):
     table("project (the caller's folder)", project_of)
     table("day", lambda r: r["ts"][:10])
     cost_table([r for r in recs if not run_failed(r)], project_of)
+    runs_table(args.since, args.all, session)
     quality_table(args.since, args.all, session)
     if not session:
         guard_line(args.since)
@@ -1285,6 +1334,50 @@ def cost_table(recs, key):
           "+write: also\nthe answers at the output price, as if Claude had written them. Not counted: Claude Code "
           "sends what it read\nagain on every later turn. Prices per million tokens: "
           + ", ".join(f"{m} ${i:.2f} in / ${o:.2f} out" for m, (i, o) in PRICES.items()) + ".")
+
+
+def runs_table(since=None, include_tagged=False, session=None):
+    """runs.jsonl by day: the runs, what they read and wrote, and what that would have cost on Claude at the price
+    of each run's day (log_run)"""
+    if not RUNS_LOG.exists():
+        return
+    runs = []
+    for line in RUNS_LOG.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if (since and r["ts"][:10] < since) or (r.get("tag") and not include_tagged):
+            continue
+        if session and not str(r.get("session", "")).startswith(session):
+            continue
+        runs.append(r)
+    if not runs:
+        return
+    models = list(dict.fromkeys(m for r in runs for m in r.get("claude_usd", {})))
+    rows = {}
+    for r in runs:
+        a = rows.setdefault(r["ts"][:10], {"runs": 0, "requests": 0, "in": 0, "out": 0, "remote": 0.0,
+                                           **{m: 0.0 for m in models}})
+        a["runs"] += 1
+        for k in ("requests", "in", "out"):
+            a[k] += r[k]
+        a["remote"] += (r.get("remote") or {}).get("usd", 0.0)
+        for m, usd in r.get("claude_usd", {}).items():
+            a[m] += usd
+    if len(rows) > 1:
+        rows["total"] = {k: sum(v[k] for v in rows.values()) for k in next(iter(rows.values()))}
+    remote = any(a["remote"] for a in rows.values())
+    print(f"\n{'runs (runs.jsonl) at Claude price':<34} {'runs':>6} {'requests':>8} {'read':>12} {'written':>11}"
+          + "".join(f" {m + ' USD':>14}" for m in models) + (f" {'remote USD':>11}" if remote else ""))
+    for k, a in rows.items():
+        print(f"{k:<34} {a['runs']:>6} {a['requests']:>8} {a['in']:>12,} {a['out']:>11,}"
+              + "".join(f" {a[m]:>14,.2f}" for m in models) + (f" {a['remote']:>11,.2f}" if remote else ""))
+    print("read: every token the worker read (files, prompts, its context); written: every token it wrote, its "
+          "thinking too.\nUSD: the same tokens on Claude at the API list price on the day of each run, read at "
+          "the input price and\nwritten at the output price, whatever came of the run: what it consumed, not what "
+          "it saved (that is the\ntable above). " + ("remote USD: what the server elsewhere cost. " if remote else "")
+          + f"One line per run in {RUNS_LOG}.")
 
 
 # ----------------------------------------------------------------------------------------------------- ask, batch
@@ -3884,6 +3977,7 @@ def cmd_batch(args):
         ex.shutdown(wait=False, cancel_futures=True)
         print(f"interrupted: {ended} of {len(todo)} tasks had ended. Run the same batch again for the rest: the "
               "finished ones are skipped", flush=True)
+        log_run("batch", 130)  # os._exit skips main's finally
         os._exit(130)
     ex.shutdown()
     print(f"done: {len(todo) - failed - not_run} ok, {failed} failed or cut, "
@@ -4327,12 +4421,16 @@ def main():
     p.add_argument("--session", nargs="?", const=os.environ.get("CLAUDE_CODE_SESSION_ID") or "",
                    help="only one Claude Code session's requests: the calling one, or the id given (its start)")
     args = ap.parse_args()
+    rc = None
     try:
-        return {"start": cmd_start, "stop": cmd_stop, "local": cmd_local, "status": cmd_status, "config": cmd_config,
-                "ask": cmd_ask, "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
+        rc = {"start": cmd_start, "stop": cmd_stop, "local": cmd_local, "status": cmd_status, "config": cmd_config,
+              "ask": cmd_ask, "batch": cmd_batch, "agent": cmd_agent, "usage": cmd_usage}[args.cmd](args)
     except WorkerError as e:  # what the caller got wrong (a task file, a brief, an output's path), in one line
         print(e)
-        return 1
+        rc = 1
+    finally:
+        log_run(args.cmd, rc)  # what the run consumed, if it sent anything: runs.jsonl
+    return rc
 
 
 if __name__ == "__main__":

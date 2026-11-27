@@ -604,6 +604,23 @@ total                                          7.80            15.59            
 
 Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless `--all`.
 
+### What each run consumed, at Claude's price (`runs.jsonl`)
+
+Every `ask`, `batch` or `agent` run that sent anything adds one line to `logs/runs.jsonl` when it ends (a batch is one
+run, whatever its tasks): when it started and ended, the command, the caller's folder and session, its requests, what
+the worker read (`in`) and wrote (`out`, thinking included), and `claude_usd`: the same tokens on Claude at the API
+list price of that day, read at the input price and written at the output price, by model. The prices go into the
+line too (`prices`), so a week that was measured stays as it was if they change; what a server elsewhere cost goes
+in `remote`. A batch stopped with Ctrl+C still writes its line. `usage` shows the runs by day:
+
+```
+runs (runs.jsonl) at Claude price    runs requests         read     written   Opus 5.5 USD  Fable 5.2 USD
+2026-11-27                              2        2       24,581       1,175           0.12           0.24
+```
+
+This is what the runs consumed, whatever came of them; the table "USD saved" above is what was kept off Claude.
+To measure a week, `usage --since` its first day.
+
 ## The scale
 
 Left to itself, Claude hands the worker what is easy to hand over, not what is heavy. One session spent six hours
@@ -808,7 +825,7 @@ setup's download against a server that drops the connection. A couple of minutes
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
 | `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first; 1.7.0's `test_check_bad.py`, `test_named.py`, `test_resume.py`, `test_variants.py`, `test_remote_think.py`, `test_reach.py`; 1.8.0's `test_best_round.py`, and more in
-`test_remote_think.py` and `test_reach.py`), and the stand-in for llama-server they run against |
+`test_remote_think.py` and `test_reach.py`; 2.0.0's `test_runs.py`, the runs log), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `local`, `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,
