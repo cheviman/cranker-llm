@@ -90,7 +90,8 @@ Already have the model or llama-server? `--model-path` checks your file's SHA-25
 `--llama-server` uses your binary. On Linux and macOS, install llama.cpp b12421 or newer yourself (a CUDA, Metal or
 Vulkan build); the setup downloads it only on Windows.
 
-`/worker-status` says whether it is running and what it saved today; `/worker-usage` gives the whole bill.
+`/worker-status` says whether it is running and what it saved today; `/worker-usage` gives the whole bill;
+`/worker-runs` what its runs read and wrote in the last 7 days, at Claude's price.
 
 ## Three ways in
 
@@ -489,12 +490,17 @@ is one thing to send there; a client's is another.
 | Profile | GPU | Status | Use it for |
 |---|---|---|---|
 | `qwen3.8-27b-q4kxl`: Qwen3.8-27B UD-Q4_K_XL (unsloth), 17.7 GB | 24 GB | measured | everything: the default |
+| `qwen3.8-27b-q5km`: Qwen3.8-27B UD-Q5_K_M (unsloth), 19.9 GB | 24 GB, ~0.6 GB to spare | measured | nothing the default does not: as right on the bench, ~8 % slower |
+| `qwen3.8-27b-q6k`: Qwen3.8-27B UD-Q6_K (unsloth), 22.0 GB | 24 GB, 48K and 4 slots | measured | nothing the default does not: as right on the bench, slower, less context |
 | `bonsai2-27b-q2_0`: Ternary Bonsai 2 27B Q2_0 (PrismML), 7.6 GB | 12 GB and up | measured on 24 GB only | reading in volume, and speed; not exact edits |
 | `qwen3.8-27b-iq3s`: Qwen3.8-27B UD-IQ3_S (unsloth), 12.0 GB | 16 GB | untested | |
 | `daisyrose-27b-q4km`: DaisyRose-27B Q4_K_M (bartowski), 17.3 GB | 24 GB | untested | a fine-tune of Qwen3.8-27B for long agent tasks, to compare against the default |
 
 Everything here was measured on one machine: an RTX 3090 (24 GB) at 260 W, on Windows 11, on 15 and 16 November
-2026. Other GPUs and the Linux and macOS paths are not measured yet; numbers from yours are welcome (see
+2026; the Q5_K_M and Q6_K against the default at 350 W on 23 November. A bigger quant was no better on any test
+of `bench/bench.py`: the rename's code was right 40 of 40 times with all three, and every miss of the whole file
+was the same header comment renamed. What a bigger quant may buy is on harder work than the bench asks, and that
+is not measured. Other GPUs and the Linux and macOS paths are not measured yet; numbers from yours are welcome (see
 "Benchmark your machine").
 
 <details>
@@ -598,6 +604,24 @@ total                                          7.80            15.59            
   session's own.
 
 Benchmarks run with `CRANKER_USAGE_TAG=bench` and stay out of the totals unless `--all`.
+
+### What each run consumed, at Claude's price (`runs.jsonl`)
+
+Every `ask`, `batch` or `agent` run that sent anything adds one line to `logs/runs.jsonl` when it ends (a batch is one
+run, whatever its tasks): when it started and ended, the command, the caller's folder and session, its requests, what
+the worker read (`in`) and wrote (`out`, thinking included), and `claude_usd`: the same tokens on Claude at the API
+list price of that day, read at the input price and written at the output price, by model. The prices go into the
+line too (`prices`), so a week that was measured stays as it was if they change; what a server elsewhere cost goes
+in `remote`. A batch stopped with Ctrl+C still writes its line. `usage` shows the runs by day:
+
+```
+runs (runs.jsonl) at Claude price    runs requests         read     written   Opus 5.5 USD  Fable 5.2 USD
+2026-11-27                              2        2       24,581       1,175           0.12           0.24
+```
+
+This is what the runs consumed, whatever came of them; the table "USD saved" above is what was kept off Claude.
+The table alone, for the last 7 days: `worker.py runs` (`--days N`, `--since` a day, `--session`), or
+`/worker-runs [YYYY-MM-DD]` in Claude Code.
 
 ## The scale
 
@@ -795,15 +819,15 @@ setup's download against a server that drops the connection. A couple of minutes
 |---|---|
 | `.claude-plugin/` | plugin and marketplace manifests |
 | `skills/cranker-llm/SKILL.md` | when and how Claude uses the worker, and how it checks what comes back |
-| `commands/` | `/worker-status`, `/worker-usage` |
+| `commands/` | `/worker-status`, `/worker-usage`, `/worker-runs` |
 | `hooks/hooks.json`, `scripts/read_guard.py` | the read guard (off until `read_guard.roots` lists folders) |
 | `hooks/hooks.json`, `scripts/local_share.py` | the scale: the day's report, and the note to sessions below it |
-| `scripts/worker.py` | start, stop, local, status, config, ask, batch, agent, usage |
+| `scripts/worker.py` | start, stop, local, status, config, ask, batch, agent, usage, runs |
 | `scripts/setup.py` | profiles, downloads with SHA-256, config |
 | `profiles/profiles.json` | the models, with what was measured on each |
 | `bench/bench.py`, `bench/sample.c` | the benchmarks |
 | `tests/test_*.py`, `tests/fake_llama.py` | the tests (`test_context.py`: the context pack, the brief's note and the check tried first; 1.7.0's `test_check_bad.py`, `test_named.py`, `test_resume.py`, `test_variants.py`, `test_remote_think.py`, `test_reach.py`; 1.8.0's `test_best_round.py`, and more in
-`test_remote_think.py` and `test_reach.py`), and the stand-in for llama-server they run against |
+`test_remote_think.py` and `test_reach.py`; 2.0.0's `test_runs.py`, the runs log), and the stand-in for llama-server they run against |
 | `tests/fixtures/` | real answers that went wrong, which the tests replay |
 
 Settings are in `CRANKER_HOME/config.json`: `local`, `model`, `llama_server`, `template`, `alias`, `port`, `ctx`, `parallel`,

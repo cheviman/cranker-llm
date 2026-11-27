@@ -4,7 +4,7 @@
     "title": "Qwen3.8-27B UD-Q4_K_XL (unsloth): the default for a 24 GB GPU",
     "min_vram_gb": 22,
     "status": "measured",
-    "measured": "RTX 3090 capped at 260 W, 15-11-2026: 30.7 tok/s on one request, ~118 tok/s in all on batches of 8; a 666-line C file summarised in 47 s (25 of 25 functions, 22 accurate); the agent's who-calls-what exact in 2-4 turns; renamed a local in 120 lines of C right 6 of 6 times. 21 GB of the GPU with the desktop's.",
+    "measured": "RTX 3090 capped at 260 W, 15-11-2026: 30.7 tok/s on one request, ~118 tok/s in all on batches of 8; a 666-line C file summarised in 47 s (25 of 25 functions, 22 accurate); the agent's who-calls-what exact in 2-4 turns; renamed a local in 120 lines of C right 6 of 6 times. 21 GB of the GPU with the desktop's. At 350 W, 23-11-2026: 31-40 tok/s on one request, 119 tok/s in all on a batch of 16; the rename's code right 40 of 40 times, the whole file 32 of 40 (the other 8 also renamed the variable in sample.c's header comment); 95 of 96 function lines exact with --number. Q5_K_M and Q6_K were measured against it on the same day and did no better: see their profiles.",
     "model": {
       "repo": "unsloth/Qwen3.8-27B-GGUF",
       "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
@@ -13,6 +13,36 @@
       "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
     },
     "config": {"alias": "qwen3.8-27b", "ctx": 65536, "parallel": 8, "cache_type": "q8_0", "spec": "ngram-mod"}
+  },
+  {
+    "name": "qwen3.8-27b-q5km",
+    "title": "Qwen3.8-27B UD-Q5_K_M (unsloth): one step up from the default on a 24 GB GPU, measured no better",
+    "min_vram_gb": 24,
+    "status": "measured",
+    "measured": "RTX 3090 at 350 W, 23-11-2026, against the default on the same day: 29-36 tok/s on one request (the default 31-40), 110 tok/s in all on a batch of 16 (119); the rename's code right 40 of 40 times, the whole file 34 of 40 (32 of 40), the same comment as the default's misses; map, agent and 94 of 96 function lines with --number as the default. 23.9 GB of the GPU with the desktop's at 64K and 8 slots, ~0.6 GB to spare: past that, Windows moves memory to system RAM and everything crawls. Nothing on bench/bench.py is better than the default's, and it is slower.",
+    "model": {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-Q5_K_M.gguf",
+      "size": 19870878624,
+      "sha256": "e2771d4c10c6b77141552ea7a21631067271f17baf918f46a3cba78495f92e1e",
+      "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "qwen3.8-27b", "ctx": 65536, "parallel": 8, "cache_type": "q8_0", "spec": "ngram-mod"}
+  },
+  {
+    "name": "qwen3.8-27b-q6k",
+    "title": "Qwen3.8-27B UD-Q6_K (unsloth): 6-bit on a 24 GB GPU with 48K of context, measured no better than the default",
+    "min_vram_gb": 24,
+    "status": "measured",
+    "measured": "RTX 3090 at 350 W, 23-11-2026, against the default on the same day: 27-29 tok/s on one request (the default 31-40), 74 tok/s in all on a batch of 16 with its 4 slots (119 with 8); the rename's code right 40 of 40 times, the whole file 34 of 40 (32 of 40), the same comment as the default's misses; map and agent as the default; 95 of 96 function lines with --number, but written \"(125)\" where \"(line 125)\" was asked. 23.9 GB of the GPU with the desktop's at 48K and 4 slots; 64K does not fit. Slower, a smaller context, fewer slots, and nothing on bench/bench.py better than the default's.",
+    "model": {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "file": "Qwen3.8-27B-UD-Q6_K.gguf",
+      "size": 21980441504,
+      "sha256": "6cac55f876015d6d4b94b1656d23f79f424ac9b583652aedf0633dba116576a8",
+      "license": "Apache-2.0 (Qwen/Qwen3.8-27B)"
+    },
+    "config": {"alias": "qwen3.8-27b", "ctx": 49152, "parallel": 4, "cache_type": "q8_0", "spec": "ngram-mod"}
   },
   {
     "name": "bonsai2-27b-q2_0",
