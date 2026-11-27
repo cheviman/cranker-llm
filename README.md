@@ -489,12 +489,17 @@ is one thing to send there; a client's is another.
 | Profile | GPU | Status | Use it for |
 |---|---|---|---|
 | `qwen3.8-27b-q4kxl`: Qwen3.8-27B UD-Q4_K_XL (unsloth), 17.7 GB | 24 GB | measured | everything: the default |
+| `qwen3.8-27b-q5km`: Qwen3.8-27B UD-Q5_K_M (unsloth), 19.9 GB | 24 GB, ~0.6 GB to spare | measured | nothing the default does not: as right on the bench, ~8 % slower |
+| `qwen3.8-27b-q6k`: Qwen3.8-27B UD-Q6_K (unsloth), 22.0 GB | 24 GB, 48K and 4 slots | measured | nothing the default does not: as right on the bench, slower, less context |
 | `bonsai2-27b-q2_0`: Ternary Bonsai 2 27B Q2_0 (PrismML), 7.6 GB | 12 GB and up | measured on 24 GB only | reading in volume, and speed; not exact edits |
 | `qwen3.8-27b-iq3s`: Qwen3.8-27B UD-IQ3_S (unsloth), 12.0 GB | 16 GB | untested | |
 | `daisyrose-27b-q4km`: DaisyRose-27B Q4_K_M (bartowski), 17.3 GB | 24 GB | untested | a fine-tune of Qwen3.8-27B for long agent tasks, to compare against the default |
 
 Everything here was measured on one machine: an RTX 3090 (24 GB) at 260 W, on Windows 11, on 15 and 16 November
-2026. Other GPUs and the Linux and macOS paths are not measured yet; numbers from yours are welcome (see
+2026; the Q5_K_M and Q6_K against the default at 350 W on 23 November. A bigger quant was no better on any test
+of `bench/bench.py`: the rename's code was right 40 of 40 times with all three, and every miss of the whole file
+was the same header comment renamed. What a bigger quant may buy is on harder work than the bench asks, and that
+is not measured. Other GPUs and the Linux and macOS paths are not measured yet; numbers from yours are welcome (see
 "Benchmark your machine").
 
 <details>

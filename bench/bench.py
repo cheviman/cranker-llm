@@ -6,8 +6,10 @@
   rename  rename the local 'state' (not the field ->state) in sample.c, --runs times: how many come out exactly right
   agent   the agent: which functions call elevator_step, at which lines
   batch   16 explanations at once (--jobs = the server's slots): tokens out per second in all
-  lines   map scripts/worker.py (some 1,800 lines, ~35K tokens with the answer) with the line of each function,
+  lines   map the first 2,270 lines of scripts/worker.py (~38K tokens numbered) with the line of each function,
           without and with --number: how many lines come out exact (two long requests: a few minutes)
+Every request runs with --local: the remote's spill and escalation would measure another model (on 23-11-2026 the
+whole worker.py, grown to 4,295 lines, no longer fit in 64K and the lines step went to the remote).
 Answers and the report go to bench/runs/<TAG>/. The runs are tagged "bench" in usage.jsonl, so `worker.py usage`
 leaves them out. Send the report with your GPU and profile: the profiles' "measured" lines come from it.
 """
@@ -27,7 +29,8 @@ SAMPLE = BENCH / "sample.c"
 FUNCTIONS = ["queue_empty", "queue_push", "queue_pop", "elevator_init", "elevator_call", "next_state",
              "elevator_step", "elevator_run", "elevator_fault"]
 STEPS = ["map", "rename", "agent", "batch", "lines"]
-LONG = BENCH.parent / "scripts" / "worker.py"  # the long file of the lines step
+LONG = BENCH.parent / "scripts" / "worker.py"  # the long file of the lines step: its first LONG_LINES lines
+LONG_LINES = 2270  # what the whole file was on 19-11-2026, so the runs since compare
 OUT_TPS = re.compile(r"out (\d+) tok \(([\d.]+) tok/s\)")
 
 
@@ -54,7 +57,7 @@ def expected_rename():
 
 
 def step_map(out, rep):
-    rc, line = worker("ask", "-f", str(SAMPLE), "-o", str(out / "map.md"), "--max-tokens", "1500", "-p",
+    rc, line = worker("ask", "--local", "-f", str(SAMPLE), "-o", str(out / "map.md"), "--max-tokens", "1500", "-p",
                       "For each function in this file, in order, write one line: `name`: what it does, concretely. "
                       "Nothing else.")
     text = (out / "map.md").read_text(encoding="utf-8") if (out / "map.md").exists() else ""
@@ -63,22 +66,35 @@ def step_map(out, rep):
 
 
 def step_rename(out, rep, runs):
+    """Scored twice: the whole file exact, and the code alone. sample.c's header comment names the variable
+    'state', and on 23-11-2026 every wrong answer of 80 (Q4_K_XL and Q5_K_M) was that comment renamed, the code
+    right: a count of the whole file alone said a quant was worse than it is."""
     want = expected_rename()
-    right = 0
+    right = code_right = 0
     tps = []
     for i in range(runs):
         o = out / f"rename_{i + 1}.c"
-        rc, line = worker("ask", "-f", str(SAMPLE), "-o", str(o), "--max-tokens", "3000", "-p",
+        rc, line = worker("ask", "--local", "-f", str(SAMPLE), "-o", str(o), "--max-tokens", "3000", "-p",
                           "Rewrite this C file exactly as it is, but rename the local variable 'state' to 'step' "
                           "everywhere it is a local variable (not the struct field 'state'). Output only the code.")
         got = code_of(o.read_text(encoding="utf-8")) if o.exists() else ""
         ok = got == want
+        code_ok = ok or without_comments(got) == without_comments(want)
         right += ok
+        code_right += code_ok
         m = OUT_TPS.search(line)
         if m:
             tps.append(float(m.group(2)))
-        rep(f"  rename {i + 1}: {'right' if ok else 'wrong'}" + (f", {m.group(2)} tok/s" if m else f" ({line[-200:]})"))
-    rep(f"rename: {right} of {runs} right" + (f"; {min(tps):.0f}-{max(tps):.0f} tok/s" if tps else ""))
+        verdict = "right" if ok else "code right, a comment changed" if code_ok else "wrong"
+        rep(f"  rename {i + 1}: {verdict}" + (f", {m.group(2)} tok/s" if m else f" ({line[-200:]})"))
+    rep(f"rename: {right} of {runs} right, the code right in {code_right}"
+        + (f"; {min(tps):.0f}-{max(tps):.0f} tok/s" if tps else ""))
+
+
+def without_comments(code):
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    code = re.sub(r"//[^\n]*", "", code)
+    return "\n".join(l.rstrip() for l in code.splitlines() if l.strip())
 
 
 def step_agent(out, rep):
@@ -100,30 +116,33 @@ def step_batch(out, rep):
     for i in range(16):
         f = FUNCTIONS[i % len(FUNCTIONS)]
         tasks.append({"id": f"{i:02}", "prompt": f"Explain the function {f} step by step in about 150 words.",
-                      "files": [str(SAMPLE)], "out": str(out / "batch" / f"{i:02}.md"), "max_tokens": 300})
+                      "files": [str(SAMPLE)], "out": str(out / "batch" / f"{i:02}.md"), "max_tokens": 600})
     jl = out / "batch.jsonl"
     jl.write_text("\n".join(json.dumps(t) for t in tasks) + "\n", encoding="utf-8")
-    rc, text = worker("batch", str(jl), "--force")
-    last = text.splitlines()[-1] if text else ""
-    m = re.search(r"(\d+) tokens out in (\d+) s", last)
+    rc, text = worker("batch", str(jl), "--force", "--local")
+    m = re.search(r"(\d+) tokens out in (\d+) s", text)
+    last = next((l for l in text.splitlines() if "tokens out in" in l), text.splitlines()[-1] if text else "")
     rep(f"batch: {last}" + (f" -> {int(m.group(1)) / max(int(m.group(2)), 1):.0f} tok/s in all" if m else ""))
 
 
 def score_lines(text, want):
     """(functions named with a line, lines exact) in a map of `name` (line N) lines"""
-    said = {m.group(1): int(m.group(2)) for m in re.finditer(r"`?(\w+)`?\s*\(lines? (\d+)", text)}
+    # "(line 125)" as asked, or "(125)": Q6_K wrote the second on 23-11-2026, every number right, and scored 0
+    said = {m.group(1): int(m.group(2)) for m in re.finditer(r"`?(\w+)`?\s*\((?:lines? )?(\d+)", text)}
     return sum(f in said for f in want), sum(said.get(f) == n for f, n in want.items())
 
 
 def step_lines(out, rep):
     """What --number is for: asked for each function's line, a model counts the lines by eye, and over a long file
     it drifts; with the number in front of each line it has it to copy."""
-    source = LONG.read_text(encoding="utf-8").splitlines()
+    source = LONG.read_text(encoding="utf-8").splitlines()[:LONG_LINES]
+    part = out / "long.py"
+    part.write_text("\n".join(source) + "\n", encoding="utf-8")
     want = {m.group(1): i for i, l in enumerate(source, 1) if (m := re.match(r"def (\w+)\(", l))}
     got = []
     for name, flags in (("plain", []), ("numbered", ["--number"])):
         o = out / f"lines_{name}.md"
-        rc, line = worker("ask", "-f", str(LONG), "-o", str(o), "--max-tokens", "6000", *flags, "-p",
+        rc, line = worker("ask", "--local", "-f", str(part), "-o", str(o), "--max-tokens", "6000", *flags, "-p",
                           "For each top-level function in this file (not the methods), in order, write one line: "
                           "`name` (line N): what it does, in a few words. N is the line its `def` is on. Nothing "
                           "else.")
