@@ -458,6 +458,12 @@ that errs in other things catches more), the volume to the local one. Under `"re
 - **They say so**: a task's line says `MODEL as ROLE`, an escalated one `fixes from fix N on by MODEL as ROLE
   (escalated)`; a batch says how many tasks go to each role; `usage.jsonl` keeps the model and the role of every
   request, and `usage` prices each model at its own `price`; `status` lists the roles.
+- **A request the server refuses** (HTTP 400, 413 or 422: that request, not the account or a busy moment) is
+  answered by the local worker, and the task goes on: its line says `HOST refused a request, answered by the local
+  worker`. A refused escalated fix leaves the task's next fixes where it runs, and a task none of whose fixes the
+  role did is not called `(escalated)`. With `--remote`, or with the local worker off, the refusal is still the
+  task's error: there is nowhere else to run it. On 27-11-2026 a role's task and an escalated fix ended in `FAIL`
+  with "provider rejected the request: invalid request error" and the local worker free.
 
 ### Fully remote: the local worker off
 
